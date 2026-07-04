@@ -29,7 +29,7 @@ struct ContentView: View {
                     case .reports:
                         placeholderView("Reports")
                     case .settings:
-                        placeholderView("Settings")
+                        AccountView()
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
