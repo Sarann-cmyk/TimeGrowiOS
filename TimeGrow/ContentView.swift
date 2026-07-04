@@ -86,9 +86,11 @@ struct ContentView: View {
                 ScrollView {
                     LazyVStack(spacing: 12) {
                         ForEach(taskService.tasks) { task in
-                            TaskRow(task: task) {
-                                taskService.deleteTask(task)
-                            }
+                            TaskRow(
+                                task: task,
+                                onToggleTimer: { toggleTimer(task) },
+                                deleteAction: { taskService.deleteTask(task) }
+                            )
                         }
                     }
                     .padding(.horizontal, 26)
@@ -97,6 +99,14 @@ struct ContentView: View {
                 }
                 .scrollIndicators(.hidden)
             }
+        }
+    }
+
+    private func toggleTimer(_ task: TGTask) {
+        if task.isTimerRunning {
+            taskService.stopTimer(for: task)
+        } else {
+            taskService.startTimer(for: task)
         }
     }
 
@@ -155,6 +165,7 @@ struct ContentView: View {
 
 private struct TaskRow: View {
     let task: TGTask
+    let onToggleTimer: () -> Void
     let deleteAction: () -> Void
 
     var body: some View {
@@ -171,9 +182,7 @@ private struct TaskRow: View {
                     .foregroundStyle(.white)
                     .lineLimit(1)
 
-                Text(formatDuration(task.totalTrackedSeconds()))
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(.secondary)
+                TaskDurationLabel(task: task)
             }
 
             Spacer()
@@ -189,19 +198,57 @@ private struct TaskRow: View {
         }
         .padding(.horizontal, 18)
         .frame(height: 76)
-        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(task.isTimerRunning ? 0.16 : 0.07))
+        )
+        .overlay {
+            if task.isTimerRunning {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.green.opacity(0.6), lineWidth: 1.5)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onToggleTimer)
+    }
+}
+
+private struct TaskDurationLabel: View {
+    let task: TGTask
+
+    var body: some View {
+        if task.isTimerRunning {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                durationView(seconds: task.totalTrackedSeconds(at: context.date), isRunning: true)
+            }
+        } else {
+            durationView(seconds: task.totalTrackedSeconds(), isRunning: false)
+        }
     }
 
-    private func formatDuration(_ seconds: TimeInterval) -> String {
-        let totalSeconds = max(0, Int(seconds))
-        let hours = totalSeconds / 3600
-        let minutes = (totalSeconds % 3600) / 60
+    private func durationView(seconds: TimeInterval, isRunning: Bool) -> some View {
+        HStack(spacing: 6) {
+            if isRunning {
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 6, height: 6)
+            }
 
-        if hours > 0 {
-            return "\(hours)h \(minutes)m"
+            Text(Self.format(seconds))
+                .font(.system(size: 15, weight: .medium, design: .monospaced))
+                .foregroundStyle(isRunning ? Color.green : .secondary)
         }
+    }
 
-        return "\(minutes)m"
+    private static func format(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, secs)
+        }
+        return String(format: "%02d:%02d", minutes, secs)
     }
 }
 
