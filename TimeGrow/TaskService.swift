@@ -102,6 +102,18 @@ final class TaskService: NSObject, ObservableObject {
         }
     }
 
+    func updateTask(_ task: TGTask, name: String, color: Color) {
+        guard let uid = currentUser?.uid, let id = task.id else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        tasksCollection(for: uid).document(id).updateData([
+            "name": trimmed,
+            "colorHex": TaskAppearance.hexString(from: color),
+            "updatedAt": Timestamp(date: Date()),
+        ])
+    }
+
     func deleteTask(_ task: TGTask) {
         guard let uid = currentUser?.uid, let id = task.id else { return }
         tasksCollection(for: uid).document(id).delete { error in

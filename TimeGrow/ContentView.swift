@@ -6,12 +6,24 @@
 //
 
 import SwiftUI
+import UIKit
+
+private enum Haptics {
+    static func impact(_ style: UIImpactFeedbackGenerator.FeedbackStyle = .medium) {
+        UIImpactFeedbackGenerator(style: style).impactOccurred()
+    }
+
+    static func selection() {
+        UISelectionFeedbackGenerator().selectionChanged()
+    }
+}
 
 struct ContentView: View {
     @EnvironmentObject private var taskService: TaskService
 
     @State private var selectedTab: AppTab = .tasks
     @State private var isShowingAddTask = false
+    @State private var taskBeingEdited: TGTask?
 
     var body: some View {
         ZStack {
@@ -39,10 +51,22 @@ struct ContentView: View {
             tabBar
         }
         .sheet(isPresented: $isShowingAddTask) {
-            AddTaskView { name, color in
+            TaskFormView(navigationTitle: "New Task", confirmTitle: "Create") { name, color in
                 taskService.createTask(name: name, color: color)
             }
-            .presentationDetents([.height(260)])
+            .presentationDetents([.height(360)])
+            .presentationDragIndicator(.visible)
+        }
+        .sheet(item: $taskBeingEdited) { task in
+            TaskFormView(
+                initialName: task.name,
+                initialColor: task.color,
+                navigationTitle: "Edit Task",
+                confirmTitle: "Save"
+            ) { name, color in
+                taskService.updateTask(task, name: name, color: color)
+            }
+            .presentationDetents([.height(360)])
             .presentationDragIndicator(.visible)
         }
         .preferredColorScheme(.dark)
@@ -59,6 +83,7 @@ struct ContentView: View {
 
             if selectedTab == .tasks {
                 Button {
+                    Haptics.impact(.light)
                     isShowingAddTask = true
                 } label: {
                     Image(systemName: "plus")
@@ -69,7 +94,7 @@ struct ContentView: View {
                 .accessibilityLabel("Add task")
             }
         }
-        .padding(.horizontal, 24)
+        .padding(.horizontal, 20)
         .padding(.top, 0)
         .frame(height: 65, alignment: .bottom)
     }
@@ -83,21 +108,24 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .padding(.top, 76)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 12) {
-                        ForEach(taskService.tasks) { task in
-                            TaskRow(
-                                task: task,
-                                onToggleTimer: { toggleTimer(task) },
-                                deleteAction: { taskService.deleteTask(task) }
-                            )
-                        }
+                List {
+                    ForEach(taskService.tasks) { task in
+                        TaskRow(
+                            task: task,
+                            onToggleTimer: { toggleTimer(task) },
+                            editAction: { taskBeingEdited = task },
+                            deleteAction: { taskService.deleteTask(task) }
+                        )
+                        .listRowInsets(EdgeInsets(top: 6, leading: 21, bottom: 6, trailing: 21))
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
                     }
-                    .padding(.horizontal, 26)
-                    .padding(.top, 26)
-                    .padding(.bottom, 112)
                 }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
                 .scrollIndicators(.hidden)
+                .contentMargins(.top, 26, for: .scrollContent)
+                .contentMargins(.bottom, 112, for: .scrollContent)
             }
         }
     }
@@ -122,7 +150,10 @@ struct ContentView: View {
         HStack(spacing: 0) {
             ForEach(AppTab.allCases) { tab in
                 Button {
-                    selectedTab = tab
+                    if selectedTab != tab {
+                        Haptics.selection()
+                        selectedTab = tab
+                    }
                 } label: {
                     VStack(spacing: 6) {
                         Image(systemName: tab.systemImage)
@@ -157,7 +188,7 @@ struct ContentView: View {
                         .stroke(Color.white.opacity(0.11), lineWidth: 1)
                 }
         }
-        .padding(.horizontal, 28)
+        .padding(.horizontal, 22)
         .padding(.bottom, 0)
         .offset(y: 10)
     }
@@ -166,50 +197,110 @@ struct ContentView: View {
 private struct TaskRow: View {
     let task: TGTask
     let onToggleTimer: () -> Void
+    let editAction: () -> Void
     let deleteAction: () -> Void
 
+    @State private var isShowingActionMenu = false
+
     var body: some View {
-        HStack(spacing: 14) {
-            Text(task.symbol.isEmpty ? "T" : task.symbol)
-                .font(.system(size: 15, weight: .bold))
-                .foregroundStyle(.black)
-                .frame(width: 34, height: 34)
-                .background(task.color, in: Circle())
-
-            VStack(alignment: .leading, spacing: 5) {
-                Text(task.name)
-                    .font(.system(size: 19, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-
-                TaskDurationLabel(task: task)
+        rowContent
+            .contentShape(Rectangle())
+            .onTapGesture {
+                Haptics.impact(.light)
+                onToggleTimer()
             }
+            .simultaneousGesture(
+                LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                    Haptics.impact(.medium)
+                    isShowingActionMenu = true
+                }
+            )
+            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                Button(role: .destructive) {
+                    Haptics.impact(.rigid)
+                    deleteAction()
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+            }
+            .confirmationDialog(task.name, isPresented: $isShowingActionMenu, titleVisibility: .visible) {
+                Button("Edit") {
+                    Haptics.impact(.light)
+                    editAction()
+                }
+                Button("Delete", role: .destructive) {
+                    Haptics.impact(.rigid)
+                    deleteAction()
+                }
+            }
+    }
+
+    private var rowContent: some View {
+        HStack(spacing: 14) {
+            TaskAvatarCircle(color: task.color, symbol: task.symbol, isPulsing: task.isTimerRunning)
+
+            Text(task.name)
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
 
             Spacer()
 
-            Button(action: deleteAction) {
-                Image(systemName: "trash")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 38, height: 38)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Delete task")
+            TaskDurationLabel(task: task)
         }
         .padding(.horizontal, 18)
         .frame(height: 76)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.white.opacity(task.isTimerRunning ? 0.16 : 0.07))
+                .fill(task.isTimerRunning ? task.color.opacity(0.09) : Color.white.opacity(0.07))
         )
         .overlay {
             if task.isTimerRunning {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(Color.green.opacity(0.6), lineWidth: 1.5)
+                    .stroke(task.color.opacity(0.3), lineWidth: 1)
             }
         }
-        .contentShape(Rectangle())
-        .onTapGesture(perform: onToggleTimer)
+    }
+}
+
+private struct TaskAvatarCircle: View {
+    let color: Color
+    let symbol: String
+    let isPulsing: Bool
+
+    var body: some View {
+        if isPulsing {
+            TimelineView(.animation(minimumInterval: 1.0 / 12.0, paused: false)) { context in
+                let phase = context.date.timeIntervalSinceReferenceDate
+                let scale = 1.0 + 0.05 * (0.5 + 0.5 * sin(phase * (2 * .pi / 1.6)))
+                content.scaleEffect(scale)
+            }
+        } else {
+            content
+        }
+    }
+
+    private var content: some View {
+        Text(symbol.isEmpty ? "T" : symbol)
+            .font(.system(size: 15, weight: .bold))
+            .foregroundStyle(.black.opacity(0.8))
+            .frame(width: 34, height: 34)
+            .background {
+                Circle()
+                    .fill(color)
+                    .overlay {
+                        LinearGradient(
+                            colors: [Color.white.opacity(0.35), .clear, Color.black.opacity(0.12)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                        .clipShape(Circle())
+                    }
+                    .overlay {
+                        Circle()
+                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                    }
+            }
     }
 }
 
@@ -230,13 +321,13 @@ private struct TaskDurationLabel: View {
         HStack(spacing: 6) {
             if isRunning {
                 Circle()
-                    .fill(Color.green)
+                    .fill(task.color)
                     .frame(width: 6, height: 6)
             }
 
             Text(Self.format(seconds))
                 .font(.system(size: 15, weight: .medium, design: .monospaced))
-                .foregroundStyle(isRunning ? Color.green : .secondary)
+                .foregroundStyle(isRunning ? task.color : .secondary)
         }
     }
 
@@ -252,20 +343,61 @@ private struct TaskDurationLabel: View {
     }
 }
 
-private struct AddTaskView: View {
+private struct TaskFormView: View {
     @Environment(\.dismiss) private var dismiss
-    @State private var taskName = ""
-    @State private var selectedColorIndex = 0
+    @State private var taskName: String
+    @State private var customColors: [Color]
+    @State private var selectedColorIndex: Int
+    @State private var isShowingCustomColorPicker = false
 
-    let onCreate: (String, Color) -> Void
+    let navigationTitle: String
+    let confirmTitle: String
+    let onSave: (String, Color) -> Void
 
-    private let colors: [Color] = [
-        TGTask.defaultAccent,
-        Color(red: 0.55, green: 0.38, blue: 0.96),
-        Color(red: 0.19, green: 0.68, blue: 0.96),
-        Color(red: 1.00, green: 0.56, blue: 0.26),
-        Color(red: 0.97, green: 0.30, blue: 0.46),
+    private static let colors: [Color] = [
+        // Row 1
+        Color(red: 0.61, green: 0.24, blue: 0.78), // purple
+        Color(red: 0.85, green: 0.12, blue: 0.47), // magenta / raspberry
+        Color(red: 0.88, green: 0.14, blue: 0.24), // red
+        Color(red: 0.97, green: 0.58, blue: 0.12), // orange
+        Color(red: 1.00, green: 0.80, blue: 0.00), // yellow
+        Color(red: 0.20, green: 0.78, blue: 0.35), // green
+        Color(red: 0.35, green: 0.78, blue: 0.98), // sky blue
+        Color(red: 0.00, green: 0.48, blue: 1.00), // blue
+        // Row 2
+        Color(red: 0.35, green: 0.34, blue: 0.84), // indigo
+        Color(red: 0.69, green: 0.51, blue: 0.92), // lavender
+        Color(red: 1.00, green: 0.41, blue: 0.71), // pink
+        Color(red: 1.00, green: 0.44, blue: 0.38), // coral
+        Color(red: 0.64, green: 0.46, blue: 0.30), // brown
+        Color(red: 0.18, green: 0.80, blue: 0.60), // mint
+        Color(red: 0.19, green: 0.69, blue: 0.78), // teal
     ]
+
+    init(
+        initialName: String = "",
+        initialColor: Color = TGTask.defaultAccent,
+        navigationTitle: String,
+        confirmTitle: String,
+        onSave: @escaping (String, Color) -> Void
+    ) {
+        _taskName = State(initialValue: initialName)
+        let initialHex = TaskAppearance.hexString(from: initialColor)
+        if let matchedIndex = Self.colors.firstIndex(where: { TaskAppearance.hexString(from: $0) == initialHex }) {
+            _selectedColorIndex = State(initialValue: matchedIndex)
+            _customColors = State(initialValue: [])
+        } else {
+            _selectedColorIndex = State(initialValue: Self.colors.count)
+            _customColors = State(initialValue: [initialColor])
+        }
+        self.navigationTitle = navigationTitle
+        self.confirmTitle = confirmTitle
+        self.onSave = onSave
+    }
+
+    private var allColors: [Color] { Self.colors + customColors }
+
+    private var selectedColor: Color { allColors[selectedColorIndex] }
 
     var body: some View {
         NavigationStack {
@@ -277,24 +409,43 @@ private struct AddTaskView: View {
                     .frame(height: 52)
                     .background(Color.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                HStack(spacing: 12) {
-                    ForEach(colors.indices, id: \.self) { index in
-                        let color = colors[index]
+                VStack(alignment: .leading, spacing: 12) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 34), spacing: 12)], spacing: 12) {
+                        ForEach(Self.colors.indices, id: \.self) { index in
+                            colorSwatch(color: Self.colors[index], isSelected: selectedColorIndex == index) {
+                                selectedColorIndex = index
+                            }
+                        }
+
                         Button {
-                            selectedColorIndex = index
+                            Haptics.impact(.light)
+                            isShowingCustomColorPicker = true
                         } label: {
                             Circle()
-                                .fill(color)
+                                .fill(Color.white.opacity(0.12))
                                 .frame(width: 34, height: 34)
                                 .overlay {
-                                    if selectedColorIndex == index {
-                                        Circle()
-                                            .stroke(.white, lineWidth: 3)
-                                    }
+                                    Image(systemName: "plus")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundStyle(.white.opacity(0.7))
                                 }
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("Task color")
+                        .accessibilityLabel("Add custom color")
+                    }
+
+                    if !customColors.isEmpty {
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 34), spacing: 12)], spacing: 12) {
+                            ForEach(customColors.indices, id: \.self) { offset in
+                                let combinedIndex = Self.colors.count + offset
+                                colorSwatch(
+                                    color: customColors[offset],
+                                    isSelected: selectedColorIndex == combinedIndex,
+                                    action: { selectedColorIndex = combinedIndex },
+                                    onDelete: { deleteCustomColor(at: offset) }
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -302,7 +453,7 @@ private struct AddTaskView: View {
             }
             .padding(22)
             .background(Color.black)
-            .navigationTitle("New Task")
+            .navigationTitle(navigationTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -312,15 +463,130 @@ private struct AddTaskView: View {
                 }
 
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Create") {
-                        onCreate(taskName, colors[selectedColorIndex])
+                    Button(confirmTitle) {
+                        onSave(taskName, selectedColor)
                         dismiss()
                     }
                     .disabled(taskName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
+            .sheet(isPresented: $isShowingCustomColorPicker) {
+                CustomColorSheet(initialColor: selectedColor) { newColor in
+                    customColors.append(newColor)
+                    selectedColorIndex = Self.colors.count + customColors.count - 1
+                }
+            }
         }
         .preferredColorScheme(.dark)
+    }
+
+    private func colorSwatch(
+        color: Color,
+        isSelected: Bool,
+        action: @escaping () -> Void,
+        onDelete: (() -> Void)? = nil
+    ) -> some View {
+        Button {
+            Haptics.selection()
+            action()
+        } label: {
+            Circle()
+                .fill(color)
+                .frame(width: 34, height: 34)
+                .overlay {
+                    if isSelected {
+                        Circle()
+                            .fill(Color.black.opacity(0.35))
+                            .frame(width: 10, height: 10)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Task color")
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                guard onDelete != nil else { return }
+                Haptics.impact(.rigid)
+                onDelete?()
+            }
+        )
+    }
+
+    private func deleteCustomColor(at offset: Int) {
+        let combinedIndex = Self.colors.count + offset
+        customColors.remove(at: offset)
+        if selectedColorIndex == combinedIndex {
+            selectedColorIndex = 0
+        } else if selectedColorIndex > combinedIndex {
+            selectedColorIndex -= 1
+        }
+    }
+}
+
+private struct CustomColorSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var color: Color
+    @State private var hasSkippedInitialChange = false
+    @State private var pendingCommitID = UUID()
+
+    let onAdd: (Color) -> Void
+
+    init(initialColor: Color, onAdd: @escaping (Color) -> Void) {
+        _color = State(initialValue: initialColor)
+        self.onAdd = onAdd
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 22) {
+                Circle()
+                    .fill(color)
+                    .frame(width: 60, height: 60)
+
+                ColorPicker("Pick a color", selection: $color, supportsOpacity: false)
+
+                Spacer()
+            }
+            .padding(22)
+            .background(Color.black)
+            .navigationTitle("Custom Color")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Add") {
+                        Haptics.impact(.light)
+                        onAdd(color)
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .presentationDetents([.height(260)])
+        .presentationDragIndicator(.visible)
+        .preferredColorScheme(.dark)
+        .onChange(of: color) { _, newValue in
+            // ColorPicker fires one spurious change right when it appears
+            // (it normalizes the initial value), so the first change is ignored.
+            guard hasSkippedInitialChange else {
+                hasSkippedInitialChange = true
+                return
+            }
+            let commitID = UUID()
+            pendingCommitID = commitID
+            Task {
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                guard pendingCommitID == commitID else { return }
+                Haptics.impact(.light)
+                onAdd(newValue)
+                dismiss()
+            }
+        }
     }
 }
 
