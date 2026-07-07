@@ -7,6 +7,8 @@ import SwiftUI
 
 struct TaskRow: View {
     let task: TGTask
+    let sessions: [TaskTimeSession]
+    let timerOwnerStatus: (Date) -> TimerOwnerStatus
     let onToggleTimer: () -> Void
     let editAction: () -> Void
     let deleteAction: () -> Void
@@ -14,7 +16,7 @@ struct TaskRow: View {
     @State private var isShowingActionMenu = false
 
     var body: some View {
-        rowContent
+        timerAwareRowContent
             .contentShape(Rectangle())
             .onTapGesture {
                 Haptics.impact(.light)
@@ -46,9 +48,27 @@ struct TaskRow: View {
             }
     }
 
-    private var rowContent: some View {
+    @ViewBuilder
+    private var timerAwareRowContent: some View {
+        if task.isTimerRunning {
+            TimelineView(.animation(minimumInterval: 1.0 / 15.0, paused: false)) { context in
+                rowContent(status: timerOwnerStatus(context.date), date: context.date)
+            }
+        } else {
+            rowContent(status: .notRunning, date: Date())
+        }
+    }
+
+    private func rowContent(status: TimerOwnerStatus, date: Date) -> some View {
         HStack(spacing: 14) {
-            TaskAvatarCircle(color: task.color, symbol: task.symbol, isPulsing: task.isTimerRunning)
+            TaskProgressStrip(color: status.isInterrupted ? .orange : task.color)
+
+            TaskAvatarCircle(
+                color: task.color,
+                symbol: task.symbol,
+                isPulsing: task.isTimerRunning && !status.isInterrupted,
+                secondsText: task.isTimerRunning ? Self.secondsText(startedAt: task.timerStartedAt, at: date) : nil
+            )
 
             Text(task.name)
                 .font(.system(size: 19, weight: .semibold))
@@ -57,20 +77,38 @@ struct TaskRow: View {
 
             Spacer()
 
-            TaskDurationLabel(task: task)
+            TaskDurationLabel(task: task, sessions: sessions, ownerStatus: status, date: date)
         }
         .padding(.horizontal, 18)
         .frame(height: 76)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(task.isTimerRunning ? task.color.opacity(0.09) : Color.white.opacity(0.07))
+                .fill(task.isTimerRunning ? task.color.opacity(status.isInterrupted ? 0.05 : 0.09) : Color.white.opacity(0.07))
         )
         .overlay {
             if task.isTimerRunning {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(task.color.opacity(0.3), lineWidth: 0.7)
+                    .stroke(status.isInterrupted ? Color.orange.opacity(0.45) : task.color.opacity(0.3), lineWidth: 0.7)
             }
         }
+    }
+
+    private static func secondsText(startedAt: Date?, at date: Date) -> String {
+        guard let startedAt else { return "1" }
+        let elapsed = max(0, Int(date.timeIntervalSince(startedAt)))
+        return String((elapsed % 60) + 1)
+    }
+}
+
+private struct TaskProgressStrip: View {
+    let color: Color
+
+    private let fullHeight: CGFloat = 52
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 2, style: .continuous)
+            .fill(color)
+            .frame(width: 2.4, height: fullHeight)
     }
 }
 
@@ -78,6 +116,7 @@ struct TaskAvatarCircle: View {
     let color: Color
     let symbol: String
     let isPulsing: Bool
+    var secondsText: String? = nil
 
     var body: some View {
         if isPulsing {
@@ -92,25 +131,43 @@ struct TaskAvatarCircle: View {
     }
 
     private var content: some View {
-        Text(symbol.isEmpty ? "T" : symbol)
-            .font(.system(size: 15, weight: .bold))
-            .foregroundStyle(.white)
+        Text(secondsText ?? (symbol.isEmpty ? "T" : symbol))
+            .font(.system(size: secondsText != nil ? 12 : 15, weight: .bold, design: secondsText != nil ? .monospaced : .default))
+            .foregroundStyle(color)
             .frame(width: 34, height: 34)
-            .background(Circle().fill(color))
+            .background(
+                Circle()
+                    .fill(Color.clear)
+                    .overlay {
+                        Circle()
+                            .stroke(color, lineWidth: 1.2)
+                    }
+            )
     }
 }
 
 struct TaskDurationLabel: View {
     let task: TGTask
+    let sessions: [TaskTimeSession]
+    let ownerStatus: TimerOwnerStatus
+    let date: Date
+
+    private func totalSeconds(at date: Date) -> TimeInterval {
+        let calendar = Calendar.current
+        let dayStart = calendar.startOfDay(for: date)
+        let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? date
+        let runningEndDate = ownerStatus.interruptedAt ?? date
+
+        return sessions.reduce(0) { total, session in
+            let sessionEnd = session.endedAt ?? runningEndDate
+            let overlapStart = max(session.startedAt, dayStart)
+            let overlapEnd = min(sessionEnd, dayEnd)
+            return total + max(0, overlapEnd.timeIntervalSince(overlapStart))
+        }
+    }
 
     var body: some View {
-        if task.isTimerRunning {
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                durationView(seconds: task.totalTrackedSeconds(at: context.date), isRunning: true)
-            }
-        } else {
-            durationView(seconds: task.totalTrackedSeconds(), isRunning: false)
-        }
+        durationView(seconds: totalSeconds(at: date), isRunning: task.isTimerRunning && !ownerStatus.isInterrupted)
     }
 
     private func durationView(seconds: TimeInterval, isRunning: Bool) -> some View {
@@ -120,10 +177,15 @@ struct TaskDurationLabel: View {
                     .fill(task.color)
                     .frame(width: 6, height: 6)
             }
+            if ownerStatus.isInterrupted {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.orange)
+            }
 
             Text(Self.format(seconds))
                 .font(.system(size: 15, weight: .medium, design: .monospaced))
-                .foregroundStyle(isRunning ? task.color : .secondary)
+                .foregroundStyle(ownerStatus.isInterrupted ? .orange : (isRunning ? task.color : .secondary))
         }
     }
 
@@ -131,10 +193,6 @@ struct TaskDurationLabel: View {
         let total = max(0, Int(seconds))
         let hours = total / 3600
         let minutes = (total % 3600) / 60
-        let secs = total % 60
-        if hours > 0 {
-            return String(format: "%d:%02d:%02d", hours, minutes, secs)
-        }
-        return String(format: "%02d:%02d", minutes, secs)
+        return String(format: "%02d:%02d", hours, minutes)
     }
 }

@@ -12,9 +12,41 @@ import Foundation
 import SwiftUI
 import UIKit
 
+enum TimerOwnerStatus: Equatable {
+    case notRunning
+    case active
+    case inactive(deviceName: String?, lastAliveAt: Date?)
+    case stale(deviceName: String?, lastAliveAt: Date)
+    case unknown
+
+    var interruptedAt: Date? {
+        switch self {
+        case .inactive(_, let lastAliveAt):
+            return lastAliveAt
+        case .stale(_, let lastAliveAt):
+            return lastAliveAt
+        case .notRunning, .active, .unknown:
+            return nil
+        }
+    }
+
+    var isInterrupted: Bool {
+        switch self {
+        case .inactive, .stale:
+            return true
+        case .notRunning, .active, .unknown:
+            return false
+        }
+    }
+}
+
 @MainActor
 final class TaskService: NSObject, ObservableObject {
     @Published private(set) var tasks: [TGTask] = []
+    @Published private(set) var sessions: [TaskTimeSession] = []
+    @Published private(set) var devices: [String: UserDeviceHeartbeat] = [:]
+    @Published private(set) var trackingSettings: TrackingSettings = .defaults
+    @Published private(set) var pendingStops: [String: AutoTrackPendingStop] = [:]
     @Published private(set) var isSignedIn = false
     @Published private(set) var currentUser: User?
 
@@ -24,11 +56,35 @@ final class TaskService: NSObject, ObservableObject {
 
     private let db = Firestore.firestore()
     private var listener: ListenerRegistration?
+    private var sessionsListener: ListenerRegistration?
+    private var devicesListener: ListenerRegistration?
+    private var trackingSettingsListener: ListenerRegistration?
     private var authHandle: AuthStateDidChangeListenerHandle?
+    private var staleTimer: Timer?
+    private var heartbeatTimer: Timer?
     private var currentNonce: String?
+    private var autoClosingTaskIDs: Set<String> = []
+    private let staleCheckInterval: TimeInterval = 5
+    private let heartbeatInterval: TimeInterval = 15
 
     private func tasksCollection(for uid: String) -> CollectionReference {
         db.collection("users").document(uid).collection("tasks")
+    }
+
+    private func sessionsCollection(for uid: String) -> CollectionReference {
+        db.collection("users").document(uid).collection("sessions")
+    }
+
+    private func devicesCollection(for uid: String) -> CollectionReference {
+        db.collection("users").document(uid).collection("devices")
+    }
+
+    private func trackingSettingsDocument(for uid: String) -> DocumentReference {
+        db.collection("users").document(uid).collection("settings").document("tracking")
+    }
+
+    private func currentDeviceDocument(for uid: String) -> DocumentReference {
+        devicesCollection(for: uid).document(Self.currentDeviceID)
     }
 
     func start() {
@@ -41,9 +97,22 @@ final class TaskService: NSObject, ObservableObject {
                 self.isSignedIn = user != nil
                 if let user {
                     self.observeTasks(uid: user.uid)
+                    self.observeSessions(uid: user.uid)
+                    self.observeDevices(uid: user.uid)
+                    self.observeTrackingSettings(uid: user.uid)
+                    self.startStaleTimer()
+                    self.handleScenePhase(.active)
                 } else {
                     self.listener?.remove()
+                    self.sessionsListener?.remove()
+                    self.devicesListener?.remove()
+                    self.trackingSettingsListener?.remove()
+                    self.stopStaleTimer()
+                    self.stopHeartbeatTimer()
                     self.tasks = []
+                    self.sessions = []
+                    self.devices = [:]
+                    self.pendingStops = [:]
                 }
             }
         }
@@ -72,6 +141,78 @@ final class TaskService: NSObject, ObservableObject {
                 Task { @MainActor in
                     self.tasks = decoded
                     print("Firestore tasks updated. count=\(decoded.count)")
+                    self.autoCloseInterruptedMacTimers()
+                    self.processExpiredPendingStops()
+                }
+            }
+    }
+
+    private func observeSessions(uid: String) {
+        sessionsListener?.remove()
+        let cutoff = Calendar.current.date(byAdding: .day, value: -30, to: Date()) ?? .distantPast
+        sessionsListener = sessionsCollection(for: uid)
+            .whereField("startedAt", isGreaterThan: Timestamp(date: cutoff))
+            .order(by: "startedAt", descending: true)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self else { return }
+                if let error {
+                    print("Firestore sessions listen error: \(error.localizedDescription)")
+                    return
+                }
+                let documents = snapshot?.documents ?? []
+                let decoded = documents.compactMap { try? $0.data(as: TaskTimeSession.self) }
+                Task { @MainActor in
+                    self.sessions = decoded
+                }
+            }
+    }
+
+    private func observeDevices(uid: String) {
+        devicesListener?.remove()
+        devicesListener = devicesCollection(for: uid)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self else { return }
+                if let error {
+                    print("Firestore devices listen error: \(error.localizedDescription)")
+                    return
+                }
+                let documents = snapshot?.documents ?? []
+                let decoded = documents.compactMap { try? $0.data(as: UserDeviceHeartbeat.self) }
+                var devicesByID: [String: UserDeviceHeartbeat] = [:]
+                for device in decoded {
+                    if let id = device.resolvedDeviceID {
+                        devicesByID[id] = device
+                    }
+                    if let id = device.id {
+                        devicesByID[id] = device
+                    }
+                }
+                Task { @MainActor in
+                    self.devices = devicesByID
+                    self.autoCloseInterruptedMacTimers()
+                }
+            }
+    }
+
+    private func observeTrackingSettings(uid: String) {
+        trackingSettingsListener?.remove()
+        trackingSettingsListener = trackingSettingsDocument(for: uid)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self else { return }
+                if let error {
+                    print("Firestore tracking settings listen error: \(error.localizedDescription)")
+                    return
+                }
+
+                if let snapshot, snapshot.exists {
+                    let settings = (try? snapshot.data(as: TrackingSettings.self)) ?? .defaults
+                    Task { @MainActor in
+                        self.trackingSettings = settings
+                    }
+                } else {
+                    Task { @MainActor in
+                        self.writeTrackingSettings(.defaults, uid: uid)
+                    }
                 }
             }
     }
@@ -89,8 +230,13 @@ final class TaskService: NSObject, ObservableObject {
             colorHex: TaskAppearance.hexString(from: color),
             createdAt: now,
             updatedAt: now,
-            trackedSeconds: 0,
-            timerStartedAt: nil
+            timerStartedAt: nil,
+            activeSessionID: nil,
+            timerOwnerDeviceID: nil,
+            timerOwnerPlatform: nil,
+            timerOwnerDeviceName: nil,
+            timerOwnerLastAliveAt: nil,
+            timerOwnerIsActive: nil
         )
 
         do {
@@ -125,20 +271,60 @@ final class TaskService: NSObject, ObservableObject {
 
     func startTimer(for task: TGTask) {
         guard let uid = currentUser?.uid, let id = task.id, !task.isTimerRunning else { return }
-        tasksCollection(for: uid).document(id).updateData([
-            "timerStartedAt": Timestamp(date: Date()),
-            "updatedAt": Timestamp(date: Date()),
-        ])
+        let now = Date()
+
+        let session = TaskTimeSession(
+            id: nil,
+            taskID: id,
+            taskName: task.name,
+            colorHex: task.colorHex,
+            startedAt: now,
+            endedAt: nil,
+            startedByDeviceID: Self.currentDeviceID,
+            startedByPlatform: Self.currentPlatform,
+            startedByDeviceName: Self.currentDeviceName
+        )
+
+        do {
+            let ref = try sessionsCollection(for: uid).addDocument(from: session)
+            tasksCollection(for: uid).document(id).updateData([
+                "timerStartedAt": Timestamp(date: now),
+                "activeSessionID": ref.documentID,
+                "timerOwnerDeviceID": Self.currentDeviceID,
+                "timerOwnerPlatform": Self.currentPlatform,
+                "timerOwnerDeviceName": Self.currentDeviceName,
+                "timerOwnerLastAliveAt": Timestamp(date: now),
+                "timerOwnerIsActive": true,
+                "updatedAt": Timestamp(date: now),
+            ])
+        } catch {
+            print("Failed to start session: \(error.localizedDescription)")
+        }
     }
 
     func stopTimer(for task: TGTask) {
-        guard let uid = currentUser?.uid, let id = task.id, let startedAt = task.timerStartedAt else { return }
-        let elapsed = Int(Date().timeIntervalSince(startedAt))
+        stopTimer(for: task, endedAt: Date())
+    }
+
+    private func stopTimer(for task: TGTask, endedAt: Date) {
+        guard let uid = currentUser?.uid, let id = task.id, task.timerStartedAt != nil else { return }
+        pendingStops.removeValue(forKey: id)
         tasksCollection(for: uid).document(id).updateData([
             "timerStartedAt": FieldValue.delete(),
-            "trackedSeconds": task.trackedSeconds + elapsed,
+            "activeSessionID": FieldValue.delete(),
+            "timerOwnerDeviceID": FieldValue.delete(),
+            "timerOwnerPlatform": FieldValue.delete(),
+            "timerOwnerDeviceName": FieldValue.delete(),
+            "timerOwnerLastAliveAt": FieldValue.delete(),
+            "timerOwnerIsActive": FieldValue.delete(),
             "updatedAt": Timestamp(date: Date()),
         ])
+
+        if let sessionID = task.activeSessionID {
+            sessionsCollection(for: uid).document(sessionID).updateData([
+                "endedAt": Timestamp(date: endedAt),
+            ])
+        }
     }
 
     private func fetchTasks(uid: String) async throws -> [TGTask] {
@@ -156,6 +342,257 @@ final class TaskService: NSObject, ObservableObject {
             }
         }
         print("Imported \(tasksToImport.count) local task(s) into signed-in account.")
+    }
+
+    func updateTrackingSettings(startDelaySeconds: Int? = nil, stopDelaySeconds: Int? = nil) {
+        guard let uid = currentUser?.uid else { return }
+        var settings = trackingSettings
+        if let startDelaySeconds {
+            settings.autoTrackStartDelaySeconds = max(0, startDelaySeconds)
+        }
+        if let stopDelaySeconds {
+            settings.autoTrackStopDelaySeconds = max(1, stopDelaySeconds)
+        }
+        writeTrackingSettings(settings, uid: uid)
+    }
+
+    func handleScenePhase(_ scenePhase: ScenePhase) {
+        guard currentUser?.uid != nil else { return }
+        switch scenePhase {
+        case .active:
+            Task { @MainActor in
+                await recoverOwnSuspendedTimers()
+                processExpiredPendingStops()
+                clearRecoverablePendingStops()
+                writeCurrentDeviceHeartbeat(isActive: true)
+                startHeartbeatTimer()
+            }
+        case .background:
+            let deactivatedAt = Date()
+            stopHeartbeatTimer()
+            writeCurrentDeviceHeartbeat(isActive: false, at: deactivatedAt)
+            createPendingStopsForOwnRunningTimers(deactivatedAt: deactivatedAt)
+        case .inactive:
+            break
+        @unknown default:
+            break
+        }
+    }
+
+    private func writeTrackingSettings(_ settings: TrackingSettings, uid: String) {
+        trackingSettingsDocument(for: uid).setData([
+            "autoTrackStartDelaySeconds": settings.autoTrackStartDelaySeconds,
+            "autoTrackStopDelaySeconds": settings.autoTrackStopDelaySeconds,
+            "updatedAt": Timestamp(date: Date()),
+        ], merge: true) { error in
+            if let error {
+                print("Failed to write tracking settings: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func startHeartbeatTimer() {
+        guard heartbeatTimer == nil else { return }
+        writeCurrentDeviceHeartbeat(isActive: true)
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: heartbeatInterval, repeats: true) { _ in
+            Task { @MainActor [weak self] in
+                self?.writeCurrentDeviceHeartbeat(isActive: true)
+            }
+        }
+    }
+
+    private func stopHeartbeatTimer() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+    }
+
+    private func writeCurrentDeviceHeartbeat(isActive: Bool, at date: Date = Date()) {
+        guard let uid = currentUser?.uid else { return }
+        currentDeviceDocument(for: uid).setData([
+            "deviceID": Self.currentDeviceID,
+            "deviceName": Self.currentDeviceName,
+            "platform": Self.currentPlatform,
+            "isActive": isActive,
+            "lastAliveAt": Timestamp(date: date),
+        ], merge: true) { error in
+            if let error {
+                print("Failed to write iPhone heartbeat: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func createPendingStopsForOwnRunningTimers(deactivatedAt: Date) {
+        let delaySeconds = max(1, trackingSettings.autoTrackStopDelaySeconds)
+        let deadline = deactivatedAt.addingTimeInterval(TimeInterval(delaySeconds))
+        for task in ownRunningTasks {
+            guard let taskID = task.id else { continue }
+            pendingStops[taskID] = AutoTrackPendingStop(
+                deadline: deadline,
+                delaySeconds: delaySeconds,
+                deactivatedAt: deactivatedAt
+            )
+        }
+    }
+
+    private func clearRecoverablePendingStops() {
+        let now = Date()
+        for (taskID, pendingStop) in pendingStops {
+            if now < pendingStop.deadline {
+                pendingStops.removeValue(forKey: taskID)
+            }
+        }
+    }
+
+    private func processExpiredPendingStops() {
+        let now = Date()
+        for (taskID, pendingStop) in pendingStops where now >= pendingStop.deadline {
+            guard let task = tasks.first(where: { $0.id == taskID }) else {
+                pendingStops.removeValue(forKey: taskID)
+                continue
+            }
+            stopTimer(for: task, endedAt: pendingStop.deactivatedAt)
+            pendingStops.removeValue(forKey: taskID)
+        }
+    }
+
+    private func recoverOwnSuspendedTimers() async {
+        guard let uid = currentUser?.uid else { return }
+        let heartbeatDate: Date?
+        do {
+            let snapshot = try await currentDeviceDocument(for: uid).getDocument()
+            let device = try? snapshot.data(as: UserDeviceHeartbeat.self)
+            heartbeatDate = device?.lastAliveAt
+        } catch {
+            print("Failed to fetch iPhone heartbeat for recovery: \(error.localizedDescription)")
+            heartbeatDate = devices[Self.currentDeviceID]?.lastAliveAt
+        }
+
+        guard let deactivatedAt = heartbeatDate else { return }
+        let elapsed = Date().timeIntervalSince(deactivatedAt)
+        guard elapsed > TimeInterval(trackingSettings.autoTrackStopDelaySeconds) else { return }
+
+        for task in ownRunningTasks {
+            stopTimer(for: task, endedAt: deactivatedAt)
+        }
+    }
+
+    private var ownRunningTasks: [TGTask] {
+        tasks.filter {
+            $0.timerStartedAt != nil &&
+            ($0.timerOwnerDeviceID == Self.currentDeviceID || $0.timerOwnerDeviceID == nil && $0.timerOwnerPlatform == Self.currentPlatform)
+        }
+    }
+
+    func timerOwnerStatus(for task: TGTask, at date: Date = Date()) -> TimerOwnerStatus {
+        guard task.isTimerRunning else { return .notRunning }
+
+        if task.timerOwnerPlatform?.localizedCaseInsensitiveContains("mac") == true,
+           task.timerOwnerIsActive == false {
+            return .inactive(deviceName: task.timerOwnerDeviceName, lastAliveAt: task.timerOwnerLastAliveAt)
+        }
+        if task.timerOwnerPlatform?.localizedCaseInsensitiveContains("mac") == true,
+           let lastAliveAt = task.timerOwnerLastAliveAt,
+           date.timeIntervalSince(lastAliveAt) > TimeInterval(trackingSettings.autoTrackStopDelaySeconds) {
+            return .stale(deviceName: task.timerOwnerDeviceName, lastAliveAt: lastAliveAt)
+        }
+
+        guard let ownerID = task.timerOwnerDeviceID, let device = devices[ownerID] else {
+            return .unknown
+        }
+
+        let deviceName = device.deviceName ?? task.timerOwnerDeviceName
+        if device.isActive == false {
+            if ownerID == Self.currentDeviceID,
+               let lastAliveAt = device.lastAliveAt,
+               date.timeIntervalSince(lastAliveAt) <= TimeInterval(trackingSettings.autoTrackStopDelaySeconds) {
+                return .active
+            }
+            return .inactive(deviceName: deviceName, lastAliveAt: device.lastAliveAt)
+        }
+        if let lastAliveAt = device.lastAliveAt,
+           date.timeIntervalSince(lastAliveAt) > TimeInterval(trackingSettings.autoTrackStopDelaySeconds) {
+            return .stale(deviceName: deviceName, lastAliveAt: lastAliveAt)
+        }
+        return .active
+    }
+
+    private func autoCloseInterruptedMacTimers() {
+        guard let uid = currentUser?.uid else { return }
+
+        for task in tasks {
+            guard let taskID = task.id,
+                  task.timerStartedAt != nil,
+                  !autoClosingTaskIDs.contains(taskID) else { continue }
+
+            let status = timerOwnerStatus(for: task)
+            guard let interruptedAt = status.interruptedAt else { continue }
+
+            autoClosingTaskIDs.insert(taskID)
+            closeInterruptedTimer(task, uid: uid, endedAt: interruptedAt)
+        }
+    }
+
+    private func closeInterruptedTimer(_ task: TGTask, uid: String, endedAt: Date) {
+        guard let taskID = task.id else { return }
+        pendingStops.removeValue(forKey: taskID)
+
+        let batch = db.batch()
+        let taskRef = tasksCollection(for: uid).document(taskID)
+        batch.updateData([
+            "timerStartedAt": FieldValue.delete(),
+            "activeSessionID": FieldValue.delete(),
+            "timerOwnerDeviceID": FieldValue.delete(),
+            "timerOwnerPlatform": FieldValue.delete(),
+            "timerOwnerDeviceName": FieldValue.delete(),
+            "timerOwnerLastAliveAt": FieldValue.delete(),
+            "timerOwnerIsActive": FieldValue.delete(),
+            "updatedAt": Timestamp(date: Date()),
+        ], forDocument: taskRef)
+
+        if let sessionID = task.activeSessionID {
+            let sessionRef = sessionsCollection(for: uid).document(sessionID)
+            batch.updateData([
+                "endedAt": Timestamp(date: endedAt),
+            ], forDocument: sessionRef)
+        }
+
+        batch.commit { error in
+            Task { @MainActor [weak self] in
+                self?.autoClosingTaskIDs.remove(taskID)
+                if let error {
+                    print("Failed to auto-close interrupted timer: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func startStaleTimer() {
+        guard staleTimer == nil else { return }
+        staleTimer = Timer.scheduledTimer(withTimeInterval: staleCheckInterval, repeats: true) { _ in
+            Task { @MainActor [weak self] in
+                self?.processExpiredPendingStops()
+                self?.autoCloseInterruptedMacTimers()
+            }
+        }
+    }
+
+    private func stopStaleTimer() {
+        staleTimer?.invalidate()
+        staleTimer = nil
+        autoClosingTaskIDs = []
+        pendingStops = [:]
+    }
+
+    private static var currentDeviceID: String {
+        UIDevice.current.identifierForVendor?.uuidString ?? "ios-device"
+    }
+
+    private static var currentDeviceName: String {
+        UIDevice.current.name
+    }
+
+    private static var currentPlatform: String {
+        "iOS"
     }
 
     // MARK: - Sign in with Apple

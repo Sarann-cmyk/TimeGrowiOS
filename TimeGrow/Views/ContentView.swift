@@ -101,6 +101,8 @@ struct ContentView: View {
                     ForEach(taskService.tasks) { task in
                         TaskRow(
                             task: task,
+                            sessions: taskService.sessions.filter { $0.taskID == task.id },
+                            timerOwnerStatus: { taskService.timerOwnerStatus(for: task, at: $0) },
                             onToggleTimer: { toggleTimer(task) },
                             editAction: { taskBeingEdited = task },
                             deleteAction: { taskService.deleteTask(task) }

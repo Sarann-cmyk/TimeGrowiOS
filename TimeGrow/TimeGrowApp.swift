@@ -14,6 +14,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {}
 struct TimeGrowApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject private var taskService: TaskService
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         FirebaseApp.configure()
@@ -26,6 +27,9 @@ struct TimeGrowApp: App {
                 .environmentObject(taskService)
                 .onAppear {
                     taskService.start()
+                }
+                .onChange(of: scenePhase) { _, newPhase in
+                    taskService.handleScenePhase(newPhase)
                 }
         }
     }

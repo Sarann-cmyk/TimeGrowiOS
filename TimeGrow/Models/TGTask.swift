@@ -13,8 +13,13 @@ struct TGTask: Identifiable, Codable, Equatable {
     var colorHex: String
     var createdAt: Date
     var updatedAt: Date
-    var trackedSeconds: Int
     var timerStartedAt: Date?
+    var activeSessionID: String?
+    var timerOwnerDeviceID: String?
+    var timerOwnerPlatform: String?
+    var timerOwnerDeviceName: String?
+    var timerOwnerLastAliveAt: Date?
+    var timerOwnerIsActive: Bool?
 
     static let defaultAccent = Color(red: 0.55, green: 0.84, blue: 0.09)
 
@@ -28,11 +33,5 @@ struct TGTask: Identifiable, Codable, Equatable {
 
     var isTimerRunning: Bool {
         timerStartedAt != nil
-    }
-
-    func totalTrackedSeconds(at date: Date = Date()) -> TimeInterval {
-        let stored = TimeInterval(trackedSeconds)
-        guard let timerStartedAt else { return stored }
-        return stored + max(0, date.timeIntervalSince(timerStartedAt))
     }
 }
