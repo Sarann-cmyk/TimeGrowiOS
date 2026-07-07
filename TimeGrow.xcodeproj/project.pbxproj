@@ -7,13 +7,47 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		4056B7D989B53BED2634A480 /* AutoTrackingExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 104D9DA54C1EACFDE8DD2264 /* AutoTrackingExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		43CA1BAB4BAA87F84C13A908 /* DeviceActivity.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 383BE76F4E5A2DA6FFA7D60B /* DeviceActivity.framework */; };
+		6A6861BE315942EDFD5622F1 /* AutoTrackingExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8359DAA4B916ED508B7710A5 /* AutoTrackingExtension.swift */; };
+		C3B6AFD662FB4BA7ADC0408B /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 07E701AD1415D7A18A363A7D /* Foundation.framework */; };
 		E244C36A2FF97B530026734E /* FirebaseAnalytics in Frameworks */ = {isa = PBXBuildFile; productRef = E244C3692FF97B530026734E /* FirebaseAnalytics */; };
 		E244C36C2FF97B530026734E /* FirebaseAuth in Frameworks */ = {isa = PBXBuildFile; productRef = E244C36B2FF97B530026734E /* FirebaseAuth */; };
 		E244C36E2FF97B530026734E /* FirebaseFirestore in Frameworks */ = {isa = PBXBuildFile; productRef = E244C36D2FF97B530026734E /* FirebaseFirestore */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		303AC57CB964FC68F6663950 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = E2BAEF1F2FF7CEDA0004282D /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 5254F00483309052DBC287C1;
+			remoteInfo = AutoTrackingExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		7D0BF31230DFC075A0704A94 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				4056B7D989B53BED2634A480 /* AutoTrackingExtension.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		07E701AD1415D7A18A363A7D /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
+		104D9DA54C1EACFDE8DD2264 /* AutoTrackingExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = AutoTrackingExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		383BE76F4E5A2DA6FFA7D60B /* DeviceActivity.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = DeviceActivity.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/DeviceActivity.framework; sourceTree = DEVELOPER_DIR; };
+		3C361313133AC9B3E22DFE2A /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		8359DAA4B916ED508B7710A5 /* AutoTrackingExtension.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AutoTrackingExtension.swift; sourceTree = "<group>"; };
 		E2BAEF272FF7CEDA0004282D /* TimeGrow.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TimeGrow.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F8557A2C21F38A593367B633 /* AutoTrackingExtension.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = AutoTrackingExtension.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -38,6 +72,15 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		CDC0B256291A49987E7D4CB3 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C3B6AFD662FB4BA7ADC0408B /* Foundation.framework in Frameworks */,
+				43CA1BAB4BAA87F84C13A908 /* DeviceActivity.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		E2BAEF242FF7CEDA0004282D /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -51,11 +94,41 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		6DEAECE9BEC9834BDB3820D4 /* AutoTrackingExtension */ = {
+			isa = PBXGroup;
+			children = (
+				8359DAA4B916ED508B7710A5 /* AutoTrackingExtension.swift */,
+				3C361313133AC9B3E22DFE2A /* Info.plist */,
+				F8557A2C21F38A593367B633 /* AutoTrackingExtension.entitlements */,
+			);
+			name = AutoTrackingExtension;
+			path = AutoTrackingExtension;
+			sourceTree = "<group>";
+		};
+		9655873538177B3E10191D69 /* iOS */ = {
+			isa = PBXGroup;
+			children = (
+				07E701AD1415D7A18A363A7D /* Foundation.framework */,
+				383BE76F4E5A2DA6FFA7D60B /* DeviceActivity.framework */,
+			);
+			name = iOS;
+			sourceTree = "<group>";
+		};
+		AD5A95F8F811A59C6EDC2AAA /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				9655873538177B3E10191D69 /* iOS */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		E2BAEF1E2FF7CEDA0004282D = {
 			isa = PBXGroup;
 			children = (
 				E2BAEF292FF7CEDA0004282D /* TimeGrow */,
 				E2BAEF282FF7CEDA0004282D /* Products */,
+				AD5A95F8F811A59C6EDC2AAA /* Frameworks */,
+				6DEAECE9BEC9834BDB3820D4 /* AutoTrackingExtension */,
 			);
 			sourceTree = "<group>";
 		};
@@ -63,6 +136,7 @@
 			isa = PBXGroup;
 			children = (
 				E2BAEF272FF7CEDA0004282D /* TimeGrow.app */,
+				104D9DA54C1EACFDE8DD2264 /* AutoTrackingExtension.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -70,6 +144,23 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		5254F00483309052DBC287C1 /* AutoTrackingExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5F5DEDFE1535B5F6C4D9B0A7 /* Build configuration list for PBXNativeTarget "AutoTrackingExtension" */;
+			buildPhases = (
+				90D22BF1D4438B0EB9B9A17A /* Sources */,
+				CDC0B256291A49987E7D4CB3 /* Frameworks */,
+				722C4E3C8C4982B7288F440D /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = AutoTrackingExtension;
+			productName = AutoTrackingExtension;
+			productReference = 104D9DA54C1EACFDE8DD2264 /* AutoTrackingExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		E2BAEF262FF7CEDA0004282D /* TimeGrow */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = E2BAEF352FF7CEDB0004282D /* Build configuration list for PBXNativeTarget "TimeGrow" */;
@@ -77,10 +168,12 @@
 				E2BAEF232FF7CEDA0004282D /* Sources */,
 				E2BAEF242FF7CEDA0004282D /* Frameworks */,
 				E2BAEF252FF7CEDA0004282D /* Resources */,
+				7D0BF31230DFC075A0704A94 /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				80315BF7BEC0C08FC3419F82 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				E2BAEF292FF7CEDA0004282D /* TimeGrow */,
@@ -105,6 +198,9 @@
 				LastSwiftUpdateCheck = 2650;
 				LastUpgradeCheck = 2650;
 				TargetAttributes = {
+					5254F00483309052DBC287C1 = {
+						CreatedOnToolsVersion = 26.5;
+					};
 					E2BAEF262FF7CEDA0004282D = {
 						CreatedOnToolsVersion = 26.5;
 					};
@@ -128,11 +224,19 @@
 			projectRoot = "";
 			targets = (
 				E2BAEF262FF7CEDA0004282D /* TimeGrow */,
+				5254F00483309052DBC287C1 /* AutoTrackingExtension */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		722C4E3C8C4982B7288F440D /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		E2BAEF252FF7CEDA0004282D /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -143,6 +247,14 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		90D22BF1D4438B0EB9B9A17A /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6A6861BE315942EDFD5622F1 /* AutoTrackingExtension.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		E2BAEF232FF7CEDA0004282D /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -152,7 +264,71 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		80315BF7BEC0C08FC3419F82 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = AutoTrackingExtension;
+			target = 5254F00483309052DBC287C1 /* AutoTrackingExtension */;
+			targetProxy = 303AC57CB964FC68F6663950 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		1D324E9C61165BB306315A9C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_ENTITLEMENTS = AutoTrackingExtension/AutoTrackingExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 9CYR3K5YHR;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = AutoTrackingExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = WINNER.ltd.TimeGrow.AutoTrackingExtension;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		536C93A5C79269779786D4D6 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_ENTITLEMENTS = AutoTrackingExtension/AutoTrackingExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 9CYR3K5YHR;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = AutoTrackingExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = WINNER.ltd.TimeGrow.AutoTrackingExtension;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
 		E2BAEF362FF7CEDB0004282D /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -345,6 +521,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		5F5DEDFE1535B5F6C4D9B0A7 /* Build configuration list for PBXNativeTarget "AutoTrackingExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1D324E9C61165BB306315A9C /* Release */,
+				536C93A5C79269779786D4D6 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		E2BAEF222FF7CEDA0004282D /* Build configuration list for PBXProject "TimeGrow" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

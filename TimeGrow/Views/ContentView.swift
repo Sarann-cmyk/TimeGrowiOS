@@ -13,6 +13,7 @@ struct ContentView: View {
     @State private var selectedTab: AppTab = .tasks
     @State private var isShowingAddTask = false
     @State private var taskBeingEdited: TGTask?
+    @State private var taskForAutoTracking: TGTask?
 
     var body: some View {
         ZStack {
@@ -57,6 +58,9 @@ struct ContentView: View {
             }
             .presentationDetents([.height(360)])
             .presentationDragIndicator(.visible)
+        }
+        .sheet(item: $taskForAutoTracking) { task in
+            AutoTrackingPickerView(task: task)
         }
         .preferredColorScheme(.dark)
     }
@@ -105,7 +109,8 @@ struct ContentView: View {
                             timerOwnerStatus: { taskService.timerOwnerStatus(for: task, at: $0) },
                             onToggleTimer: { toggleTimer(task) },
                             editAction: { taskBeingEdited = task },
-                            deleteAction: { taskService.deleteTask(task) }
+                            deleteAction: { taskService.deleteTask(task) },
+                            autoTrackAction: { taskForAutoTracking = task }
                         )
                         .listRowInsets(EdgeInsets(top: 6, leading: 21, bottom: 6, trailing: 21))
                         .listRowBackground(Color.clear)

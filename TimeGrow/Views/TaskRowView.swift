@@ -12,6 +12,7 @@ struct TaskRow: View {
     let onToggleTimer: () -> Void
     let editAction: () -> Void
     let deleteAction: () -> Void
+    let autoTrackAction: () -> Void
 
     @State private var isShowingActionMenu = false
 
@@ -41,6 +42,10 @@ struct TaskRow: View {
                     Haptics.impact(.light)
                     editAction()
                 }
+                Button("Автотрекінг") {
+                    Haptics.impact(.light)
+                    autoTrackAction()
+                }
                 Button("Delete", role: .destructive) {
                     Haptics.impact(.rigid)
                     deleteAction()
@@ -50,7 +55,7 @@ struct TaskRow: View {
 
     @ViewBuilder
     private var timerAwareRowContent: some View {
-        if task.isTimerRunning {
+        if task.isTimerRunning || isAutoTrackLive(at: Date()) {
             TimelineView(.animation(minimumInterval: 1.0 / 15.0, paused: false)) { context in
                 rowContent(status: timerOwnerStatus(context.date), date: context.date)
             }
@@ -60,14 +65,20 @@ struct TaskRow: View {
     }
 
     private func rowContent(status: TimerOwnerStatus, date: Date) -> some View {
-        HStack(spacing: 14) {
-            TaskProgressStrip(color: status.isInterrupted ? .orange : task.color)
+        let autoLiveSession = autoTrackLiveSession(at: date)
+        let isAutoLive = autoLiveSession != nil
+        let isVisuallyActive = task.isTimerRunning || isAutoLive
+        let isInterrupted = task.isTimerRunning && status.isInterrupted
+        let secondsStart = task.timerStartedAt ?? autoLiveSession?.startedAt
+
+        return HStack(spacing: 14) {
+            TaskProgressStrip(color: isInterrupted ? .orange : task.color)
 
             TaskAvatarCircle(
                 color: task.color,
                 symbol: task.symbol,
-                isPulsing: task.isTimerRunning && !status.isInterrupted,
-                secondsText: task.isTimerRunning ? Self.secondsText(startedAt: task.timerStartedAt, at: date) : nil
+                isPulsing: isVisuallyActive && !isInterrupted,
+                secondsText: isVisuallyActive ? Self.secondsText(startedAt: secondsStart, at: date) : nil
             )
 
             Text(task.name)
@@ -83,14 +94,30 @@ struct TaskRow: View {
         .frame(height: 76)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(task.isTimerRunning ? task.color.opacity(status.isInterrupted ? 0.05 : 0.09) : Color.white.opacity(0.07))
+                .fill(isVisuallyActive ? task.color.opacity(isInterrupted ? 0.05 : 0.09) : Color.white.opacity(0.07))
         )
         .overlay {
-            if task.isTimerRunning {
+            if isVisuallyActive {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(status.isInterrupted ? Color.orange.opacity(0.45) : task.color.opacity(0.3), lineWidth: 0.7)
+                    .stroke(isInterrupted ? Color.orange.opacity(0.45) : task.color.opacity(0.3), lineWidth: 0.7)
             }
         }
+    }
+
+    private func isAutoTrackLive(at date: Date) -> Bool {
+        autoTrackLiveSession(at: date) != nil
+    }
+
+    private func autoTrackLiveSession(at date: Date) -> TaskTimeSession? {
+        sessions
+            .filter { session in
+                guard session.startedAutomatically == true,
+                      let endedAt = session.endedAt else { return false }
+                return date.timeIntervalSince(endedAt) <= autoTrackingInactivityGraceSeconds
+            }
+            .max { first, second in
+                (first.endedAt ?? first.startedAt) < (second.endedAt ?? second.startedAt)
+            }
     }
 
     private static func secondsText(startedAt: Date?, at date: Date) -> String {
@@ -157,17 +184,53 @@ struct TaskDurationLabel: View {
         let dayStart = calendar.startOfDay(for: date)
         let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? date
         let runningEndDate = ownerStatus.interruptedAt ?? date
+        let liveAutoSessionID = autoTrackLiveSession(at: date)?.id
 
-        return sessions.reduce(0) { total, session in
-            let sessionEnd = session.endedAt ?? runningEndDate
+        let sessionSeconds = sessions.reduce(0) { total, session in
+            let sessionEnd: Date
+            if session.id == liveAutoSessionID {
+                sessionEnd = date
+            } else {
+                sessionEnd = session.endedAt ?? runningEndDate
+            }
             let overlapStart = max(session.startedAt, dayStart)
             let overlapEnd = min(sessionEnd, dayEnd)
             return total + max(0, overlapEnd.timeIntervalSince(overlapStart))
         }
+
+        guard task.isTimerRunning,
+              let timerStartedAt = task.timerStartedAt,
+              !sessions.contains(where: { session in
+                  if let activeSessionID = task.activeSessionID, session.id == activeSessionID {
+                      return true
+                  }
+                  return session.endedAt == nil
+              }) else {
+            return sessionSeconds
+        }
+
+        let overlapStart = max(timerStartedAt, dayStart)
+        let overlapEnd = min(runningEndDate, dayEnd)
+        return sessionSeconds + max(0, overlapEnd.timeIntervalSince(overlapStart))
     }
 
     var body: some View {
-        durationView(seconds: totalSeconds(at: date), isRunning: task.isTimerRunning && !ownerStatus.isInterrupted)
+        durationView(
+            seconds: totalSeconds(at: date),
+            isRunning: (task.isTimerRunning && !ownerStatus.isInterrupted) || autoTrackLiveSession(at: date) != nil
+        )
+    }
+
+    private func autoTrackLiveSession(at date: Date) -> TaskTimeSession? {
+        sessions
+            .filter { session in
+                guard session.startedAutomatically == true,
+                      let endedAt = session.endedAt else { return false }
+                return date.timeIntervalSince(endedAt) <= autoTrackingInactivityGraceSeconds
+            }
+            .max { first, second in
+                (first.endedAt ?? first.startedAt) < (second.endedAt ?? second.startedAt)
+            }
     }
 
     private func durationView(seconds: TimeInterval, isRunning: Bool) -> some View {

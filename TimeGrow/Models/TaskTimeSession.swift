@@ -17,6 +17,7 @@ struct TaskTimeSession: Identifiable, Codable, Equatable {
     var startedByDeviceID: String?
     var startedByPlatform: String?
     var startedByDeviceName: String?
+    var startedAutomatically: Bool?
 
     var isRunning: Bool { endedAt == nil }
 

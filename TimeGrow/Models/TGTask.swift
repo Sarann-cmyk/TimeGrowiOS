@@ -20,6 +20,10 @@ struct TGTask: Identifiable, Codable, Equatable {
     var timerOwnerDeviceName: String?
     var timerOwnerLastAliveAt: Date?
     var timerOwnerIsActive: Bool?
+    var autoTrackLastUsageAt: Date?
+    var autoTrackLiveUntil: Date?
+    var autoTrackActiveSessionID: String?
+    var autoTrackSessionStartedAt: Date?
 
     static let defaultAccent = Color(red: 0.55, green: 0.84, blue: 0.09)
 

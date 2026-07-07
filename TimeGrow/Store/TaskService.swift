@@ -64,8 +64,20 @@ final class TaskService: NSObject, ObservableObject {
     private var heartbeatTimer: Timer?
     private var currentNonce: String?
     private var autoClosingTaskIDs: Set<String> = []
+    private var queuedAutoTrackEvents: [PendingAutoTrackEvent] = []
+    private var optimisticTimerStarts: [String: OptimisticTimerStart] = [:]
     private let staleCheckInterval: TimeInterval = 5
     private let heartbeatInterval: TimeInterval = 15
+    private let autoTrackingFirebaseProjectID = "timegrowmac"
+    private let autoTrackingAuthUIDKey = "autoTracking.firebase.uid"
+    private let autoTrackingAuthIDTokenKey = "autoTracking.firebase.idToken"
+    private let autoTrackingAuthTokenExpirationKey = "autoTracking.firebase.idTokenExpiration"
+
+    private struct OptimisticTimerStart {
+        let sessionID: String?
+        let startedAt: Date
+        let updatedAt: Date
+    }
 
     private func tasksCollection(for uid: String) -> CollectionReference {
         db.collection("users").document(uid).collection("tasks")
@@ -96,6 +108,7 @@ final class TaskService: NSObject, ObservableObject {
                 self.currentUser = user
                 self.isSignedIn = user != nil
                 if let user {
+                    self.refreshAutoTrackingFirebaseAuthSnapshot(for: user)
                     self.observeTasks(uid: user.uid)
                     self.observeSessions(uid: user.uid)
                     self.observeDevices(uid: user.uid)
@@ -113,6 +126,7 @@ final class TaskService: NSObject, ObservableObject {
                     self.sessions = []
                     self.devices = [:]
                     self.pendingStops = [:]
+                    self.clearAutoTrackingFirebaseAuthSnapshot()
                 }
             }
         }
@@ -124,6 +138,31 @@ final class TaskService: NSObject, ObservableObject {
                 }
             }
         }
+    }
+
+    private func refreshAutoTrackingFirebaseAuthSnapshot(for user: User) {
+        user.getIDTokenResult(forcingRefresh: false) { [weak self] result, error in
+            guard let self else { return }
+            if let error {
+                print("Failed to refresh auto-tracking Firebase token: \(error.localizedDescription)")
+                return
+            }
+            guard let result,
+                  let shared = UserDefaults(suiteName: autoTrackingAppGroupID) else { return }
+            shared.set(user.uid, forKey: self.autoTrackingAuthUIDKey)
+            shared.set(result.token, forKey: self.autoTrackingAuthIDTokenKey)
+            shared.set(result.expirationDate.timeIntervalSince1970, forKey: self.autoTrackingAuthTokenExpirationKey)
+            shared.set(self.autoTrackingFirebaseProjectID, forKey: "autoTracking.firebase.projectID")
+            print("Updated auto-tracking Firebase auth snapshot. expiresAt=\(result.expirationDate)")
+        }
+    }
+
+    private func clearAutoTrackingFirebaseAuthSnapshot() {
+        guard let shared = UserDefaults(suiteName: autoTrackingAppGroupID) else { return }
+        shared.removeObject(forKey: autoTrackingAuthUIDKey)
+        shared.removeObject(forKey: autoTrackingAuthIDTokenKey)
+        shared.removeObject(forKey: autoTrackingAuthTokenExpirationKey)
+        shared.removeObject(forKey: "autoTracking.firebase.projectID")
     }
 
     private func observeTasks(uid: String) {
@@ -139,8 +178,11 @@ final class TaskService: NSObject, ObservableObject {
                 let documents = snapshot?.documents ?? []
                 let decoded = documents.compactMap { try? $0.data(as: TGTask.self) }
                 Task { @MainActor in
-                    self.tasks = decoded
-                    print("Firestore tasks updated. count=\(decoded.count)")
+                    let merged = decoded.map { self.mergingOptimisticTimerStart(into: $0) }
+                    self.tasks = merged
+                    print("Firestore tasks updated. count=\(merged.count)")
+                    self.processQueuedAutoTrackEvents()
+                    self.closeRunningAutoTrackedTimers()
                     self.autoCloseInterruptedMacTimers()
                     self.processExpiredPendingStops()
                 }
@@ -163,6 +205,7 @@ final class TaskService: NSObject, ObservableObject {
                 let decoded = documents.compactMap { try? $0.data(as: TaskTimeSession.self) }
                 Task { @MainActor in
                     self.sessions = decoded
+                    self.closeRunningAutoTrackedTimers()
                 }
             }
     }
@@ -269,37 +312,248 @@ final class TaskService: NSObject, ObservableObject {
         }
     }
 
-    func startTimer(for task: TGTask) {
-        guard let uid = currentUser?.uid, let id = task.id, !task.isTimerRunning else { return }
+    func startTimer(for task: TGTask, at startDate: Date = Date(), startedAutomatically: Bool = false) {
+        guard let uid = currentUser?.uid,
+              let id = task.id,
+              !task.isTimerRunning,
+              optimisticTimerStarts[id] == nil else { return }
         let now = Date()
+        pendingStops.removeValue(forKey: id)
+        let sessionRef = sessionsCollection(for: uid).document()
 
-        let session = TaskTimeSession(
+        var session = TaskTimeSession(
             id: nil,
             taskID: id,
             taskName: task.name,
             colorHex: task.colorHex,
-            startedAt: now,
+            startedAt: startDate,
             endedAt: nil,
             startedByDeviceID: Self.currentDeviceID,
             startedByPlatform: Self.currentPlatform,
-            startedByDeviceName: Self.currentDeviceName
+            startedByDeviceName: Self.currentDeviceName,
+            startedAutomatically: startedAutomatically
         )
+        session.id = sessionRef.documentID
+
+        applyOptimisticTimerStart(for: task, session: session, startedAt: startDate, updatedAt: now)
 
         do {
-            let ref = try sessionsCollection(for: uid).addDocument(from: session)
+            try sessionRef.setData(from: session) { error in
+                if let error {
+                    print("Failed to write session \(sessionRef.documentID): \(error.localizedDescription)")
+                } else {
+                    print("Wrote session \(sessionRef.documentID) for task \(id)")
+                }
+            }
+
             tasksCollection(for: uid).document(id).updateData([
-                "timerStartedAt": Timestamp(date: now),
-                "activeSessionID": ref.documentID,
+                "timerStartedAt": Timestamp(date: startDate),
+                "activeSessionID": sessionRef.documentID,
                 "timerOwnerDeviceID": Self.currentDeviceID,
                 "timerOwnerPlatform": Self.currentPlatform,
                 "timerOwnerDeviceName": Self.currentDeviceName,
                 "timerOwnerLastAliveAt": Timestamp(date: now),
                 "timerOwnerIsActive": true,
                 "updatedAt": Timestamp(date: now),
-            ])
+            ]) { error in
+                if let error {
+                    print("Failed to mark task \(id) running: \(error.localizedDescription)")
+                } else {
+                    print("Marked task \(id) running")
+                }
+            }
         } catch {
             print("Failed to start session: \(error.localizedDescription)")
         }
+    }
+
+    private func applyOptimisticTimerStart(for task: TGTask, session: TaskTimeSession, startedAt: Date, updatedAt: Date) {
+        guard let taskID = task.id else { return }
+        optimisticTimerStarts[taskID] = OptimisticTimerStart(
+            sessionID: session.id,
+            startedAt: startedAt,
+            updatedAt: updatedAt
+        )
+
+        if let taskIndex = tasks.firstIndex(where: { $0.id == taskID }) {
+            tasks[taskIndex].timerStartedAt = startedAt
+            tasks[taskIndex].activeSessionID = session.id
+            tasks[taskIndex].timerOwnerDeviceID = Self.currentDeviceID
+            tasks[taskIndex].timerOwnerPlatform = Self.currentPlatform
+            tasks[taskIndex].timerOwnerDeviceName = Self.currentDeviceName
+            tasks[taskIndex].timerOwnerLastAliveAt = updatedAt
+            tasks[taskIndex].timerOwnerIsActive = true
+            tasks[taskIndex].updatedAt = updatedAt
+        }
+
+        if let sessionID = session.id, !sessions.contains(where: { $0.id == sessionID }) {
+            sessions.insert(session, at: 0)
+        }
+    }
+
+    private func mergingOptimisticTimerStart(into task: TGTask) -> TGTask {
+        guard let taskID = task.id,
+              let optimisticStart = optimisticTimerStarts[taskID] else { return task }
+
+        if task.timerStartedAt != nil {
+            optimisticTimerStarts.removeValue(forKey: taskID)
+            return task
+        }
+
+        var merged = task
+        merged.timerStartedAt = optimisticStart.startedAt
+        merged.activeSessionID = optimisticStart.sessionID
+        merged.timerOwnerDeviceID = Self.currentDeviceID
+        merged.timerOwnerPlatform = Self.currentPlatform
+        merged.timerOwnerDeviceName = Self.currentDeviceName
+        merged.timerOwnerLastAliveAt = optimisticStart.updatedAt
+        merged.timerOwnerIsActive = true
+        merged.updatedAt = optimisticStart.updatedAt
+        return merged
+    }
+
+    /// Turns AutoTrackingExtension's queued threshold events into real running
+    /// sessions, backdated to when the usage threshold was actually reached.
+    func processPendingAutoTrackEvents(_ events: [PendingAutoTrackEvent]) {
+        guard !events.isEmpty else { return }
+        print("Queueing \(events.count) pending auto-track event(s). tasks=\(tasks.count)")
+        queuedAutoTrackEvents.append(contentsOf: events)
+        processQueuedAutoTrackEvents()
+    }
+
+    private func processQueuedAutoTrackEvents() {
+        guard !queuedAutoTrackEvents.isEmpty else { return }
+
+        var remainingEvents: [PendingAutoTrackEvent] = []
+        for event in queuedAutoTrackEvents {
+            guard let task = tasks.first(where: { $0.id == event.taskID }) else {
+                print("Pending auto-track task not loaded yet: \(event.taskID)")
+                remainingEvents.append(event)
+                continue
+            }
+            guard !task.isTimerRunning, optimisticTimerStarts[event.taskID] == nil else {
+                print("Skipping auto-track event because task is already running: \(event.taskID)")
+                continue
+            }
+            let endedAt = event.occurredAt
+            let startedAt = endedAt.addingTimeInterval(-autoTrackingThresholdSeconds)
+            print("Recording auto-tracked minute for task \(event.taskID) from \(startedAt) to \(endedAt)")
+            recordAutoTrackedSession(for: task, startedAt: startedAt, endedAt: endedAt)
+        }
+        queuedAutoTrackEvents = remainingEvents
+    }
+
+    private func recordAutoTrackedSession(for task: TGTask, startedAt: Date, endedAt: Date) {
+        guard let uid = currentUser?.uid,
+              let taskID = task.id,
+              endedAt > startedAt else { return }
+
+        if let existingSession = latestMergeableAutoTrackedSession(for: taskID, nextStartedAt: startedAt),
+           let existingSessionID = existingSession.id {
+            let mergedEnd = max(existingSession.endedAt ?? existingSession.startedAt, endedAt)
+            if let sessionIndex = sessions.firstIndex(where: { $0.id == existingSessionID }) {
+                sessions[sessionIndex].endedAt = mergedEnd
+            }
+            applyOptimisticAutoTrackLiveState(
+                taskID: taskID,
+                sessionID: existingSessionID,
+                sessionStartedAt: existingSession.startedAt,
+                lastUsageAt: mergedEnd
+            )
+            sessionsCollection(for: uid).document(existingSessionID).updateData([
+                "endedAt": Timestamp(date: mergedEnd),
+            ]) { error in
+                if let error {
+                    print("Failed to extend auto-tracked session \(existingSessionID): \(error.localizedDescription)")
+                } else {
+                    print("Extended auto-tracked session \(existingSessionID) for task \(taskID) to \(mergedEnd)")
+                }
+            }
+            updateAutoTrackLiveState(
+                uid: uid,
+                taskID: taskID,
+                sessionID: existingSessionID,
+                sessionStartedAt: existingSession.startedAt,
+                lastUsageAt: mergedEnd
+            )
+            return
+        }
+
+        let sessionRef = sessionsCollection(for: uid).document()
+        var session = TaskTimeSession(
+            id: nil,
+            taskID: taskID,
+            taskName: task.name,
+            colorHex: task.colorHex,
+            startedAt: startedAt,
+            endedAt: endedAt,
+            startedByDeviceID: Self.currentDeviceID,
+            startedByPlatform: Self.currentPlatform,
+            startedByDeviceName: Self.currentDeviceName,
+            startedAutomatically: true
+        )
+        session.id = sessionRef.documentID
+
+        if !sessions.contains(where: { $0.id == sessionRef.documentID }) {
+            sessions.insert(session, at: 0)
+        }
+        applyOptimisticAutoTrackLiveState(
+            taskID: taskID,
+            sessionID: sessionRef.documentID,
+            sessionStartedAt: startedAt,
+            lastUsageAt: endedAt
+        )
+
+        do {
+            try sessionRef.setData(from: session) { error in
+                if let error {
+                    print("Failed to write auto-tracked session \(sessionRef.documentID): \(error.localizedDescription)")
+                } else {
+                    print("Wrote auto-tracked session \(sessionRef.documentID) for task \(taskID)")
+                }
+            }
+            updateAutoTrackLiveState(
+                uid: uid,
+                taskID: taskID,
+                sessionID: sessionRef.documentID,
+                sessionStartedAt: startedAt,
+                lastUsageAt: endedAt
+            )
+        } catch {
+            print("Failed to record auto-tracked session: \(error.localizedDescription)")
+        }
+    }
+
+    private func applyOptimisticAutoTrackLiveState(taskID: String, sessionID: String, sessionStartedAt: Date, lastUsageAt: Date) {
+        guard let taskIndex = tasks.firstIndex(where: { $0.id == taskID }) else { return }
+        tasks[taskIndex].autoTrackLastUsageAt = lastUsageAt
+        tasks[taskIndex].autoTrackLiveUntil = lastUsageAt.addingTimeInterval(autoTrackingInactivityGraceSeconds)
+        tasks[taskIndex].autoTrackActiveSessionID = sessionID
+        tasks[taskIndex].autoTrackSessionStartedAt = sessionStartedAt
+        tasks[taskIndex].updatedAt = Date()
+    }
+
+    private func updateAutoTrackLiveState(uid: String, taskID: String, sessionID: String, sessionStartedAt: Date, lastUsageAt: Date) {
+        tasksCollection(for: uid).document(taskID).updateData([
+            "autoTrackLastUsageAt": Timestamp(date: lastUsageAt),
+            "autoTrackLiveUntil": Timestamp(date: lastUsageAt.addingTimeInterval(autoTrackingInactivityGraceSeconds)),
+            "autoTrackActiveSessionID": sessionID,
+            "autoTrackSessionStartedAt": Timestamp(date: sessionStartedAt),
+            "updatedAt": Timestamp(date: Date()),
+        ])
+    }
+
+    private func latestMergeableAutoTrackedSession(for taskID: String, nextStartedAt: Date) -> TaskTimeSession? {
+        sessions
+            .filter { session in
+                guard session.taskID == taskID,
+                      session.startedAutomatically == true,
+                      let endedAt = session.endedAt else { return false }
+                return nextStartedAt.timeIntervalSince(endedAt) <= autoTrackingInactivityGraceSeconds
+            }
+            .max { first, second in
+                (first.endedAt ?? first.startedAt) < (second.endedAt ?? second.startedAt)
+            }
     }
 
     func stopTimer(for task: TGTask) {
@@ -309,6 +563,8 @@ final class TaskService: NSObject, ObservableObject {
     private func stopTimer(for task: TGTask, endedAt: Date) {
         guard let uid = currentUser?.uid, let id = task.id, task.timerStartedAt != nil else { return }
         pendingStops.removeValue(forKey: id)
+        optimisticTimerStarts.removeValue(forKey: id)
+        applyOptimisticTimerStop(for: task, endedAt: endedAt)
         tasksCollection(for: uid).document(id).updateData([
             "timerStartedAt": FieldValue.delete(),
             "activeSessionID": FieldValue.delete(),
@@ -324,6 +580,28 @@ final class TaskService: NSObject, ObservableObject {
             sessionsCollection(for: uid).document(sessionID).updateData([
                 "endedAt": Timestamp(date: endedAt),
             ])
+        }
+    }
+
+    private func applyOptimisticTimerStop(for task: TGTask, endedAt: Date) {
+        guard let taskID = task.id else { return }
+
+        if let taskIndex = tasks.firstIndex(where: { $0.id == taskID }) {
+            tasks[taskIndex].timerStartedAt = nil
+            tasks[taskIndex].activeSessionID = nil
+            tasks[taskIndex].timerOwnerDeviceID = nil
+            tasks[taskIndex].timerOwnerPlatform = nil
+            tasks[taskIndex].timerOwnerDeviceName = nil
+            tasks[taskIndex].timerOwnerLastAliveAt = nil
+            tasks[taskIndex].timerOwnerIsActive = nil
+            tasks[taskIndex].updatedAt = Date()
+        }
+
+        if let activeSessionID = task.activeSessionID,
+           let sessionIndex = sessions.firstIndex(where: { $0.id == activeSessionID }) {
+            sessions[sessionIndex].endedAt = endedAt
+        } else if let sessionIndex = sessions.firstIndex(where: { $0.taskID == taskID && $0.endedAt == nil }) {
+            sessions[sessionIndex].endedAt = endedAt
         }
     }
 
@@ -360,6 +638,9 @@ final class TaskService: NSObject, ObservableObject {
         guard currentUser?.uid != nil else { return }
         switch scenePhase {
         case .active:
+            if let currentUser {
+                refreshAutoTrackingFirebaseAuthSnapshot(for: currentUser)
+            }
             Task { @MainActor in
                 await recoverOwnSuspendedTimers()
                 processExpiredPendingStops()
@@ -472,6 +753,9 @@ final class TaskService: NSObject, ObservableObject {
         guard elapsed > TimeInterval(trackingSettings.autoTrackStopDelaySeconds) else { return }
 
         for task in ownRunningTasks {
+            if let timerStartedAt = task.timerStartedAt, timerStartedAt >= deactivatedAt {
+                continue
+            }
             stopTimer(for: task, endedAt: deactivatedAt)
         }
     }
@@ -481,6 +765,29 @@ final class TaskService: NSObject, ObservableObject {
             $0.timerStartedAt != nil &&
             ($0.timerOwnerDeviceID == Self.currentDeviceID || $0.timerOwnerDeviceID == nil && $0.timerOwnerPlatform == Self.currentPlatform)
         }
+    }
+
+    private func closeRunningAutoTrackedTimers(at endedAt: Date = Date()) {
+        for task in ownRunningTasks {
+            guard let taskID = task.id,
+                  !autoClosingTaskIDs.contains(taskID),
+                  let activeSession = activeSession(for: task),
+                  activeSession.startedAutomatically == true else { continue }
+
+            autoClosingTaskIDs.insert(taskID)
+            print("Closing running auto-tracked timer for task \(taskID) at \(endedAt)")
+            stopTimer(for: task, endedAt: endedAt)
+            autoClosingTaskIDs.remove(taskID)
+        }
+    }
+
+    private func activeSession(for task: TGTask) -> TaskTimeSession? {
+        if let activeSessionID = task.activeSessionID,
+           let session = sessions.first(where: { $0.id == activeSessionID }) {
+            return session
+        }
+        guard let taskID = task.id else { return nil }
+        return sessions.first { $0.taskID == taskID && $0.endedAt == nil }
     }
 
     func timerOwnerStatus(for task: TGTask, at date: Date = Date()) -> TimerOwnerStatus {
