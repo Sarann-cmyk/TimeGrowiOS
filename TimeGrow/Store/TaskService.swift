@@ -12,12 +12,22 @@ import Foundation
 import SwiftUI
 import UIKit
 
-enum TimerOwnerStatus: Equatable {
+enum TimerOwnerStatus: Equatable, CustomStringConvertible {
     case notRunning
     case active
     case inactive(deviceName: String?, lastAliveAt: Date?)
     case stale(deviceName: String?, lastAliveAt: Date)
     case unknown
+
+    var description: String {
+        switch self {
+        case .notRunning: "notRunning"
+        case .active: "active"
+        case .inactive(let deviceName, let lastAliveAt): "inactive(device=\(deviceName ?? "?"), lastAliveAt=\(lastAliveAt.map(String.init(describing:)) ?? "nil"))"
+        case .stale(let deviceName, let lastAliveAt): "stale(device=\(deviceName ?? "?"), lastAliveAt=\(lastAliveAt))"
+        case .unknown: "unknown"
+        }
+    }
 
     var interruptedAt: Date? {
         switch self {
@@ -49,6 +59,7 @@ final class TaskService: NSObject, ObservableObject {
     @Published private(set) var pendingStops: [String: AutoTrackPendingStop] = [:]
     @Published private(set) var isSignedIn = false
     @Published private(set) var currentUser: User?
+    @Published var taskDeletionBlockedTaskName: String?
 
     var isAnonymous: Bool { currentUser?.isAnonymous ?? true }
     var displayName: String? { currentUser?.displayName?.isEmpty == false ? currentUser?.displayName : nil }
@@ -172,15 +183,22 @@ final class TaskService: NSObject, ObservableObject {
             .addSnapshotListener { [weak self] snapshot, error in
                 guard let self else { return }
                 if let error {
-                    print("Firestore listen error: \(error.localizedDescription)")
+                    DiagnosticsLog.log("sync", "Firestore tasks listen error: \(error.localizedDescription)")
                     return
                 }
                 let documents = snapshot?.documents ?? []
                 let decoded = documents.compactMap { try? $0.data(as: TGTask.self) }
                 Task { @MainActor in
                     let merged = decoded.map { self.mergingOptimisticTimerStart(into: $0) }
+                    let runningBeforeIDs = Set(self.tasks.filter(\.isTimerRunning).compactMap(\.id))
+                    let runningAfter = merged.filter(\.isTimerRunning)
+                    let runningAfterIDs = Set(runningAfter.compactMap(\.id))
+                    let stoppedSinceLastSnapshot = self.tasks.filter { runningBeforeIDs.contains($0.id ?? "") && !runningAfterIDs.contains($0.id ?? "") }
                     self.tasks = merged
-                    print("Firestore tasks updated. count=\(merged.count)")
+                    DiagnosticsLog.log("sync", "tasks snapshot count=\(merged.count) running=\(runningAfter.map(\.name))")
+                    if !stoppedSinceLastSnapshot.isEmpty {
+                        DiagnosticsLog.log("sync", "timer(s) stopped since last snapshot: \(stoppedSinceLastSnapshot.map(\.name))")
+                    }
                     self.processQueuedAutoTrackEvents()
                     self.closeRunningAutoTrackedTimers()
                     self.autoCloseInterruptedMacTimers()
@@ -198,7 +216,7 @@ final class TaskService: NSObject, ObservableObject {
             .addSnapshotListener { [weak self] snapshot, error in
                 guard let self else { return }
                 if let error {
-                    print("Firestore sessions listen error: \(error.localizedDescription)")
+                    DiagnosticsLog.log("sync", "Firestore sessions listen error: \(error.localizedDescription)")
                     return
                 }
                 let documents = snapshot?.documents ?? []
@@ -216,7 +234,7 @@ final class TaskService: NSObject, ObservableObject {
             .addSnapshotListener { [weak self] snapshot, error in
                 guard let self else { return }
                 if let error {
-                    print("Firestore devices listen error: \(error.localizedDescription)")
+                    DiagnosticsLog.log("sync", "Firestore devices listen error: \(error.localizedDescription)")
                     return
                 }
                 let documents = snapshot?.documents ?? []
@@ -232,6 +250,8 @@ final class TaskService: NSObject, ObservableObject {
                 }
                 Task { @MainActor in
                     self.devices = devicesByID
+                    let summary = devicesByID.values.map { "\($0.deviceName ?? "?"):\($0.platform ?? "?"):isActive=\($0.isActive ?? false)" }
+                    DiagnosticsLog.log("sync", "devices snapshot \(summary)")
                     self.autoCloseInterruptedMacTimers()
                 }
             }
@@ -303,12 +323,69 @@ final class TaskService: NSObject, ObservableObject {
         ])
     }
 
+    /// Only deletes the task once it has no tracked sessions left (past or present),
+    /// so Reports never ends up with orphaned session entries for a task that no longer exists.
     func deleteTask(_ task: TGTask) {
         guard let uid = currentUser?.uid, let id = task.id else { return }
-        tasksCollection(for: uid).document(id).delete { error in
-            if let error {
-                print("Failed to delete task: \(error.localizedDescription)")
+
+        Task {
+            do {
+                let snapshot = try await sessionsCollection(for: uid)
+                    .whereField("taskID", isEqualTo: id)
+                    .limit(to: 1)
+                    .getDocuments()
+
+                guard snapshot.documents.isEmpty else {
+                    await MainActor.run {
+                        self.taskDeletionBlockedTaskName = task.name
+                    }
+                    return
+                }
+
+                tasksCollection(for: uid).document(id).delete { error in
+                    if let error {
+                        print("Failed to delete task: \(error.localizedDescription)")
+                    }
+                }
+            } catch {
+                print("Failed to check sessions before deleting task: \(error.localizedDescription)")
             }
+        }
+    }
+
+    func deleteSession(_ session: TaskTimeSession) {
+        guard let uid = currentUser?.uid, let sessionID = session.id else { return }
+
+        sessions.removeAll { $0.id == sessionID }
+        if let taskIndex = tasks.firstIndex(where: { $0.activeSessionID == sessionID }) {
+            tasks[taskIndex].timerStartedAt = nil
+            tasks[taskIndex].activeSessionID = nil
+            tasks[taskIndex].timerOwnerDeviceID = nil
+            tasks[taskIndex].timerOwnerPlatform = nil
+            tasks[taskIndex].timerOwnerDeviceName = nil
+            tasks[taskIndex].timerOwnerLastAliveAt = nil
+            tasks[taskIndex].timerOwnerIsActive = nil
+            tasks[taskIndex].updatedAt = Date()
+        }
+
+        let taskRef = tasksCollection(for: uid).document(session.taskID)
+        sessionsCollection(for: uid).document(sessionID).delete { error in
+            if let error {
+                print("Failed to delete session: \(error.localizedDescription)")
+                return
+            }
+
+            guard session.isRunning else { return }
+            taskRef.updateData([
+                "timerStartedAt": FieldValue.delete(),
+                "activeSessionID": FieldValue.delete(),
+                "timerOwnerDeviceID": FieldValue.delete(),
+                "timerOwnerPlatform": FieldValue.delete(),
+                "timerOwnerDeviceName": FieldValue.delete(),
+                "timerOwnerLastAliveAt": FieldValue.delete(),
+                "timerOwnerIsActive": FieldValue.delete(),
+                "updatedAt": Timestamp(date: Date()),
+            ])
         }
     }
 
@@ -316,7 +393,11 @@ final class TaskService: NSObject, ObservableObject {
         guard let uid = currentUser?.uid,
               let id = task.id,
               !task.isTimerRunning,
-              optimisticTimerStarts[id] == nil else { return }
+              optimisticTimerStarts[id] == nil else {
+            DiagnosticsLog.log("timer", "startTimer ignored task=\(task.name) auto=\(startedAutomatically) isRunning=\(task.isTimerRunning)")
+            return
+        }
+        DiagnosticsLog.log("timer", "startTimer task=\(task.name) id=\(id) auto=\(startedAutomatically) at=\(startDate) device=\(Self.currentDeviceName)")
         let now = Date()
         pendingStops.removeValue(forKey: id)
         let sessionRef = sessionsCollection(for: uid).document()
@@ -357,13 +438,11 @@ final class TaskService: NSObject, ObservableObject {
                 "updatedAt": Timestamp(date: now),
             ]) { error in
                 if let error {
-                    print("Failed to mark task \(id) running: \(error.localizedDescription)")
-                } else {
-                    print("Marked task \(id) running")
+                    DiagnosticsLog.log("timer", "Failed to mark task \(id) running: \(error.localizedDescription)")
                 }
             }
         } catch {
-            print("Failed to start session: \(error.localizedDescription)")
+            DiagnosticsLog.log("timer", "Failed to start session for task \(id): \(error.localizedDescription)")
         }
     }
 
@@ -557,11 +636,12 @@ final class TaskService: NSObject, ObservableObject {
     }
 
     func stopTimer(for task: TGTask) {
-        stopTimer(for: task, endedAt: Date())
+        stopTimer(for: task, endedAt: Date(), reason: "manual")
     }
 
-    private func stopTimer(for task: TGTask, endedAt: Date) {
+    private func stopTimer(for task: TGTask, endedAt: Date, reason: String = "manual") {
         guard let uid = currentUser?.uid, let id = task.id, task.timerStartedAt != nil else { return }
+        DiagnosticsLog.log("timer", "stopTimer task=\(task.name) id=\(id) reason=\(reason) endedAt=\(endedAt) ownerPlatform=\(task.timerOwnerPlatform ?? "?") ownerDevice=\(task.timerOwnerDeviceName ?? "?")")
         pendingStops.removeValue(forKey: id)
         optimisticTimerStarts.removeValue(forKey: id)
         applyOptimisticTimerStop(for: task, endedAt: endedAt)
@@ -610,6 +690,18 @@ final class TaskService: NSObject, ObservableObject {
         return snapshot.documents.compactMap { try? $0.data(as: TGTask.self) }
     }
 
+    /// On-demand fetch for report ranges that may exceed the 30-day `observeSessions` window.
+    func fetchSessions(from startDate: Date, to endDate: Date) async throws -> [TaskTimeSession] {
+        guard let uid = currentUser?.uid else { return [] }
+        let snapshot = try await sessionsCollection(for: uid)
+            .whereField("startedAt", isLessThan: Timestamp(date: endDate))
+            .order(by: "startedAt", descending: true)
+            .getDocuments()
+        return snapshot.documents
+            .compactMap { try? $0.data(as: TaskTimeSession.self) }
+            .filter { ($0.endedAt ?? endDate) > startDate }
+    }
+
     private func importTasks(_ tasksToImport: [TGTask], into uid: String) async {
         for var task in tasksToImport {
             task.id = nil
@@ -638,6 +730,7 @@ final class TaskService: NSObject, ObservableObject {
         guard currentUser?.uid != nil else { return }
         switch scenePhase {
         case .active:
+            DiagnosticsLog.log("scene", "active runningTasks=\(ownRunningTasks.map(\.name))")
             if let currentUser {
                 refreshAutoTrackingFirebaseAuthSnapshot(for: currentUser)
             }
@@ -650,6 +743,7 @@ final class TaskService: NSObject, ObservableObject {
             }
         case .background:
             let deactivatedAt = Date()
+            DiagnosticsLog.log("scene", "background at=\(deactivatedAt) runningTasks=\(ownRunningTasks.map(\.name))")
             stopHeartbeatTimer()
             writeCurrentDeviceHeartbeat(isActive: false, at: deactivatedAt)
             createPendingStopsForOwnRunningTimers(deactivatedAt: deactivatedAt)
@@ -689,6 +783,7 @@ final class TaskService: NSObject, ObservableObject {
 
     private func writeCurrentDeviceHeartbeat(isActive: Bool, at date: Date = Date()) {
         guard let uid = currentUser?.uid else { return }
+        DiagnosticsLog.log("heartbeat", "write isActive=\(isActive) at=\(date) device=\(Self.currentDeviceName)")
         currentDeviceDocument(for: uid).setData([
             "deviceID": Self.currentDeviceID,
             "deviceName": Self.currentDeviceName,
@@ -697,16 +792,22 @@ final class TaskService: NSObject, ObservableObject {
             "lastAliveAt": Timestamp(date: date),
         ], merge: true) { error in
             if let error {
-                print("Failed to write iPhone heartbeat: \(error.localizedDescription)")
+                DiagnosticsLog.log("heartbeat", "write failed: \(error.localizedDescription)")
             }
         }
     }
 
+    /// Only auto-tracked sessions need a "did the app actually die" grace period —
+    /// a manually started timer is meant to keep running while the app is backgrounded,
+    /// same as any ordinary time tracker. Applying this to manual sessions caused them
+    /// to silently stop ~60s after the user locked their phone.
     private func createPendingStopsForOwnRunningTimers(deactivatedAt: Date) {
         let delaySeconds = max(1, trackingSettings.autoTrackStopDelaySeconds)
         let deadline = deactivatedAt.addingTimeInterval(TimeInterval(delaySeconds))
         for task in ownRunningTasks {
-            guard let taskID = task.id else { continue }
+            guard let taskID = task.id,
+                  activeSession(for: task)?.startedAutomatically == true else { continue }
+            DiagnosticsLog.log("pendingStop", "created task=\(task.name) id=\(taskID) deadline=\(deadline) delay=\(delaySeconds)s")
             pendingStops[taskID] = AutoTrackPendingStop(
                 deadline: deadline,
                 delaySeconds: delaySeconds,
@@ -731,7 +832,7 @@ final class TaskService: NSObject, ObservableObject {
                 pendingStops.removeValue(forKey: taskID)
                 continue
             }
-            stopTimer(for: task, endedAt: pendingStop.deactivatedAt)
+            stopTimer(for: task, endedAt: pendingStop.deactivatedAt, reason: "pendingStopExpired(delay=\(pendingStop.delaySeconds)s)")
             pendingStops.removeValue(forKey: taskID)
         }
     }
@@ -744,19 +845,24 @@ final class TaskService: NSObject, ObservableObject {
             let device = try? snapshot.data(as: UserDeviceHeartbeat.self)
             heartbeatDate = device?.lastAliveAt
         } catch {
-            print("Failed to fetch iPhone heartbeat for recovery: \(error.localizedDescription)")
+            DiagnosticsLog.log("recover", "Failed to fetch heartbeat for recovery: \(error.localizedDescription)")
             heartbeatDate = devices[Self.currentDeviceID]?.lastAliveAt
         }
 
-        guard let deactivatedAt = heartbeatDate else { return }
+        guard let deactivatedAt = heartbeatDate else {
+            DiagnosticsLog.log("recover", "no heartbeat date found, skipping recovery check")
+            return
+        }
         let elapsed = Date().timeIntervalSince(deactivatedAt)
+        DiagnosticsLog.log("recover", "lastHeartbeat=\(deactivatedAt) elapsed=\(Int(elapsed))s stopDelay=\(trackingSettings.autoTrackStopDelaySeconds)s runningTasks=\(ownRunningTasks.map(\.name))")
         guard elapsed > TimeInterval(trackingSettings.autoTrackStopDelaySeconds) else { return }
 
         for task in ownRunningTasks {
+            guard activeSession(for: task)?.startedAutomatically == true else { continue }
             if let timerStartedAt = task.timerStartedAt, timerStartedAt >= deactivatedAt {
                 continue
             }
-            stopTimer(for: task, endedAt: deactivatedAt)
+            stopTimer(for: task, endedAt: deactivatedAt, reason: "recoverOwnSuspendedTimers(elapsed=\(Int(elapsed))s)")
         }
     }
 
@@ -775,8 +881,7 @@ final class TaskService: NSObject, ObservableObject {
                   activeSession.startedAutomatically == true else { continue }
 
             autoClosingTaskIDs.insert(taskID)
-            print("Closing running auto-tracked timer for task \(taskID) at \(endedAt)")
-            stopTimer(for: task, endedAt: endedAt)
+            stopTimer(for: task, endedAt: endedAt, reason: "closeRunningAutoTrackedTimers")
             autoClosingTaskIDs.remove(taskID)
         }
     }
@@ -793,14 +898,25 @@ final class TaskService: NSObject, ObservableObject {
     func timerOwnerStatus(for task: TGTask, at date: Date = Date()) -> TimerOwnerStatus {
         guard task.isTimerRunning else { return .notRunning }
 
-        if task.timerOwnerPlatform?.localizedCaseInsensitiveContains("mac") == true,
-           task.timerOwnerIsActive == false {
-            return .inactive(deviceName: task.timerOwnerDeviceName, lastAliveAt: task.timerOwnerLastAliveAt)
-        }
-        if task.timerOwnerPlatform?.localizedCaseInsensitiveContains("mac") == true,
-           let lastAliveAt = task.timerOwnerLastAliveAt,
-           date.timeIntervalSince(lastAliveAt) > TimeInterval(trackingSettings.autoTrackStopDelaySeconds) {
-            return .stale(deviceName: task.timerOwnerDeviceName, lastAliveAt: lastAliveAt)
+        // Manually started timers aren't tied to device/app liveness — they should
+        // keep running regardless of heartbeat staleness, same as any ordinary time tracker.
+        guard activeSession(for: task)?.startedAutomatically == true else { return .active }
+
+        if task.timerOwnerPlatform?.localizedCaseInsensitiveContains("mac") == true {
+            if task.timerOwnerIsActive == false {
+                guard let lastAliveAt = task.timerOwnerLastAliveAt else {
+                    return .inactive(deviceName: task.timerOwnerDeviceName, lastAliveAt: nil)
+                }
+                if date.timeIntervalSince(lastAliveAt) > TimeInterval(trackingSettings.autoTrackStopDelaySeconds) {
+                    return .inactive(deviceName: task.timerOwnerDeviceName, lastAliveAt: lastAliveAt)
+                }
+                return .active
+            }
+            if let lastAliveAt = task.timerOwnerLastAliveAt,
+               date.timeIntervalSince(lastAliveAt) > TimeInterval(trackingSettings.autoTrackStopDelaySeconds) {
+                return .stale(deviceName: task.timerOwnerDeviceName, lastAliveAt: lastAliveAt)
+            }
+            return .active
         }
 
         guard let ownerID = task.timerOwnerDeviceID, let device = devices[ownerID] else {
@@ -809,12 +925,13 @@ final class TaskService: NSObject, ObservableObject {
 
         let deviceName = device.deviceName ?? task.timerOwnerDeviceName
         if device.isActive == false {
-            if ownerID == Self.currentDeviceID,
-               let lastAliveAt = device.lastAliveAt,
-               date.timeIntervalSince(lastAliveAt) <= TimeInterval(trackingSettings.autoTrackStopDelaySeconds) {
-                return .active
+            guard let lastAliveAt = device.lastAliveAt else {
+                return .inactive(deviceName: deviceName, lastAliveAt: nil)
             }
-            return .inactive(deviceName: deviceName, lastAliveAt: device.lastAliveAt)
+            if date.timeIntervalSince(lastAliveAt) > TimeInterval(trackingSettings.autoTrackStopDelaySeconds) {
+                return .inactive(deviceName: deviceName, lastAliveAt: lastAliveAt)
+            }
+            return .active
         }
         if let lastAliveAt = device.lastAliveAt,
            date.timeIntervalSince(lastAliveAt) > TimeInterval(trackingSettings.autoTrackStopDelaySeconds) {
@@ -833,6 +950,11 @@ final class TaskService: NSObject, ObservableObject {
 
             let status = timerOwnerStatus(for: task)
             guard let interruptedAt = status.interruptedAt else { continue }
+
+            DiagnosticsLog.log(
+                "interrupt",
+                "REMOTE STOP task=\(task.name) id=\(taskID) status=\(status) ownerPlatform=\(task.timerOwnerPlatform ?? "?") ownerDevice=\(task.timerOwnerDeviceName ?? "?") ownerLastAliveAt=\(task.timerOwnerLastAliveAt.map(String.init(describing:)) ?? "nil") evaluatingDevice=\(Self.currentDeviceName) interruptedAt=\(interruptedAt)"
+            )
 
             autoClosingTaskIDs.insert(taskID)
             closeInterruptedTimer(task, uid: uid, endedAt: interruptedAt)

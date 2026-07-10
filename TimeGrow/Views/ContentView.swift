@@ -29,7 +29,7 @@ struct ContentView: View {
                     case .timeline:
                         placeholderView("Timeline")
                     case .reports:
-                        placeholderView("Reports")
+                        ReportsView()
                     case .settings:
                         AccountView()
                     }
@@ -62,34 +62,48 @@ struct ContentView: View {
         .sheet(item: $taskForAutoTracking) { task in
             AutoTrackingPickerView(task: task)
         }
+        .alert(
+            "Can't Delete Task",
+            isPresented: Binding(
+                get: { taskService.taskDeletionBlockedTaskName != nil },
+                set: { if !$0 { taskService.taskDeletionBlockedTaskName = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("\"\(taskService.taskDeletionBlockedTaskName ?? "")\" still has tracked time. Delete its sessions in Reports first.")
+        }
         .preferredColorScheme(.dark)
     }
 
+    @ViewBuilder
     private var header: some View {
-        HStack(alignment: .center) {
-            Text(selectedTab.title)
-                .font(.system(size: 38, weight: .bold, design: .default))
-                .foregroundStyle(.white)
-                .minimumScaleFactor(0.75)
+        if selectedTab != .reports {
+            HStack(alignment: .center) {
+                Text(selectedTab.title)
+                    .font(.system(size: 38, weight: .bold, design: .default))
+                    .foregroundStyle(.white)
+                    .minimumScaleFactor(0.75)
 
-            Spacer()
+                Spacer()
 
-            if selectedTab == .tasks {
-                Button {
-                    Haptics.impact(.light)
-                    isShowingAddTask = true
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 25, weight: .semibold))
-                        .frame(width: 42, height: 42)
+                if selectedTab == .tasks {
+                    Button {
+                        Haptics.impact(.light)
+                        isShowingAddTask = true
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 25, weight: .semibold))
+                            .frame(width: 42, height: 42)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Add task")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Add task")
             }
+            .padding(.horizontal, 20)
+            .padding(.top, 0)
+            .frame(height: 65, alignment: .bottom)
         }
-        .padding(.horizontal, 20)
-        .padding(.top, 0)
-        .frame(height: 65, alignment: .bottom)
     }
 
     private var tasksView: some View {
@@ -101,8 +115,9 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .padding(.top, 76)
             } else {
-                List {
-                    ForEach(taskService.tasks) { task in
+                ScrollView {
+                    LazyVStack(spacing: 11) {
+                        ForEach(taskService.tasks) { task in
                         TaskRow(
                             task: task,
                             sessions: taskService.sessions.filter { $0.taskID == task.id },
@@ -112,16 +127,14 @@ struct ContentView: View {
                             deleteAction: { taskService.deleteTask(task) },
                             autoTrackAction: { taskForAutoTracking = task }
                         )
-                        .listRowInsets(EdgeInsets(top: 6, leading: 21, bottom: 6, trailing: 21))
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
+                        }
                     }
+                    .padding(.horizontal, 21)
+                    .padding(.top, 31)
+                    .padding(.bottom, 112)
                 }
-                .listStyle(.plain)
-                .scrollContentBackground(.hidden)
                 .scrollIndicators(.hidden)
-                .contentMargins(.top, 26, for: .scrollContent)
-                .contentMargins(.bottom, 112, for: .scrollContent)
+                .scrollBounceBehavior(.always)
             }
         }
     }

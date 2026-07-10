@@ -101,7 +101,6 @@
 				3C361313133AC9B3E22DFE2A /* Info.plist */,
 				F8557A2C21F38A593367B633 /* AutoTrackingExtension.entitlements */,
 			);
-			name = AutoTrackingExtension;
 			path = AutoTrackingExtension;
 			sourceTree = "<group>";
 		};

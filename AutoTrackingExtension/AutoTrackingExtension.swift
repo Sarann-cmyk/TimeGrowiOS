@@ -174,7 +174,7 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
             "taskID": taskID,
             "occurredAt": occurredAt.timeIntervalSince1970,
         ])
-        sharedDefaults.set(Array(debugEvents.suffix(50)), forKey: debugEventsKey)
+        sharedDefaults.set(Array(debugEvents.suffix(300)), forKey: debugEventsKey)
     }
 
     private func taskID(from activity: DeviceActivityName) -> String {

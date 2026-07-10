@@ -6,6 +6,8 @@
 import SwiftUI
 
 struct TaskRow: View {
+    @EnvironmentObject private var autoTrackingStore: AutoTrackingStore
+
     let task: TGTask
     let sessions: [TaskTimeSession]
     let timerOwnerStatus: (Date) -> TimerOwnerStatus
@@ -70,8 +72,9 @@ struct TaskRow: View {
         let isVisuallyActive = task.isTimerRunning || isAutoLive
         let isInterrupted = task.isTimerRunning && status.isInterrupted
         let secondsStart = task.timerStartedAt ?? autoLiveSession?.startedAt
+        let hasAutoTrackingSelection = task.id.map { autoTrackingStore.hasSelection(for: $0) } ?? false
 
-        return HStack(spacing: 14) {
+        return HStack(spacing: 13) {
             TaskProgressStrip(color: isInterrupted ? .orange : task.color)
 
             TaskAvatarCircle(
@@ -82,16 +85,22 @@ struct TaskRow: View {
             )
 
             Text(task.name)
-                .font(.system(size: 19, weight: .semibold))
+                .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(.white)
                 .lineLimit(1)
 
             Spacer()
 
-            TaskDurationLabel(task: task, sessions: sessions, ownerStatus: status, date: date)
+            HStack(spacing: 18) {
+                AutoTrackingBadge(color: task.color, isEnabled: hasAutoTrackingSelection)
+
+                TaskDurationLabel(task: task, sessions: sessions, ownerStatus: status, date: date)
+                    .frame(minWidth: 72, alignment: .trailing)
+            }
+            .fixedSize(horizontal: true, vertical: false)
         }
-        .padding(.horizontal, 18)
-        .frame(height: 76)
+        .padding(.horizontal, 16)
+        .frame(height: 68)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(isVisuallyActive ? task.color.opacity(isInterrupted ? 0.05 : 0.09) : Color.white.opacity(0.07))
@@ -130,12 +139,34 @@ struct TaskRow: View {
 private struct TaskProgressStrip: View {
     let color: Color
 
-    private let fullHeight: CGFloat = 52
+    private let fullHeight: CGFloat = 47
 
     var body: some View {
         RoundedRectangle(cornerRadius: 2, style: .continuous)
             .fill(color)
-            .frame(width: 2.4, height: fullHeight)
+            .frame(width: 2.2, height: fullHeight)
+    }
+}
+
+private struct AutoTrackingBadge: View {
+    let color: Color
+    let isEnabled: Bool
+
+    var body: some View {
+        Text("A")
+            .font(.system(size: 9, weight: .bold, design: .rounded))
+            .foregroundStyle(isEnabled ? color : Color.white.opacity(0.28))
+            .frame(width: 18, height: 18)
+            .background {
+                Circle()
+                    .fill(isEnabled ? color.opacity(0.14) : Color.white.opacity(0.04))
+            }
+            .overlay {
+                Circle()
+                    .stroke(isEnabled ? color.opacity(0.75) : Color.white.opacity(0.16), lineWidth: 1)
+            }
+            .shadow(color: isEnabled ? color.opacity(0.18) : .clear, radius: 5, x: 0, y: 0)
+            .accessibilityLabel(isEnabled ? "Auto-tracking apps added" : "No auto-tracking apps")
     }
 }
 
@@ -159,9 +190,9 @@ struct TaskAvatarCircle: View {
 
     private var content: some View {
         Text(secondsText ?? (symbol.isEmpty ? "T" : symbol))
-            .font(.system(size: secondsText != nil ? 12 : 15, weight: .bold, design: secondsText != nil ? .monospaced : .default))
+            .font(.system(size: secondsText != nil ? 11 : 14, weight: .bold, design: secondsText != nil ? .monospaced : .default))
             .foregroundStyle(color)
-            .frame(width: 34, height: 34)
+            .frame(width: 31, height: 31)
             .background(
                 Circle()
                     .fill(Color.clear)
@@ -249,7 +280,10 @@ struct TaskDurationLabel: View {
             Text(Self.format(seconds))
                 .font(.system(size: 15, weight: .medium, design: .monospaced))
                 .foregroundStyle(ownerStatus.isInterrupted ? .orange : (isRunning ? task.color : .secondary))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
         }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private static func format(_ seconds: TimeInterval) -> String {
