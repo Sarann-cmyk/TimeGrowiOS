@@ -13,6 +13,9 @@ import Foundation
 let autoTrackingAppGroupID = "group.WINNER.ltd.TimeGrow"
 let autoTrackingThresholdSeconds: TimeInterval = 60
 let autoTrackingInactivityGraceSeconds: TimeInterval = 120
+/// Sessions shorter than this when stopped are discarded outright (deleted, not just
+/// hidden) — they're accidental taps or auto-tracking blips, not real tracked time.
+let minimumTrackedSessionDuration: TimeInterval = 3
 private let pendingEventsKey = "autoTracking.pendingEvents"
 private let debugEventsKey = "autoTracking.debugEvents"
 private let selectionDataKeyPrefix = "autoTracking.selectionData."

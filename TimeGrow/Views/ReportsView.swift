@@ -161,7 +161,7 @@ struct ReportsView: View {
     }
 
     private func content(at date: Date) -> some View {
-        let reportSessions = displaySessions
+        let reportSessions = displaySessions.filter { sessionListDuration($0, at: date) >= TimeInterval(sessionListMinimumDuration) }
         let entries = taskEntries(reportSessions, at: date)
         let columns = chartColumns(reportSessions, at: date)
         let scale = ReportChartScale.automatic(for: columns)
@@ -679,7 +679,6 @@ struct ReportsView: View {
     private func groupedSessions(_ sourceSessions: [TaskTimeSession], at date: Date) -> [ReportSessionGroup] {
         let scoped = sourceSessions
             .filter { overlapSeconds($0, start: range.start, end: range.end, now: date) > 0 }
-            .filter { sessionListDuration($0, at: date) >= TimeInterval(sessionListMinimumDuration) }
             .sorted { $0.startedAt > $1.startedAt }
         let grouped = Dictionary(grouping: scoped) { calendar.startOfDay(for: $0.startedAt) }
         return grouped.keys.sorted(by: >).map { day in

@@ -640,7 +640,7 @@ final class TaskService: NSObject, ObservableObject {
     }
 
     private func stopTimer(for task: TGTask, endedAt: Date, reason: String = "manual") {
-        guard let uid = currentUser?.uid, let id = task.id, task.timerStartedAt != nil else { return }
+        guard let uid = currentUser?.uid, let id = task.id, let startedAt = task.timerStartedAt else { return }
         DiagnosticsLog.log("timer", "stopTimer task=\(task.name) id=\(id) reason=\(reason) endedAt=\(endedAt) ownerPlatform=\(task.timerOwnerPlatform ?? "?") ownerDevice=\(task.timerOwnerDeviceName ?? "?")")
         pendingStops.removeValue(forKey: id)
         optimisticTimerStarts.removeValue(forKey: id)
@@ -657,9 +657,14 @@ final class TaskService: NSObject, ObservableObject {
         ])
 
         if let sessionID = task.activeSessionID {
-            sessionsCollection(for: uid).document(sessionID).updateData([
-                "endedAt": Timestamp(date: endedAt),
-            ])
+            if endedAt.timeIntervalSince(startedAt) < minimumTrackedSessionDuration {
+                sessions.removeAll { $0.id == sessionID }
+                sessionsCollection(for: uid).document(sessionID).delete()
+            } else {
+                sessionsCollection(for: uid).document(sessionID).updateData([
+                    "endedAt": Timestamp(date: endedAt),
+                ])
+            }
         }
     }
 
@@ -980,9 +985,14 @@ final class TaskService: NSObject, ObservableObject {
 
         if let sessionID = task.activeSessionID {
             let sessionRef = sessionsCollection(for: uid).document(sessionID)
-            batch.updateData([
-                "endedAt": Timestamp(date: endedAt),
-            ], forDocument: sessionRef)
+            if let startedAt = task.timerStartedAt, endedAt.timeIntervalSince(startedAt) < minimumTrackedSessionDuration {
+                sessions.removeAll { $0.id == sessionID }
+                batch.deleteDocument(sessionRef)
+            } else {
+                batch.updateData([
+                    "endedAt": Timestamp(date: endedAt),
+                ], forDocument: sessionRef)
+            }
         }
 
         batch.commit { error in

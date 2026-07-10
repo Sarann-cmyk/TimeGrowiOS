@@ -27,7 +27,7 @@ struct ContentView: View {
                     case .tasks:
                         tasksView
                     case .timeline:
-                        placeholderView("Timeline")
+                        TimelineTabView()
                     case .reports:
                         ReportsView()
                     case .settings:
@@ -78,7 +78,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private var header: some View {
-        if selectedTab != .reports {
+        if selectedTab != .reports && selectedTab != .timeline {
             HStack(alignment: .center) {
                 Text(selectedTab.title)
                     .font(.system(size: 38, weight: .bold, design: .default))
@@ -145,14 +145,6 @@ struct ContentView: View {
         } else {
             taskService.startTimer(for: task)
         }
-    }
-
-    private func placeholderView(_ title: String) -> some View {
-        Text(title)
-            .font(.system(size: 27, weight: .medium))
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            .padding(.top, 76)
     }
 
     private var tabBar: some View {
