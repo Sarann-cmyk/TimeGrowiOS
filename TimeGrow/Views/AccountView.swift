@@ -7,10 +7,12 @@ import SwiftUI
 
 struct AccountView: View {
     @EnvironmentObject private var taskService: TaskService
+    @EnvironmentObject private var accentColorManager: AccentColorManager
 
     @AppStorage(SessionListDisplaySettings.minimumDurationKey) private var sessionListMinimumDuration = SessionListDisplaySettings.defaultMinimumDuration
     @State private var logExportItem: IdentifiableURL?
     @State private var didClearLogs = false
+    @State private var isShowingAccentColorPicker = false
 
     var body: some View {
         ScrollView {
@@ -25,6 +27,13 @@ struct AccountView: View {
                 } else {
                     signedInCard
                 }
+
+                Text("APPEARANCE")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 10)
+
+                appearanceCard
 
                 Text("REPORTS")
                     .font(.system(size: 12, weight: .semibold))
@@ -47,6 +56,50 @@ struct AccountView: View {
         .sheet(item: $logExportItem) { item in
             ShareSheet(items: [item.url])
         }
+        .sheet(isPresented: $isShowingAccentColorPicker) {
+            AccentColorPickerSheet()
+                .environmentObject(accentColorManager)
+        }
+    }
+
+    private var appearanceCard: some View {
+        VStack(spacing: 0) {
+            Button {
+                Haptics.impact(.light)
+                isShowingAccentColorPicker = true
+            } label: {
+                HStack(alignment: .center, spacing: 12) {
+                    Image(systemName: "paintpalette.fill")
+                        .font(.system(size: 20))
+                        .foregroundStyle(accentColorManager.color)
+                        .frame(width: 34, height: 34)
+                        .background(accentColorManager.color.opacity(0.14), in: Circle())
+
+                    Text("Accent Color")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white)
+
+                    Spacer(minLength: 8)
+
+                    Circle()
+                        .fill(accentColorManager.color)
+                        .frame(width: 22, height: 22)
+                        .overlay {
+                            Circle().stroke(Color.white.opacity(0.15), lineWidth: 1)
+                        }
+
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(16)
+            }
+            .buttonStyle(.plain)
+        }
+        .background {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color(white: 0.08))
+        }
     }
 
     private var reportsCard: some View {
@@ -54,9 +107,9 @@ struct AccountView: View {
             HStack(alignment: .center, spacing: 12) {
                 Image(systemName: "line.3.horizontal.decrease.circle.fill")
                     .font(.system(size: 22))
-                    .foregroundStyle(Color.accentPurple)
+                    .foregroundStyle(accentColorManager.color)
                     .frame(width: 34, height: 34)
-                    .background(Color.accentPurple.opacity(0.14), in: Circle())
+                    .background(accentColorManager.color.opacity(0.14), in: Circle())
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Session list noise")
@@ -251,6 +304,7 @@ struct AccountView: View {
 #Preview {
     AccountView()
         .environmentObject(TaskService())
+        .environmentObject(AccentColorManager())
         .background(Color.black)
         .preferredColorScheme(.dark)
 }

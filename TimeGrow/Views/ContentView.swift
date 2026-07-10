@@ -9,6 +9,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var taskService: TaskService
+    @EnvironmentObject private var accentColorManager: AccentColorManager
 
     @State private var selectedTab: AppTab = .tasks
     @State private var isShowingAddTask = false
@@ -164,7 +165,7 @@ struct ContentView: View {
                         Text(tab.title)
                             .font(.system(size: 12, weight: .semibold))
                     }
-                    .foregroundStyle(selectedTab == tab ? Color.accentPurple : .white)
+                    .foregroundStyle(selectedTab == tab ? accentColorManager.color : .white)
                     .frame(maxWidth: .infinity, minHeight: 62)
                     .background {
                         if selectedTab == tab {
@@ -197,4 +198,6 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
+        .environmentObject(TaskService())
+        .environmentObject(AccentColorManager())
 }

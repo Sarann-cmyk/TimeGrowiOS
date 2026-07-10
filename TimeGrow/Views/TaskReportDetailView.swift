@@ -42,6 +42,7 @@ private enum TaskReportChartStyle: String, CaseIterable, Identifiable {
 
 struct TaskReportDetailView: View {
     @EnvironmentObject private var taskService: TaskService
+    @EnvironmentObject private var accentColorManager: AccentColorManager
     @Environment(\.dismiss) private var dismiss
     @Environment(\.locale) private var locale
 
@@ -176,7 +177,7 @@ struct TaskReportDetailView: View {
             } label: {
                 Image(systemName: "chevron.left")
                     .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(Color.accentPurple)
+                    .foregroundStyle(accentColorManager.color)
                     .frame(width: 42, height: 42)
                     .background(Circle().fill(Color.tabBarBackground))
                     .overlay(Circle().stroke(Color.white.opacity(0.1), lineWidth: 1))
@@ -197,7 +198,7 @@ struct TaskReportDetailView: View {
         } label: {
             Image(systemName: systemImage)
                 .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(Color.accentPurple)
+                .foregroundStyle(accentColorManager.color)
                 .frame(width: 42, height: 42)
                 .background(Circle().fill(Color.tabBarBackground))
                 .overlay(Circle().stroke(Color.white.opacity(0.1), lineWidth: 1))
@@ -813,4 +814,5 @@ private extension View {
         initialReferenceDate: .now
     )
     .environmentObject(TaskService())
+    .environmentObject(AccentColorManager())
 }

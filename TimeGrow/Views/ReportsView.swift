@@ -86,6 +86,7 @@ private struct ReportChartScale {
 
 struct ReportsView: View {
     @EnvironmentObject private var taskService: TaskService
+    @EnvironmentObject private var accentColorManager: AccentColorManager
     @Environment(\.locale) private var locale
 
     @State private var period: ReportPeriod = .week
@@ -267,7 +268,7 @@ struct ReportsView: View {
         } label: {
             Image(systemName: systemImage)
                 .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(Color.accentPurple)
+                .foregroundStyle(accentColorManager.color)
                 .frame(width: 42, height: 42)
                 .background(Circle().fill(Color.tabBarBackground))
                 .overlay(Circle().stroke(Color.white.opacity(0.1), lineWidth: 1))
@@ -305,13 +306,13 @@ struct ReportsView: View {
         } label: {
             Text(periodStripLabel(for: normalized, selected: selected))
                 .font(.system(size: period == .year ? 20 : 15, weight: selected ? .semibold : .regular))
-                .foregroundStyle(selected ? Color.accentPurple : .secondary)
+                .foregroundStyle(selected ? accentColorManager.color : .secondary)
                 .padding(.horizontal, selected ? 14 : 10)
                 .padding(.vertical, 9)
                 .background {
                     if selected {
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(Color.accentPurple.opacity(0.22))
+                            .fill(accentColorManager.color.opacity(0.22))
                     }
                 }
         }
@@ -1051,5 +1052,6 @@ private struct ReportsStackedBarChart: View {
 #Preview {
     ReportsView()
         .environmentObject(TaskService())
+        .environmentObject(AccentColorManager())
         .preferredColorScheme(.dark)
 }

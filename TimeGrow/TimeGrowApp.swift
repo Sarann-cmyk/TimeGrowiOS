@@ -15,6 +15,7 @@ struct TimeGrowApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject private var taskService: TaskService
     @StateObject private var autoTrackingStore = AutoTrackingStore()
+    @StateObject private var accentColorManager = AccentColorManager()
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -27,6 +28,7 @@ struct TimeGrowApp: App {
             ContentView()
                 .environmentObject(taskService)
                 .environmentObject(autoTrackingStore)
+                .environmentObject(accentColorManager)
                 .onAppear {
                     taskService.start()
                     autoTrackingStore.refreshMonitoring(for: taskService.tasks)

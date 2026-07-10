@@ -14,12 +14,13 @@ struct TimelineTabView: View {
     }
 
     @EnvironmentObject private var taskService: TaskService
+    @EnvironmentObject private var accentColorManager: AccentColorManager
     @Environment(\.locale) private var locale
 
     @State private var scope: Scope = .week
     @State private var selectedDate = Date()
     @State private var sessions: [TaskTimeSession] = []
-    @State private var loadedDayKey: String?
+    @State private var loadedRangeKey: String?
     @State private var appearID = UUID()
     @AppStorage(SessionListDisplaySettings.minimumDurationKey) private var sessionListMinimumDuration = SessionListDisplaySettings.defaultMinimumDuration
 
@@ -27,13 +28,24 @@ struct TimelineTabView: View {
     private let hourHeight: CGFloat = 64
     private let leadingLabelWidth: CGFloat = 46
 
-    private var dayBounds: (start: Date, end: Date) {
-        let start = calendar.startOfDay(for: selectedDate)
+    private func dayBounds(for day: Date) -> (start: Date, end: Date) {
+        let start = calendar.startOfDay(for: day)
         let end = calendar.date(byAdding: .day, value: 1, to: start) ?? start
         return (start, end)
     }
 
-    private var dayKey: String { String(dayBounds.start.timeIntervalSince1970) }
+    private var dayBounds: (start: Date, end: Date) { dayBounds(for: selectedDate) }
+
+    private var weekBounds: (start: Date, end: Date) {
+        let start = calendar.dateInterval(of: .weekOfYear, for: selectedDate)?.start ?? calendar.startOfDay(for: selectedDate)
+        let end = calendar.date(byAdding: .day, value: 7, to: start) ?? start
+        return (start, end)
+    }
+
+    /// The range currently being fetched/displayed — a single day, or the whole visible week.
+    private var rangeBounds: (start: Date, end: Date) { scope == .day ? dayBounds : weekBounds }
+
+    private var rangeKey: String { "\(scope.rawValue)-\(rangeBounds.start.timeIntervalSince1970)" }
 
     private var hasLiveSession: Bool { sessions.contains { $0.endedAt == nil } }
 
@@ -49,15 +61,15 @@ struct TimelineTabView: View {
             Group {
                 if hasLiveSession {
                     SwiftUI.TimelineView(.periodic(from: .now, by: 30)) { context in
-                        timelineScroll(at: context.date)
+                        content(at: context.date)
                     }
                 } else {
-                    timelineScroll(at: Date())
+                    content(at: Date())
                 }
             }
         }
         .background(Color.black)
-        .task(id: dayKey) {
+        .task(id: rangeKey) {
             await load()
         }
         .onAppear {
@@ -69,10 +81,19 @@ struct TimelineTabView: View {
         }
     }
 
+    @ViewBuilder
+    private func content(at date: Date) -> some View {
+        if scope == .day {
+            timelineScroll(at: date)
+        } else {
+            weekTimelineScroll(at: date)
+        }
+    }
+
     // MARK: - Header
 
     private var header: some View {
-        HStack(alignment: .top) {
+        HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Timeline")
                     .font(.system(size: 34, weight: .bold))
@@ -85,10 +106,9 @@ struct TimelineTabView: View {
             Spacer()
 
             scopePicker
-                .padding(.top, 6)
         }
         .padding(.horizontal, 20)
-        .padding(.top, 4)
+        .padding(.top, 24)
     }
 
     private var subtitle: String {
@@ -105,11 +125,12 @@ struct TimelineTabView: View {
                 } label: {
                     Text(candidate.title)
                         .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(scope == candidate ? .white : .secondary)
+                        .foregroundStyle(scope == candidate ? accentColorManager.color : Color.white.opacity(0.7))
                         .padding(.horizontal, 14)
                         .frame(height: 34)
                         .background {
-                            Capsule().fill(scope == candidate ? Color.accentPurple : Color.white.opacity(0.08))
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(scope == candidate ? accentColorManager.color.opacity(0.22) : Color.selectedTabBackground.opacity(0.7))
                         }
                 }
                 .buttonStyle(.plain)
@@ -126,12 +147,63 @@ struct TimelineTabView: View {
 
     private var weekStrip: some View {
         HStack(spacing: 0) {
+            // Lines up the day headers with the day columns in the grid below, which are
+            // pushed over by the leading hour-label gutter (e.g. "00:00"). Otherwise-empty,
+            // so it doubles as a spot for the live active-tracker readout.
+            activeTrackerCorner
+                .frame(width: leadingLabelWidth + 8, alignment: .leading)
+
             ForEach(weekDates, id: \.timeIntervalSince1970) { date in
                 weekStripDay(date)
                     .frame(maxWidth: .infinity)
             }
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 16)
+    }
+
+    @ViewBuilder
+    private var activeTrackerCorner: some View {
+        if let task = taskService.tasks.first(where: { $0.isTimerRunning }), let startedAt = task.timerStartedAt {
+            SwiftUI.TimelineView(.periodic(from: .now, by: 1)) { context in
+                let elapsed = max(0, Int(context.date.timeIntervalSince(startedAt)))
+                let minutes = elapsed / 60
+                let secondsFraction = Double(elapsed % 60) / 60
+
+                ZStack {
+                    Circle()
+                        .stroke(task.color.opacity(0.25), lineWidth: 2.5)
+                    // The ring fills clockwise over each minute, resetting as the seconds roll over.
+                    Circle()
+                        .trim(from: 0, to: secondsFraction)
+                        .stroke(task.color, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                    Text("\(minutes)")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundStyle(task.color)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                }
+                .frame(width: 35, height: 35)
+            }
+        } else if let lastTask = mostRecentTask {
+            Text(lastTask.symbol)
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(lastTask.color)
+                .frame(width: 35, height: 35)
+                .background {
+                    Circle().stroke(lastTask.color, lineWidth: 1.2)
+                }
+        } else {
+            Color.clear
+                .frame(width: 35, height: 35)
+        }
+    }
+
+    /// The task behind the most recently started session — shown idle (just its letter) in
+    /// the corner once nothing is actively tracking, instead of leaving it empty.
+    private var mostRecentTask: TGTask? {
+        guard let mostRecentSession = taskService.sessions.max(by: { $0.startedAt < $1.startedAt }) else { return nil }
+        return taskService.tasks.first { $0.id == mostRecentSession.taskID }
     }
 
     private func weekStripDay(_ date: Date) -> some View {
@@ -145,12 +217,14 @@ struct TimelineTabView: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.secondary)
                 Text(String(calendar.component(.day, from: date)))
-                    .font(.system(size: 17, weight: selected ? .bold : .regular))
-                    .foregroundStyle(selected ? .white : .white.opacity(0.85))
-                    .frame(width: 32, height: 32)
+                    .font(.system(size: 17, weight: selected ? .semibold : .regular))
+                    .foregroundStyle(selected ? accentColorManager.color : .white.opacity(0.85))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
                     .background {
                         if selected {
-                            Circle().fill(Color.accentPurple)
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(accentColorManager.color.opacity(0.22))
                         }
                     }
             }
@@ -166,7 +240,7 @@ struct TimelineTabView: View {
                 ZStack(alignment: .topLeading) {
                     hourGrid
 
-                    sessionBlocks(at: date)
+                    sessionBlocks(bounds: dayBounds, at: date)
                         .frame(maxWidth: .infinity, alignment: .topLeading)
 
                     if calendar.isDate(selectedDate, inSameDayAs: date) {
@@ -181,13 +255,94 @@ struct TimelineTabView: View {
             .onAppear {
                 scrollToRelevantTime(proxy: proxy, at: date)
             }
-            .onChange(of: dayKey) { _, _ in
+            .onChange(of: rangeKey) { _, _ in
                 scrollToRelevantTime(proxy: proxy, at: date)
             }
             .onChange(of: appearID) { _, _ in
                 scrollToRelevantTime(proxy: proxy, at: date)
             }
         }
+    }
+
+    private func weekTimelineScroll(at date: Date) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                ZStack(alignment: .topLeading) {
+                    hourGrid
+
+                    weekSessionColumns(at: date)
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+                .padding(.bottom, 32)
+            }
+            .scrollIndicators(.hidden)
+            .onAppear {
+                scrollToRelevantTime(proxy: proxy, at: date)
+            }
+            .onChange(of: rangeKey) { _, _ in
+                scrollToRelevantTime(proxy: proxy, at: date)
+            }
+            .onChange(of: appearID) { _, _ in
+                scrollToRelevantTime(proxy: proxy, at: date)
+            }
+        }
+    }
+
+    private func weekSessionColumns(at date: Date) -> some View {
+        GeometryReader { geo in
+            let columnsAreaWidth = max(0, geo.size.width - leadingLabelWidth - 8)
+            let columnWidth = columnsAreaWidth / 7
+            ZStack(alignment: .topLeading) {
+                // Vertical dividers between the 7 day columns (and a closing line on the
+                // right edge), matching the existing horizontal hour gridlines.
+                ForEach(0...7, id: \.self) { index in
+                    Rectangle()
+                        .fill(Color.white.opacity(0.12))
+                        .frame(width: 1)
+                        .offset(x: leadingLabelWidth + 8 + CGFloat(index) * columnWidth)
+                }
+
+                ForEach(Array(weekDates.enumerated()), id: \.offset) { index, day in
+                    weekDayColumn(
+                        day: day,
+                        at: date,
+                        xOffset: leadingLabelWidth + 8 + CGFloat(index) * columnWidth,
+                        columnWidth: columnWidth,
+                        totalHeight: geo.size.height
+                    )
+                }
+            }
+        }
+        .frame(height: hourHeight * 24)
+    }
+
+    private func weekDayColumn(day: Date, at date: Date, xOffset: CGFloat, columnWidth: CGFloat, totalHeight: CGFloat) -> some View {
+        let bounds = dayBounds(for: day)
+        return ZStack(alignment: .topLeading) {
+            ForEach(positionedSessions(bounds: bounds, at: date, totalHeight: totalHeight)) { positioned in
+                let laneWidth = max(1, columnWidth - 4) / CGFloat(positioned.laneCount)
+                let laneGap: CGFloat = positioned.laneCount > 1 ? 2 : 0
+
+                sessionBlock(positioned.session, at: date, height: positioned.height, showsSubtitle: false)
+                    .frame(width: max(0, laneWidth - laneGap), height: positioned.height, alignment: .topLeading)
+                    .clipped()
+                    .offset(x: xOffset + laneWidth * CGFloat(positioned.laneIndex), y: positioned.y)
+            }
+
+            if calendar.isDate(day, inSameDayAs: date) {
+                weekCurrentTimeMarker(at: date, bounds: bounds, xOffset: xOffset, columnWidth: columnWidth, totalHeight: totalHeight)
+            }
+        }
+    }
+
+    private func weekCurrentTimeMarker(at date: Date, bounds: (start: Date, end: Date), xOffset: CGFloat, columnWidth: CGFloat, totalHeight: CGFloat) -> some View {
+        let minutes = date.timeIntervalSince(bounds.start) / 60
+        let y = totalHeight * CGFloat(minutes / 1440)
+        return Rectangle()
+            .fill(Color.red)
+            .frame(width: max(0, columnWidth - 4), height: 1.5)
+            .offset(x: xOffset, y: y)
     }
 
     private var hourGrid: some View {
@@ -236,15 +391,15 @@ struct TimelineTabView: View {
         }
     }
 
-    private func sessionBlocks(at date: Date) -> some View {
+    private func sessionBlocks(bounds: (start: Date, end: Date), at date: Date) -> some View {
         GeometryReader { geo in
             let availableWidth = max(0, geo.size.width - leadingLabelWidth - 8)
             ZStack(alignment: .topLeading) {
-                ForEach(positionedSessions(at: date, totalHeight: geo.size.height)) { positioned in
+                ForEach(positionedSessions(bounds: bounds, at: date, totalHeight: geo.size.height)) { positioned in
                     let laneWidth = availableWidth / CGFloat(positioned.laneCount)
                     let laneGap: CGFloat = positioned.laneCount > 1 ? 3 : 0
 
-                    sessionBlock(positioned.session, at: date, compact: positioned.laneCount > 1 || positioned.height < 34)
+                    sessionBlock(positioned.session, at: date, height: positioned.height, showsSubtitle: positioned.laneCount == 1)
                         .frame(width: max(0, laneWidth - laneGap), height: positioned.height, alignment: .topLeading)
                         .clipped()
                         .offset(x: leadingLabelWidth + 8 + laneWidth * CGFloat(positioned.laneIndex), y: positioned.y)
@@ -257,18 +412,18 @@ struct TimelineTabView: View {
     /// Groups sessions that overlap in time into clusters, then greedily assigns each a lane
     /// (like Apple/Google Calendar's side-by-side columns) so overlapping sessions never stack
     /// on top of each other unreadably. Sessions with no overlap keep the full row width.
-    private func positionedSessions(at date: Date, totalHeight: CGFloat) -> [PositionedSession] {
+    private func positionedSessions(bounds: (start: Date, end: Date), at date: Date, totalHeight: CGFloat) -> [PositionedSession] {
         // When looking at today, no block may cross the red current-time line — a session
         // that just started or just ended must stop exactly at "now", not reach into the future.
-        let nowMinutes: CGFloat? = calendar.isDate(selectedDate, inSameDayAs: date)
-            ? CGFloat(min(max(date.timeIntervalSince(dayBounds.start), 0), dayBounds.end.timeIntervalSince(dayBounds.start)) / 60)
+        let nowMinutes: CGFloat? = calendar.isDate(bounds.start, inSameDayAs: date)
+            ? CGFloat(min(max(date.timeIntervalSince(bounds.start), 0), bounds.end.timeIntervalSince(bounds.start)) / 60)
             : nil
 
-        let intervals = daySessions(at: date).map { session -> (session: TaskTimeSession, start: CGFloat, end: CGFloat) in
-            let start = max(session.startedAt, dayBounds.start)
-            let end = min(session.endedAt ?? date, dayBounds.end)
-            let startMinutes = CGFloat(start.timeIntervalSince(dayBounds.start) / 60)
-            let trueEndMinutes = CGFloat(end.timeIntervalSince(dayBounds.start) / 60)
+        let intervals = daySessions(for: bounds, at: date).map { session -> (session: TaskTimeSession, start: CGFloat, end: CGFloat) in
+            let start = max(session.startedAt, bounds.start)
+            let end = min(session.endedAt ?? date, bounds.end)
+            let startMinutes = CGFloat(start.timeIntervalSince(bounds.start) / 60)
+            let trueEndMinutes = CGFloat(end.timeIntervalSince(bounds.start) / 60)
             let endMinutes = nowMinutes.map { min(trueEndMinutes, max(startMinutes, $0)) } ?? trueEndMinutes
             return (session, startMinutes, endMinutes)
         }
@@ -278,6 +433,11 @@ struct TimelineTabView: View {
         var clusterStartIndex = 0
         var clusterMaxEnd: CGFloat = -.infinity
         let minPixelHeight: CGFloat = 16
+        // Clusters are temporally sequential by construction (a new one only starts once the
+        // previous one's time range is fully behind it), so tracking the lowest point reached
+        // by any earlier cluster and never drawing above it prevents overlap *across* clusters
+        // too — not just between lanes inside the same cluster.
+        var globalBottom: CGFloat = -.infinity
 
         func flushCluster(upTo index: Int) {
             guard clusterStartIndex < index else { return }
@@ -294,22 +454,56 @@ struct TimelineTabView: View {
                 }
             }
             let laneCount = laneEnds.count
+
+            // Pass 1: natural stacked position within this cluster only (lane-local), so
+            // items sharing a lane never overlap each other.
+            var laneBottom: [Int: CGFloat] = [:]
+            var naiveY: [CGFloat] = []
+            var naiveHeight: [CGFloat] = []
             for i in clusterStartIndex..<index {
                 let item = intervals[i]
+                let lane = laneOf[i] ?? 0
                 var y = totalHeight * (item.start / 1440)
-                var height = totalHeight * ((item.end - item.start) / 1440)
-                if height < minPixelHeight {
-                    height = minPixelHeight
-                    // Reaching the minimum readable size would normally stretch the block
-                    // downward past its real end. If that end is pinned to "now", grow the
-                    // block upward instead so it still can't cross the current-time line.
-                    if let nowMinutes, item.end >= nowMinutes - 0.01 {
-                        let nowY = totalHeight * (nowMinutes / 1440)
-                        y = min(y, nowY - height)
-                    }
+                let height = max(minPixelHeight, totalHeight * ((item.end - item.start) / 1440))
+                if let previousBottom = laneBottom[lane], y < previousBottom {
+                    y = previousBottom
                 }
-                result.append(PositionedSession(session: item.session, y: y, height: height, laneIndex: laneOf[i] ?? 0, laneCount: laneCount))
+                laneBottom[lane] = y + height
+                naiveY.append(y)
+                naiveHeight.append(height)
             }
+
+            // Pass 2: shift the whole cluster down if its top would land above the previous
+            // cluster's lowest point.
+            let clusterTop = naiveY.min() ?? 0
+            let shift = max(0, globalBottom - clusterTop)
+
+            var clusterBottom: CGFloat = 0
+            for (offset, i) in (clusterStartIndex..<index).enumerated() {
+                let item = intervals[i]
+                let lane = laneOf[i] ?? 0
+                var y = naiveY[offset] + shift
+                var height = naiveHeight[offset]
+
+                // Only after the shift above: a block must never cross "now" (if this is
+                // today), and — regardless of which day this is — must never cross the day's
+                // own closing "00:00" boundary either (a session ending right before midnight
+                // could otherwise get stretched by the minimum-height floor into the next day).
+                // The downward shift from Pass 2 can push a block's top past that cap on its
+                // own (e.g. several short back-to-back sessions right before "now") — clamping
+                // only the height in that case would leave the block floating below the line
+                // entirely, so the top must be pulled back up too.
+                let capMinutes = nowMinutes ?? 1440
+                if item.end >= capMinutes - 0.01 {
+                    let capY = totalHeight * (capMinutes / 1440)
+                    y = min(y, capY - 4)
+                    height = max(4, min(height, capY - y))
+                }
+
+                clusterBottom = max(clusterBottom, y + height)
+                result.append(PositionedSession(session: item.session, y: y, height: height, laneIndex: lane, laneCount: laneCount))
+            }
+            globalBottom = max(globalBottom, clusterBottom)
         }
 
         for (index, item) in intervals.enumerated() {
@@ -326,35 +520,46 @@ struct TimelineTabView: View {
         return result
     }
 
-    private func sessionBlock(_ session: TaskTimeSession, at date: Date, compact: Bool) -> some View {
+    /// A block only ever shows its label at this one fixed size — never scaled down to fit.
+    /// Once there isn't room for a legible label at that size, the block shows no text at
+    /// all (just the colored bar) rather than shrinking it into something unreadable.
+    private static let sessionLabelFontSize: CGFloat = 9
+    // A 9pt line needs roughly 11pt for its own height; with 2pt of padding top and bottom
+    // that's ~15pt — anything shorter than that genuinely has no room for a label.
+    private static let minHeightForLabel: CGFloat = 15
+    private static let minHeightForSubtitle: CGFloat = 30
+
+    private func sessionBlock(_ session: TaskTimeSession, at date: Date, height: CGFloat, showsSubtitle: Bool) -> some View {
         let end = session.endedAt ?? date
-        return VStack(alignment: .leading, spacing: 2) {
-            Text(session.taskName)
-                .font(.system(size: compact ? 11 : 13, weight: .semibold))
-                .foregroundStyle(.white)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-            if !compact {
-                Text("\(clockText(session.startedAt)) – \(clockText(end))")
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.75))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+        let showsLabel = height >= Self.minHeightForLabel
+        let showsTime = showsSubtitle && height >= Self.minHeightForSubtitle
+
+        return ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(session.color.opacity(session.endedAt == nil ? 0.45 : 0.32))
+            Rectangle()
+                .fill(session.color)
+                .frame(width: 3)
+
+            if showsLabel {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(session.taskName)
+                        .font(.system(size: Self.sessionLabelFontSize, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    if showsTime {
+                        Text("\(clockText(session.startedAt)) – \(clockText(end))")
+                            .font(.system(size: Self.sessionLabelFontSize, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.75))
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
             }
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(alignment: .leading) {
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(session.color.opacity(session.endedAt == nil ? 0.45 : 0.32))
-                Rectangle()
-                    .fill(session.color)
-                    .frame(width: 3)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-        }
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
     }
 
     private func currentTimeLine(at date: Date) -> some View {
@@ -375,7 +580,7 @@ struct TimelineTabView: View {
         let hour: Int
         if calendar.isDate(selectedDate, inSameDayAs: date) {
             hour = max(0, calendar.component(.hour, from: date) - 2)
-        } else if let first = daySessions(at: date).first {
+        } else if let first = daySessions(for: dayBounds, at: date).first {
             hour = max(0, calendar.component(.hour, from: first.startedAt) - 1)
         } else {
             hour = 6
@@ -387,40 +592,45 @@ struct TimelineTabView: View {
 
     // MARK: - Data
 
-    private func daySessions(at date: Date) -> [TaskTimeSession] {
-        (loadedDayKey == dayKey ? sessions : cachedSessionsForCurrentDay())
+    private func daySessions(for bounds: (start: Date, end: Date), at date: Date) -> [TaskTimeSession] {
+        sessionsSource(at: date)
             .filter { session in
                 let end = session.endedAt ?? date
-                guard end > dayBounds.start && session.startedAt < dayBounds.end else { return false }
-                let overlapStart = max(session.startedAt, dayBounds.start)
-                let overlapEnd = min(end, dayBounds.end)
+                guard end > bounds.start && session.startedAt < bounds.end else { return false }
+                let overlapStart = max(session.startedAt, bounds.start)
+                let overlapEnd = min(end, bounds.end)
                 let duration = max(0, overlapEnd.timeIntervalSince(overlapStart))
                 return duration >= TimeInterval(sessionListMinimumDuration)
             }
             .sorted { $0.startedAt < $1.startedAt }
     }
 
-    private func cachedSessionsForCurrentDay() -> [TaskTimeSession] {
+    private func sessionsSource(at date: Date) -> [TaskTimeSession] {
+        loadedRangeKey == rangeKey ? sessions : cachedSessionsForCurrentRange()
+    }
+
+    private func cachedSessionsForCurrentRange() -> [TaskTimeSession] {
         guard canUseObservedSessionCache else { return [] }
         return taskService.sessions
     }
 
     private var canUseObservedSessionCache: Bool {
         let observedCutoff = calendar.date(byAdding: .day, value: -30, to: Date()) ?? .distantPast
-        return dayBounds.start >= observedCutoff
+        return rangeBounds.start >= observedCutoff
     }
 
     private func load() async {
-        let requestedKey = dayKey
+        let requestedKey = rangeKey
         do {
-            let fetched = try await taskService.fetchSessions(from: dayBounds.start, to: dayBounds.end)
-            guard requestedKey == dayKey else { return }
+            let bounds = rangeBounds
+            let fetched = try await taskService.fetchSessions(from: bounds.start, to: bounds.end)
+            guard requestedKey == rangeKey else { return }
             sessions = fetched
-            loadedDayKey = requestedKey
+            loadedRangeKey = requestedKey
         } catch {
             print("Failed to load timeline sessions: \(error.localizedDescription)")
-            if requestedKey == dayKey {
-                loadedDayKey = nil
+            if requestedKey == rangeKey {
+                loadedRangeKey = nil
             }
         }
     }
@@ -439,5 +649,6 @@ struct TimelineTabView: View {
 #Preview {
     TimelineTabView()
         .environmentObject(TaskService())
+        .environmentObject(AccentColorManager())
         .preferredColorScheme(.dark)
 }

@@ -81,7 +81,7 @@ struct TaskRow: View {
                 color: task.color,
                 symbol: task.symbol,
                 isPulsing: isVisuallyActive && !isInterrupted,
-                secondsText: isVisuallyActive ? Self.secondsText(startedAt: secondsStart, at: date) : nil
+                elapsedSeconds: isVisuallyActive ? Self.elapsedSeconds(startedAt: secondsStart, at: date) : nil
             )
 
             Text(task.name)
@@ -129,10 +129,9 @@ struct TaskRow: View {
             }
     }
 
-    private static func secondsText(startedAt: Date?, at date: Date) -> String {
-        guard let startedAt else { return "1" }
-        let elapsed = max(0, Int(date.timeIntervalSince(startedAt)))
-        return String((elapsed % 60) + 1)
+    private static func elapsedSeconds(startedAt: Date?, at date: Date) -> Int {
+        guard let startedAt else { return 0 }
+        return max(0, Int(date.timeIntervalSince(startedAt)))
     }
 }
 
@@ -174,7 +173,10 @@ struct TaskAvatarCircle: View {
     let color: Color
     let symbol: String
     let isPulsing: Bool
-    var secondsText: String? = nil
+    /// Seconds since the running session started. When set, the circle shows the elapsed
+    /// minutes with a ring that fills clockwise over each minute (resetting as seconds roll
+    /// over) instead of the task's letter.
+    var elapsedSeconds: Int? = nil
 
     var body: some View {
         if isPulsing {
@@ -188,19 +190,39 @@ struct TaskAvatarCircle: View {
         }
     }
 
+    @ViewBuilder
     private var content: some View {
-        Text(secondsText ?? (symbol.isEmpty ? "T" : symbol))
-            .font(.system(size: secondsText != nil ? 11 : 14, weight: .bold, design: secondsText != nil ? .monospaced : .default))
-            .foregroundStyle(color)
-            .frame(width: 31, height: 31)
-            .background(
+        if let elapsedSeconds {
+            let minutes = elapsedSeconds / 60
+            let secondsFraction = Double(elapsedSeconds % 60) / 60
+            ZStack {
                 Circle()
-                    .fill(Color.clear)
-                    .overlay {
-                        Circle()
-                            .stroke(color, lineWidth: 1.2)
-                    }
-            )
+                    .stroke(color.opacity(0.25), lineWidth: 2)
+                Circle()
+                    .trim(from: 0, to: secondsFraction)
+                    .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                Text("\(minutes)")
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundStyle(color)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+            }
+            .frame(width: 31, height: 31)
+        } else {
+            Text(symbol.isEmpty ? "T" : symbol)
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(color)
+                .frame(width: 31, height: 31)
+                .background(
+                    Circle()
+                        .fill(Color.clear)
+                        .overlay {
+                            Circle()
+                                .stroke(color, lineWidth: 1.2)
+                        }
+                )
+        }
     }
 }
 
