@@ -54,8 +54,15 @@ struct TaskReportDetailView: View {
     @State private var isLoading = false
     @State private var isShowingDatePicker = false
     @State private var shareItem: IdentifiableURL?
-    @State private var chartStyle: TaskReportChartStyle = .bars
+    @State private var editingSession: TaskTimeSession?
+    /// Keyed per-task, so switching between tasks doesn't clobber each other's preferred style.
+    @AppStorage private var chartStyleRawValue: String
     @AppStorage(SessionListDisplaySettings.minimumDurationKey) private var sessionListMinimumDuration = SessionListDisplaySettings.defaultMinimumDuration
+
+    private var chartStyle: TaskReportChartStyle {
+        get { TaskReportChartStyle(rawValue: chartStyleRawValue) ?? .bars }
+        nonmutating set { chartStyleRawValue = newValue.rawValue }
+    }
 
     private let calendar = Calendar.current
 
@@ -63,6 +70,10 @@ struct TaskReportDetailView: View {
         self.task = task
         _period = State(initialValue: initialPeriod)
         _referenceDate = State(initialValue: initialReferenceDate)
+        _chartStyleRawValue = AppStorage(
+            wrappedValue: TaskReportChartStyle.bars.rawValue,
+            "taskReport.chartStyle.\(task.id ?? "unknown")"
+        )
     }
 
     private var range: (start: Date, end: Date) {
@@ -80,7 +91,20 @@ struct TaskReportDetailView: View {
     }
 
     private var hasLiveSession: Bool {
-        sessions.contains { $0.endedAt == nil }
+        displaySessions.contains { $0.endedAt == nil }
+    }
+
+    /// Prefer the live, always-up-to-date Firestore listener cache whenever the fetched range
+    /// is recent enough for it to cover — otherwise an edit or delete only shows up after
+    /// navigating away and back, since the one-time fetch in `load()` never refreshes itself.
+    private var displaySessions: [TaskTimeSession] {
+        guard canUseObservedSessionCache else { return sessions }
+        return taskService.sessions.filter { $0.taskID == task.id }
+    }
+
+    private var canUseObservedSessionCache: Bool {
+        let observedCutoff = calendar.date(byAdding: .day, value: -30, to: Date()) ?? .distantPast
+        return fetchRange.start >= observedCutoff
     }
 
     var body: some View {
@@ -105,6 +129,40 @@ struct TaskReportDetailView: View {
                 }
             }
         }
+        // This screen is presented via fullScreenCover, so it doesn't get the system's
+        // interactive edge-swipe-back gesture a NavigationStack push would have — add the
+        // same left-edge swipe-to-dismiss by hand.
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 20)
+                .onEnded { value in
+                    guard value.startLocation.x < 40,
+                          value.translation.width > 80,
+                          abs(value.translation.width) > abs(value.translation.height) * 1.5
+                    else { return }
+                    Haptics.impact(.light)
+                    dismiss()
+                }
+        )
+        // Swipe left/right anywhere else to step by one day/week/month/year, matching the
+        // currently selected period — the same step(-1)/step(1) the navigator pills use.
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 30)
+                .onEnded { value in
+                    guard value.startLocation.x >= 40 else { return }
+                    let horizontal = value.translation.width
+                    let vertical = value.translation.height
+                    guard abs(horizontal) > 60, abs(horizontal) > abs(vertical) * 1.5 else { return }
+
+                    if horizontal < 0 {
+                        guard !isCurrentPeriod else { return }
+                        Haptics.selection()
+                        withAnimation(.easeInOut(duration: 0.2)) { step(1) }
+                    } else {
+                        Haptics.selection()
+                        withAnimation(.easeInOut(duration: 0.2)) { step(-1) }
+                    }
+                }
+        )
         .task(id: rangeKey) {
             await load()
         }
@@ -114,6 +172,11 @@ struct TaskReportDetailView: View {
         .sheet(item: $shareItem) { item in
             ShareSheet(items: [item.url])
         }
+        .sheet(item: $editingSession) { session in
+            SessionEditView(session: session)
+                .environmentObject(taskService)
+                .environmentObject(accentColorManager)
+        }
         .preferredColorScheme(.dark)
     }
 
@@ -122,8 +185,13 @@ struct TaskReportDetailView: View {
     }
 
     private func content(at date: Date) -> some View {
-        let sortedSessions = sessions
-            .filter { overlapSeconds($0, start: range.start, end: range.end, now: date) > 0 }
+        // In Day mode the chart above always shows the whole month for context (see
+        // `chartPeriod`), so the session list below spans that same month — grouped by day —
+        // instead of just the one currently-selected day, otherwise a day with no sessions of
+        // its own looks empty even though the chart clearly shows activity elsewhere that month.
+        let sessionListBounds = fetchRange
+        let sortedSessions = displaySessions
+            .filter { overlapSeconds($0, start: sessionListBounds.start, end: sessionListBounds.end, now: date) > 0 }
             .filter { sessionListDuration($0, at: date) >= TimeInterval(sessionListMinimumDuration) }
             .sorted { $0.startedAt > $1.startedAt }
         let groups = dayGroups(sortedSessions, at: date)
@@ -416,10 +484,11 @@ struct TaskReportDetailView: View {
             statColumn(title: "Time Tracked", value: ReportDateMath.formatDuration(total))
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            VStack(alignment: .trailing, spacing: 10) {
-                statColumn(title: period.averageLabel, value: ReportDateMath.formatDuration(average))
-                chartStylePicker
-            }
+            chartStylePicker
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, 4)
+
+            statColumn(title: period.averageLabel, value: ReportDateMath.formatDuration(average))
                 .frame(maxWidth: .infinity, alignment: .trailing)
         }
     }
@@ -440,7 +509,7 @@ struct TaskReportDetailView: View {
 
     private func totalSeconds(at date: Date) -> TimeInterval {
         let bounds = range
-        return sessions.reduce(0) { total, session in
+        return displaySessions.reduce(0) { total, session in
             total + overlapSeconds(session, start: bounds.start, end: bounds.end, now: date)
         }
     }
@@ -453,13 +522,13 @@ struct TaskReportDetailView: View {
     }
 
     private func sessionListDuration(_ session: TaskTimeSession, at date: Date) -> TimeInterval {
-        overlapSeconds(session, start: range.start, end: range.end, now: date)
+        overlapSeconds(session, start: fetchRange.start, end: fetchRange.end, now: date)
     }
 
     // MARK: - Chart
 
     private var chartStylePicker: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 6) {
             ForEach(TaskReportChartStyle.allCases) { style in
                 Button {
                     guard chartStyle != style else { return }
@@ -471,18 +540,18 @@ struct TaskReportDetailView: View {
                         .foregroundStyle(chartStyle == style ? .white : .secondary)
                         .frame(width: 30, height: 24)
                         .background {
-                            if chartStyle == style {
-                                Capsule().fill(task.color.opacity(0.42))
-                            }
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(chartStyle == style ? task.color.opacity(0.42) : Color.tabBarBackground)
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                                }
                         }
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
         }
-        .padding(3)
-        .background(Capsule().fill(Color.tabBarBackground))
-        .overlay(Capsule().stroke(Color.white.opacity(0.1), lineWidth: 1))
     }
 
     @ViewBuilder
@@ -503,7 +572,7 @@ struct TaskReportDetailView: View {
                 x: .value("Period", bucket.axisID),
                 y: .value("Hours", bucket.seconds / 3600)
             )
-            .foregroundStyle(task.color)
+            .foregroundStyle(period == .day && !calendar.isDate(bucket.labelDate, inSameDayAs: referenceDate) ? task.color.opacity(0.3) : task.color)
             .cornerRadius(3)
             .annotation(position: .top) {
                 if shouldShowBarDurationAnnotations, bucket.seconds > 0 {
@@ -555,7 +624,7 @@ struct TaskReportDetailView: View {
     }
 
     private func chartBuckets(at date: Date) -> [TaskChartBucket] {
-        ReportDateMath.buckets(for: chartPeriod, referenceDate: referenceDate, calendar: calendar, sessions: sessions, at: date)
+        ReportDateMath.buckets(for: chartPeriod, referenceDate: referenceDate, calendar: calendar, sessions: displaySessions, at: date)
             .enumerated()
             .map { index, bucket in
                 let axisID = "\(chartPeriod.rawValue)-\(index)"
@@ -614,17 +683,24 @@ struct TaskReportDetailView: View {
         }
     }
 
+    /// Only meaningful in Day mode — the month-wide session list otherwise looks identical to
+    /// Month mode, so the group matching the currently selected day is called out visually.
+    private func isSelectedDayGroup(_ day: Date) -> Bool {
+        period == .day && calendar.isDate(day, inSameDayAs: referenceDate)
+    }
+
     private func sessionDayGroup(_ group: SessionDayGroup, at date: Date) -> some View {
         let dayTotal = group.sessions.reduce(0) { $0 + $1.duration(at: date) }
+        let isSelected = isSelectedDayGroup(group.day)
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(daySectionHeader(group.day))
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(isSelected ? task.color : .secondary)
                 Spacer()
                 Text(ReportDateMath.formatDuration(dayTotal))
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(isSelected ? task.color : .secondary)
             }
 
             reportCard {
@@ -633,6 +709,12 @@ struct TaskReportDetailView: View {
                     if index < group.sessions.count - 1 {
                         Divider().background(Color.white.opacity(0.08))
                     }
+                }
+            }
+            .overlay {
+                if isSelected {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(task.color.opacity(0.24), lineWidth: 1.5)
                 }
             }
         }
@@ -665,9 +747,10 @@ struct TaskReportDetailView: View {
                 Text(task.name)
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(task.color)
-                Text("No notes")
+                Text(session.notes?.isEmpty == false ? session.notes! : "No notes")
                     .font(.system(size: 15))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
 
             Spacer(minLength: 4)
@@ -676,13 +759,13 @@ struct TaskReportDetailView: View {
                 .font(.system(size: 16))
                 .foregroundStyle(.white)
                 .monospacedDigit()
-
-            Image(systemName: "chevron.right")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
         }
         .padding(.vertical, 10)
         .contentShape(Rectangle())
+        .onTapGesture {
+            Haptics.impact(.light)
+            editingSession = session
+        }
         .contextMenu {
             Button(role: .destructive) {
                 deleteSession(session)

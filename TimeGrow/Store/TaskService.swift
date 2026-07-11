@@ -389,6 +389,31 @@ final class TaskService: NSObject, ObservableObject {
         }
     }
 
+    /// Edits a past (already-ended) session's time range, task assignment, and notes from the
+    /// Reports "Edit Session" screen. Not meant for the currently-running session.
+    func updateSession(_ session: TaskTimeSession, startedAt: Date, endedAt: Date, task: TGTask, notes: String?) {
+        guard let uid = currentUser?.uid, let sessionID = session.id, let taskID = task.id else { return }
+
+        if let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }) {
+            sessions[sessionIndex].startedAt = startedAt
+            sessions[sessionIndex].endedAt = endedAt
+            sessions[sessionIndex].taskID = taskID
+            sessions[sessionIndex].taskName = task.name
+            sessions[sessionIndex].colorHex = task.colorHex
+            sessions[sessionIndex].notes = notes
+        }
+
+        let trimmedNotes = notes?.trimmingCharacters(in: .whitespacesAndNewlines)
+        sessionsCollection(for: uid).document(sessionID).updateData([
+            "startedAt": Timestamp(date: startedAt),
+            "endedAt": Timestamp(date: endedAt),
+            "taskID": taskID,
+            "taskName": task.name,
+            "colorHex": task.colorHex,
+            "notes": (trimmedNotes?.isEmpty ?? true) ? FieldValue.delete() : trimmedNotes!,
+        ])
+    }
+
     func startTimer(for task: TGTask, at startDate: Date = Date(), startedAutomatically: Bool = false) {
         guard let uid = currentUser?.uid,
               let id = task.id,

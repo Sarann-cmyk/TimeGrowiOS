@@ -96,6 +96,8 @@ struct ReportsView: View {
     @State private var isShowingDatePicker = false
     @State private var shareItem: IdentifiableURL?
     @State private var selectedTask: TGTask?
+    @State private var editingSession: TaskTimeSession?
+    @State private var sessionPendingDeletion: TaskTimeSession?
     @AppStorage(SessionListDisplaySettings.minimumDurationKey) private var sessionListMinimumDuration = SessionListDisplaySettings.defaultMinimumDuration
 
     private let calendar = Calendar.current
@@ -129,7 +131,13 @@ struct ReportsView: View {
     }
 
     private var displaySessions: [TaskTimeSession] {
-        loadedRangeKey == rangeKey ? sessions : cachedSessionsForCurrentRange()
+        // Prefer the live, always-up-to-date Firestore listener cache whenever the range is
+        // recent enough for it to cover — otherwise an edit or delete only shows up after
+        // navigating away and back, since the one-time fetch below never refreshes itself.
+        guard canUseObservedSessionCache else {
+            return loadedRangeKey == rangeKey ? sessions : []
+        }
+        return taskService.sessions
     }
 
     var body: some View {
@@ -154,6 +162,25 @@ struct ReportsView: View {
         .fullScreenCover(item: $selectedTask) { task in
             TaskReportDetailView(task: task, initialPeriod: period, initialReferenceDate: referenceDate)
                 .environmentObject(taskService)
+        }
+        .sheet(item: $editingSession) { session in
+            SessionEditView(session: session)
+                .environmentObject(taskService)
+                .environmentObject(accentColorManager)
+        }
+        .alert("Delete Session?", isPresented: Binding(
+            get: { sessionPendingDeletion != nil },
+            set: { if !$0 { sessionPendingDeletion = nil } }
+        )) {
+            Button("Delete", role: .destructive) {
+                if let session = sessionPendingDeletion {
+                    taskService.deleteSession(session)
+                }
+                sessionPendingDeletion = nil
+            }
+            Button("Cancel", role: .cancel) { sessionPendingDeletion = nil }
+        } message: {
+            Text("This can't be undone.")
         }
     }
 
@@ -469,12 +496,9 @@ struct ReportsView: View {
                 .font(.system(size: 15))
                 .foregroundStyle(.white)
                 .monospacedDigit()
-
-            Image(systemName: "chevron.right")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
         }
         .padding(.vertical, 10)
+        .contentShape(Rectangle())
     }
 
     private func usageScaleRow(color: Color, percent: Int) -> some View {
@@ -561,9 +585,10 @@ struct ReportsView: View {
                 Text(session.taskName)
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(session.color)
-                Text("No notes")
+                Text(session.notes?.isEmpty == false ? session.notes! : "No notes")
                     .font(.system(size: 15))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
 
             Spacer(minLength: 4)
@@ -572,12 +597,19 @@ struct ReportsView: View {
                 .font(.system(size: 16))
                 .foregroundStyle(.white)
                 .monospacedDigit()
-
-            Image(systemName: "chevron.right")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
         }
         .padding(.vertical, 10)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            Haptics.impact(.light)
+            editingSession = session
+        }
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                Haptics.impact(.medium)
+                sessionPendingDeletion = session
+            }
+        )
     }
 
     private func reportCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
@@ -610,13 +642,6 @@ struct ReportsView: View {
             if requestedRangeKey == rangeKey {
                 loadedRangeKey = nil
             }
-        }
-    }
-
-    private func cachedSessionsForCurrentRange() -> [TaskTimeSession] {
-        guard canUseObservedSessionCache else { return [] }
-        return taskService.sessions.filter {
-            ($0.endedAt ?? range.end) > range.start && $0.startedAt < range.end
         }
     }
 

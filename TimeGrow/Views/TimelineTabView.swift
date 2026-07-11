@@ -71,6 +71,10 @@ struct TimelineTabView: View {
                     content(at: Date())
                 }
             }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 30)
+                    .onEnded(handleHorizontalSwipe)
+            )
         }
         .background(Color.black)
         .task(id: rangeKey) {
@@ -91,6 +95,23 @@ struct TimelineTabView: View {
             timelineScroll(at: date)
         } else {
             weekTimelineScroll(at: date)
+        }
+    }
+
+    /// Swipe left/right to step by a day (Day mode) or a week (Week mode). Only fires on a
+    /// clearly horizontal drag so it doesn't fight the grid's own vertical scrolling.
+    private func handleHorizontalSwipe(_ value: DragGesture.Value) {
+        let horizontal = value.translation.width
+        let vertical = value.translation.height
+        guard abs(horizontal) > 60, abs(horizontal) > abs(vertical) * 1.5 else { return }
+
+        let step = scope == .day ? 1 : 7
+        let delta = horizontal < 0 ? step : -step
+        guard let newDate = calendar.date(byAdding: .day, value: delta, to: selectedDate) else { return }
+
+        Haptics.selection()
+        withAnimation(.easeInOut(duration: 0.2)) {
+            selectedDate = newDate
         }
     }
 
