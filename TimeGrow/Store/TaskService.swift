@@ -639,6 +639,22 @@ final class TaskService: NSObject, ObservableObject {
         stopTimer(for: task, endedAt: Date(), reason: "manual")
     }
 
+    /// Ends the current auto-tracked "live" grace period early, without touching the already
+    /// closed session document. Using the same app again afterward starts a fresh session that
+    /// ends later than this cutoff, so tracking resumes naturally — this only silences the
+    /// *current* grace window, it can't disable Screen Time monitoring itself.
+    func stopAutoTracking(for task: TGTask) {
+        guard let uid = currentUser?.uid, let id = task.id else { return }
+        let stoppedAt = Date()
+        if let taskIndex = tasks.firstIndex(where: { $0.id == id }) {
+            tasks[taskIndex].autoTrackStoppedAt = stoppedAt
+        }
+        tasksCollection(for: uid).document(id).updateData([
+            "autoTrackStoppedAt": Timestamp(date: stoppedAt),
+            "updatedAt": Timestamp(date: stoppedAt),
+        ])
+    }
+
     private func stopTimer(for task: TGTask, endedAt: Date, reason: String = "manual") {
         guard let uid = currentUser?.uid, let id = task.id, let startedAt = task.timerStartedAt else { return }
         DiagnosticsLog.log("timer", "stopTimer task=\(task.name) id=\(id) reason=\(reason) endedAt=\(endedAt) ownerPlatform=\(task.timerOwnerPlatform ?? "?") ownerDevice=\(task.timerOwnerDeviceName ?? "?")")

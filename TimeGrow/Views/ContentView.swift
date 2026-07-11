@@ -124,6 +124,7 @@ struct ContentView: View {
                             sessions: taskService.sessions.filter { $0.taskID == task.id },
                             timerOwnerStatus: { taskService.timerOwnerStatus(for: task, at: $0) },
                             onToggleTimer: { toggleTimer(task) },
+                            stopAutoTrackAction: { taskService.stopAutoTracking(for: task) },
                             editAction: { taskBeingEdited = task },
                             deleteAction: { taskService.deleteTask(task) },
                             autoTrackAction: { taskForAutoTracking = task }

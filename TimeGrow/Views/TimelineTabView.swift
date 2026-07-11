@@ -47,7 +47,11 @@ struct TimelineTabView: View {
 
     private var rangeKey: String { "\(scope.rawValue)-\(rangeBounds.start.timeIntervalSince1970)" }
 
-    private var hasLiveSession: Bool { sessions.contains { $0.endedAt == nil } }
+    private var hasLiveSession: Bool {
+        sessions.contains { $0.endedAt == nil }
+            || taskService.sessions.contains { $0.endedAt == nil }
+            || activeEntry != nil
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -161,25 +165,54 @@ struct TimelineTabView: View {
         .padding(.horizontal, 16)
     }
 
+    private struct ActiveEntry {
+        let color: Color
+        let symbol: String
+        let startedAt: Date
+    }
+
+    /// A manually-started timer, or an auto-tracked session that's still within its
+    /// grace-period window after ending — the same two cases the Tasks list treats as "live".
+    /// Auto-track never sets `timerStartedAt` on the task itself, only on the session, so
+    /// this can't be answered from `task.isTimerRunning` alone.
+    private var activeEntry: ActiveEntry? {
+        if let task = taskService.tasks.first(where: { $0.isTimerRunning }), let startedAt = task.timerStartedAt {
+            return ActiveEntry(color: task.color, symbol: task.symbol, startedAt: startedAt)
+        }
+        let graceCandidates = taskService.sessions.filter { session -> Bool in
+            guard session.startedAutomatically == true, let endedAt = session.endedAt else { return false }
+            if let stoppedAt = taskService.tasks.first(where: { $0.id == session.taskID })?.autoTrackStoppedAt,
+               endedAt <= stoppedAt {
+                return false
+            }
+            return Date().timeIntervalSince(endedAt) <= autoTrackingInactivityGraceSeconds
+        }
+        guard let liveSession = graceCandidates.max(by: { ($0.endedAt ?? $0.startedAt) < ($1.endedAt ?? $1.startedAt) }) else {
+            return nil
+        }
+        let symbol = String(liveSession.taskName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1)).uppercased()
+        return ActiveEntry(color: liveSession.color, symbol: symbol.isEmpty ? "T" : symbol, startedAt: liveSession.startedAt)
+    }
+
     @ViewBuilder
     private var activeTrackerCorner: some View {
-        if let task = taskService.tasks.first(where: { $0.isTimerRunning }), let startedAt = task.timerStartedAt {
+        if let entry = activeEntry {
             SwiftUI.TimelineView(.periodic(from: .now, by: 1)) { context in
-                let elapsed = max(0, Int(context.date.timeIntervalSince(startedAt)))
+                let elapsed = max(0, Int(context.date.timeIntervalSince(entry.startedAt)))
                 let minutes = elapsed / 60
                 let secondsFraction = Double(elapsed % 60) / 60
 
                 ZStack {
                     Circle()
-                        .stroke(task.color.opacity(0.25), lineWidth: 2.5)
+                        .stroke(entry.color.opacity(0.25), lineWidth: 2.5)
                     // The ring fills clockwise over each minute, resetting as the seconds roll over.
                     Circle()
                         .trim(from: 0, to: secondsFraction)
-                        .stroke(task.color, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                        .stroke(entry.color, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
                         .rotationEffect(.degrees(-90))
                     Text("\(minutes)")
                         .font(.system(size: 12, weight: .bold, design: .rounded))
-                        .foregroundStyle(task.color)
+                        .foregroundStyle(entry.color)
                         .lineLimit(1)
                         .minimumScaleFactor(0.6)
                 }
@@ -485,20 +518,18 @@ struct TimelineTabView: View {
                 var y = naiveY[offset] + shift
                 var height = naiveHeight[offset]
 
-                // Only after the shift above: a block must never cross "now" (if this is
-                // today), and — regardless of which day this is — must never cross the day's
-                // own closing "00:00" boundary either (a session ending right before midnight
-                // could otherwise get stretched by the minimum-height floor into the next day).
-                // The downward shift from Pass 2 can push a block's top past that cap on its
-                // own (e.g. several short back-to-back sessions right before "now") — clamping
-                // only the height in that case would leave the block floating below the line
-                // entirely, so the top must be pulled back up too.
+                // Only after the shift above: no block may cross "now" (if this is today), and
+                // — regardless of which day this is — none may cross the day's own closing
+                // "00:00" boundary either. This isn't limited to whichever session's *real* end
+                // happens to land on "now" — the downward shift from Pass 2 (crowding several
+                // short back-to-back sessions) can just as easily push an already-finished
+                // block's floor-inflated position past the cap, so it applies to every block
+                // unconditionally. Clamping only the height would leave a pushed-down block
+                // floating below the line entirely, so the top must be pulled back up too.
                 let capMinutes = nowMinutes ?? 1440
-                if item.end >= capMinutes - 0.01 {
-                    let capY = totalHeight * (capMinutes / 1440)
-                    y = min(y, capY - 4)
-                    height = max(4, min(height, capY - y))
-                }
+                let capY = totalHeight * (capMinutes / 1440)
+                y = min(y, capY - 4)
+                height = max(4, min(height, capY - y))
 
                 clusterBottom = max(clusterBottom, y + height)
                 result.append(PositionedSession(session: item.session, y: y, height: height, laneIndex: lane, laneCount: laneCount))
@@ -606,11 +637,13 @@ struct TimelineTabView: View {
     }
 
     private func sessionsSource(at date: Date) -> [TaskTimeSession] {
-        loadedRangeKey == rangeKey ? sessions : cachedSessionsForCurrentRange()
-    }
-
-    private func cachedSessionsForCurrentRange() -> [TaskTimeSession] {
-        guard canUseObservedSessionCache else { return [] }
+        // Prefer the live, always-up-to-date Firestore listener cache whenever the range is
+        // recent enough for it to cover — that's what makes new/ending sessions (like the
+        // one currently running) show up immediately instead of only after the view reloads.
+        // Only fall back to the one-time async fetch for ranges older than that rolling window.
+        guard canUseObservedSessionCache else {
+            return loadedRangeKey == rangeKey ? sessions : []
+        }
         return taskService.sessions
     }
 

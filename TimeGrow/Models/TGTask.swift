@@ -24,6 +24,11 @@ struct TGTask: Identifiable, Codable, Equatable {
     var autoTrackLiveUntil: Date?
     var autoTrackActiveSessionID: String?
     var autoTrackSessionStartedAt: Date?
+    /// Set when the user manually stops an in-progress auto-tracked session. Any auto-tracked
+    /// session that ended at or before this moment is no longer treated as "live" during its
+    /// grace period — using the same app again afterward starts a fresh session and clears
+    /// this naturally, since that new session ends later than this cutoff.
+    var autoTrackStoppedAt: Date?
 
     static let defaultAccent = Color(red: 0.55, green: 0.84, blue: 0.09)
 

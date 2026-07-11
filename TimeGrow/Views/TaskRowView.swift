@@ -12,6 +12,7 @@ struct TaskRow: View {
     let sessions: [TaskTimeSession]
     let timerOwnerStatus: (Date) -> TimerOwnerStatus
     let onToggleTimer: () -> Void
+    let stopAutoTrackAction: () -> Void
     let editAction: () -> Void
     let deleteAction: () -> Void
     let autoTrackAction: () -> Void
@@ -23,7 +24,11 @@ struct TaskRow: View {
             .contentShape(Rectangle())
             .onTapGesture {
                 Haptics.impact(.light)
-                onToggleTimer()
+                if !task.isTimerRunning, isAutoTrackLive(at: Date()) {
+                    stopAutoTrackAction()
+                } else {
+                    onToggleTimer()
+                }
             }
             .simultaneousGesture(
                 LongPressGesture(minimumDuration: 0.5).onEnded { _ in
@@ -122,6 +127,7 @@ struct TaskRow: View {
             .filter { session in
                 guard session.startedAutomatically == true,
                       let endedAt = session.endedAt else { return false }
+                if let stoppedAt = task.autoTrackStoppedAt, endedAt <= stoppedAt { return false }
                 return date.timeIntervalSince(endedAt) <= autoTrackingInactivityGraceSeconds
             }
             .max { first, second in
@@ -279,6 +285,7 @@ struct TaskDurationLabel: View {
             .filter { session in
                 guard session.startedAutomatically == true,
                       let endedAt = session.endedAt else { return false }
+                if let stoppedAt = task.autoTrackStoppedAt, endedAt <= stoppedAt { return false }
                 return date.timeIntervalSince(endedAt) <= autoTrackingInactivityGraceSeconds
             }
             .max { first, second in
