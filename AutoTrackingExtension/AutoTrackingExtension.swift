@@ -3,6 +3,7 @@
 //  AutoTrackingExtension
 //
 
+import ActivityKit
 import DeviceActivity
 import FamilyControls
 import Foundation
@@ -11,6 +12,7 @@ private let appGroupID = "group.WINNER.ltd.TimeGrow"
 private let pendingEventsKey = "autoTracking.pendingEvents"
 private let debugEventsKey = "autoTracking.debugEvents"
 private let selectionDataKeyPrefix = "autoTracking.selectionData."
+private let taskMetaKeyPrefix = "autoTracking.taskMeta."
 private let authUIDKey = "autoTracking.firebase.uid"
 private let authIDTokenKey = "autoTracking.firebase.idToken"
 private let authTokenExpirationKey = "autoTracking.firebase.idTokenExpiration"
@@ -37,31 +39,25 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
 
         guard let sharedDefaults = UserDefaults(suiteName: appGroupID) else { return }
 
+        let resolvedTaskID = taskID(from: activity)
+        let occurredAt = Date()
+
         var pendingEvents = sharedDefaults.array(forKey: pendingEventsKey) as? [[String: Any]] ?? []
         pendingEvents.append([
-            "taskID": taskID(from: activity),
-            "occurredAt": Date().timeIntervalSince1970,
+            "taskID": resolvedTaskID,
+            "occurredAt": occurredAt.timeIntervalSince1970,
         ])
         sharedDefaults.set(pendingEvents, forKey: pendingEventsKey)
 
-        syncAutoTrackLiveState(taskID: taskID(from: activity), occurredAt: Date(), sharedDefaults: sharedDefaults)
+        let sessionStartedAt = resolveSessionStartedAt(taskID: resolvedTaskID, occurredAt: occurredAt, sharedDefaults: sharedDefaults)
+        startLiveActivityIfNeeded(taskID: resolvedTaskID, startedAt: sessionStartedAt, sharedDefaults: sharedDefaults)
+        syncAutoTrackLiveState(taskID: resolvedTaskID, occurredAt: occurredAt, sessionStartedAt: sessionStartedAt, sharedDefaults: sharedDefaults)
         rearmMonitoring(after: activity)
     }
 
-    private func syncAutoTrackLiveState(taskID: String, occurredAt: Date, sharedDefaults: UserDefaults) {
-        guard let uid = sharedDefaults.string(forKey: authUIDKey),
-              let idToken = sharedDefaults.string(forKey: authIDTokenKey),
-              let projectID = sharedDefaults.string(forKey: projectIDKey) else {
-            appendDebugEvent("firebaseSyncSkipped:noAuth", taskID: taskID, occurredAt: occurredAt)
-            return
-        }
-
-        let expiration = Date(timeIntervalSince1970: sharedDefaults.double(forKey: authTokenExpirationKey))
-        guard expiration.timeIntervalSince(occurredAt) > 60 else {
-            appendDebugEvent("firebaseSyncSkipped:expiredToken", taskID: taskID, occurredAt: occurredAt)
-            return
-        }
-
+    /// Reuses (if within the inactivity grace period) or starts a new session-start timestamp,
+    /// persisting it so both the Live Activity and the Firestore sync below agree on it.
+    private func resolveSessionStartedAt(taskID: String, occurredAt: Date, sharedDefaults: UserDefaults) -> Date {
         let lastUsageKey = "\(lastUsageKeyPrefix)\(taskID)"
         let sessionStartKey = "\(sessionStartKeyPrefix)\(taskID)"
         let previousLastUsage = Date(timeIntervalSince1970: sharedDefaults.double(forKey: lastUsageKey))
@@ -77,6 +73,55 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
 
         sharedDefaults.set(occurredAt.timeIntervalSince1970, forKey: lastUsageKey)
         sharedDefaults.set(sessionStartedAt.timeIntervalSince1970, forKey: sessionStartKey)
+        return sessionStartedAt
+    }
+
+    /// Starts the Dynamic Island Live Activity directly from this extension, entirely locally —
+    /// no network call, no push, no dependency on the main app being woken. DeviceActivityMonitor
+    /// is already guaranteed to run right when the threshold fires, which makes it a far more
+    /// reliable trigger than push-to-start/background-wake (confirmed unreliable on-device,
+    /// especially soon after a fresh install — see 2026-07-12 debugging notes in git history).
+    private func startLiveActivityIfNeeded(taskID: String, startedAt: Date, sharedDefaults: UserDefaults) {
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+            appendDebugEvent("liveActivitySkipped:notEnabled", taskID: taskID, occurredAt: Date())
+            return
+        }
+        guard !Activity<TimeGrowLiveActivityAttributes>.activities.contains(where: { $0.attributes.taskID == taskID }) else {
+            appendDebugEvent("liveActivityAlreadyRunning", taskID: taskID, occurredAt: Date())
+            return
+        }
+
+        var taskName = taskID
+        var colorHex = "#8CD616"
+        if let metaData = sharedDefaults.dictionary(forKey: "\(taskMetaKeyPrefix)\(taskID)") {
+            taskName = metaData["name"] as? String ?? taskName
+            colorHex = metaData["colorHex"] as? String ?? colorHex
+        }
+
+        let attributes = TimeGrowLiveActivityAttributes(taskID: taskID, taskName: taskName, colorHex: colorHex)
+        let contentState = TimeGrowLiveActivityAttributes.ContentState(startedAt: startedAt)
+
+        do {
+            _ = try Activity.request(attributes: attributes, content: .init(state: contentState, staleDate: nil))
+            appendDebugEvent("liveActivityStarted", taskID: taskID, occurredAt: Date())
+        } catch {
+            appendDebugEvent("liveActivityStartFailed:\(error.localizedDescription)", taskID: taskID, occurredAt: Date())
+        }
+    }
+
+    private func syncAutoTrackLiveState(taskID: String, occurredAt: Date, sessionStartedAt: Date, sharedDefaults: UserDefaults) {
+        guard let uid = sharedDefaults.string(forKey: authUIDKey),
+              let idToken = sharedDefaults.string(forKey: authIDTokenKey),
+              let projectID = sharedDefaults.string(forKey: projectIDKey) else {
+            appendDebugEvent("firebaseSyncSkipped:noAuth", taskID: taskID, occurredAt: occurredAt)
+            return
+        }
+
+        let expiration = Date(timeIntervalSince1970: sharedDefaults.double(forKey: authTokenExpirationKey))
+        guard expiration.timeIntervalSince(occurredAt) > 60 else {
+            appendDebugEvent("firebaseSyncSkipped:expiredToken", taskID: taskID, occurredAt: occurredAt)
+            return
+        }
 
         let liveUntil = occurredAt.addingTimeInterval(inactivityGraceSeconds)
         let updatedAt = Date()

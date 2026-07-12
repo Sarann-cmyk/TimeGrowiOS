@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		3B2F0CFAD0B725190E479602 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B784A23C4BE37256025CA5D8 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift */; };
+		EBC5C9D2A2420A439BC66B48 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B784A23C4BE37256025CA5D8 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift */; };
 		4056B7D989B53BED2634A480 /* AutoTrackingExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 104D9DA54C1EACFDE8DD2264 /* AutoTrackingExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		43CA1BAB4BAA87F84C13A908 /* DeviceActivity.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 383BE76F4E5A2DA6FFA7D60B /* DeviceActivity.framework */; };
 		6A6861BE315942EDFD5622F1 /* AutoTrackingExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8359DAA4B916ED508B7710A5 /* AutoTrackingExtension.swift */; };
@@ -17,7 +19,6 @@
 		E244C36A2FF97B530026734E /* FirebaseAnalytics in Frameworks */ = {isa = PBXBuildFile; productRef = E244C3692FF97B530026734E /* FirebaseAnalytics */; };
 		E244C36C2FF97B530026734E /* FirebaseAuth in Frameworks */ = {isa = PBXBuildFile; productRef = E244C36B2FF97B530026734E /* FirebaseAuth */; };
 		E244C36E2FF97B530026734E /* FirebaseFirestore in Frameworks */ = {isa = PBXBuildFile; productRef = E244C36D2FF97B530026734E /* FirebaseFirestore */; };
-		3B2F0CFAD0B725190E479602 /* TimeGrowLiveActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B784A23C4BE37256025CA5D8 /* TimeGrowLiveActivityAttributes.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -58,12 +59,12 @@
 		383BE76F4E5A2DA6FFA7D60B /* DeviceActivity.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = DeviceActivity.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/DeviceActivity.framework; sourceTree = DEVELOPER_DIR; };
 		3C361313133AC9B3E22DFE2A /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		8359DAA4B916ED508B7710A5 /* AutoTrackingExtension.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AutoTrackingExtension.swift; sourceTree = "<group>"; };
+		B784A23C4BE37256025CA5D8 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift; sourceTree = "<group>"; };
 		E2432E35300377B7004530C0 /* TimeGrowLiveActivityExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = TimeGrowLiveActivityExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		E2432E36300377B7004530C0 /* WidgetKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WidgetKit.framework; path = System/Library/Frameworks/WidgetKit.framework; sourceTree = SDKROOT; };
 		E2432E38300377B7004530C0 /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = System/Library/Frameworks/SwiftUI.framework; sourceTree = SDKROOT; };
 		E2BAEF272FF7CEDA0004282D /* TimeGrow.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TimeGrow.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F8557A2C21F38A593367B633 /* AutoTrackingExtension.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = AutoTrackingExtension.entitlements; sourceTree = "<group>"; };
-		B784A23C4BE37256025CA5D8 /* TimeGrowLiveActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -171,7 +172,7 @@
 				E2BAEF282FF7CEDA0004282D /* Products */,
 				AD5A95F8F811A59C6EDC2AAA /* Frameworks */,
 				6DEAECE9BEC9834BDB3820D4 /* AutoTrackingExtension */,
-				B784A23C4BE37256025CA5D8 /* TimeGrowLiveActivityAttributes.swift */,
+				B784A23C4BE37256025CA5D8 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -330,6 +331,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				6A6861BE315942EDFD5622F1 /* AutoTrackingExtension.swift in Sources */,
+				EBC5C9D2A2420A439BC66B48 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -337,7 +339,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				3B2F0CFAD0B725190E479602 /* TimeGrowLiveActivityAttributes.swift in Sources */,
+				3B2F0CFAD0B725190E479602 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

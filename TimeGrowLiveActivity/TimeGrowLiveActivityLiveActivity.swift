@@ -9,6 +9,11 @@ import ActivityKit
 import WidgetKit
 import SwiftUI
 
+/// Mirrors `TGTask.symbol` (first letter of the task name, uppercased).
+private func taskInitial(_ taskName: String) -> String {
+    String(taskName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1)).uppercased()
+}
+
 struct TimeGrowLiveActivityLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: TimeGrowLiveActivityAttributes.self) { context in
@@ -21,6 +26,7 @@ struct TimeGrowLiveActivityLiveActivity: Widget {
                 DynamicIslandExpandedRegion(.leading) {
                     Text(context.attributes.taskName)
                         .font(.system(.subheadline, design: .rounded, weight: .semibold))
+                        .foregroundStyle(.white)
                         .lineLimit(1)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
@@ -35,30 +41,54 @@ struct TimeGrowLiveActivityLiveActivity: Widget {
                 }
             } compactLeading: {
                 // Compact state — single active Live Activity, oval pill next to the camera.
-                Image(systemName: "timer")
+                // Fixed width keeps iOS from stretching the pill to fit a hypothetical wider value.
+                TimerDigitsText(startedAt: context.state.startedAt, compact: true)
+                    .font(.system(.callout, design: .rounded, weight: .semibold))
                     .foregroundStyle(accent)
+                    .lineLimit(1)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(accent.opacity(0.15)))
+                    .frame(width: 52, alignment: .leading)
             } compactTrailing: {
-                TimerDigitsText(startedAt: context.state.startedAt)
-                    .foregroundStyle(accent)
-                    .frame(width: 50)
+                EmptyView()
             } minimal: {
-                // Minimal state — shown when two Live Activities are running at once.
-                Image(systemName: "timer")
+                // Minimal state — shown when two Live Activities are running at once. Digits don't
+                // fit here; show the task's initial letter, matching `TaskAvatarCircle` in the app
+                // (TaskRowView.swift): outlined circle, no fill, letter in the task's accent color.
+                Text(taskInitial(context.attributes.taskName))
+                    .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(accent)
+                    .frame(width: 20, height: 20)
+                    .overlay(Circle().stroke(accent, lineWidth: 1.2))
             }
             .keylineTint(accent)
         }
     }
 }
 
-/// Renders elapsed time as digits only. Uses `Text(timerInterval:)` per Apple's guidance so the
-/// system updates the display every second without the app pushing per-second content updates.
+/// Renders elapsed time as digits only, without the app pushing per-second content updates —
+/// both styles below are part of the small set of SwiftUI APIs Live Activities animate
+/// continuously on the system side.
+///
+/// `compact: true` uses `Text(_:style:.timer)`, which sizes to its actual current content.
+/// `Text(timerInterval:)` (used for `compact: false`) pre-reserves layout width for the longest
+/// string reachable across its *entire* range — with a 24h range that's room for a huge minute
+/// count even with `showsHours: false` — which visibly bloats the compact Dynamic Island pill
+/// (confirmed on-device 2026-07-12: huge gap between `compactLeading`/`compactTrailing`). Keep
+/// `Text(timerInterval:)` only where there's headroom to spare (expanded, Lock Screen).
 private struct TimerDigitsText: View {
     let startedAt: Date
+    var compact: Bool = false
 
     var body: some View {
-        Text(timerInterval: startedAt...startedAt.addingTimeInterval(24 * 60 * 60), countsDown: false, showsHours: true)
-            .monospacedDigit()
+        if compact {
+            Text(startedAt, style: .timer)
+                .monospacedDigit()
+        } else {
+            Text(timerInterval: startedAt...startedAt.addingTimeInterval(24 * 60 * 60), countsDown: false, showsHours: true)
+                .monospacedDigit()
+        }
     }
 }
 
@@ -74,6 +104,7 @@ private struct LockScreenLiveActivityView: View {
                 .frame(width: 10, height: 10)
             Text(context.attributes.taskName)
                 .font(.system(.headline, design: .rounded))
+                .foregroundStyle(.white)
                 .lineLimit(1)
             Spacer()
             TimerDigitsText(startedAt: context.state.startedAt)

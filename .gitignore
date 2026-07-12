@@ -15,6 +15,13 @@ Package.resolved
 # macOS
 .DS_Store
 
+# Firebase Functions
+functions/node_modules/
+functions/lib/
+firebase-debug.log
+firebase-debug.*.log
+.runtimeconfig.json
+
 # Fastlane
 fastlane/report.xml
 fastlane/Preview.html

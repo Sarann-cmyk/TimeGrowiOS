@@ -13,9 +13,36 @@ import Foundation
 final class LiveActivityManager {
     static let shared = LiveActivityManager()
 
+    /// Ticks while at least one activity is running so an auto-tracked activity whose grace
+    /// period (`autoTrackLiveUntil`) elapses purely by wall-clock time — with no new Firestore
+    /// write to trigger `TaskService.tasks`' `didSet` — still gets re-checked and ended promptly.
+    private var recheckTimer: Timer?
+    private var lastKnownTasks: [TGTask] = []
+
+    /// Called whenever a task's per-activity push token becomes known (activity just started) or
+    /// should be cleared (activity ending). Set once from `TimeGrowApp` to persist it via
+    /// `TaskService`, so this manager doesn't need a `TaskService` reference of its own.
+    var pushTokenHandler: ((_ taskID: String, _ token: String?) -> Void)?
+
     private init() {}
 
+    /// This device's ActivityKit push-to-start token stream, hex-encoded. A server can use this
+    /// token to start a new Live Activity via APNs even while the app isn't running. Available
+    /// even when zero activities are currently running.
+    var pushToStartTokenUpdates: AsyncStream<String> {
+        AsyncStream { continuation in
+            let task = Task {
+                for await data in Activity<TimeGrowLiveActivityAttributes>.pushToStartTokenUpdates {
+                    continuation.yield(data.map { String(format: "%02x", $0) }.joined())
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     func reconcile(tasks: [TGTask]) {
+        lastKnownTasks = tasks
         guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
 
         var runningStartByTaskID: [String: Date] = [:]
@@ -26,13 +53,10 @@ final class LiveActivityManager {
 
         for activity in Activity<TimeGrowLiveActivityAttributes>.activities {
             let taskID = activity.attributes.taskID
-            guard let startedAt = runningStartByTaskID[taskID] else {
+            guard runningStartByTaskID[taskID] != nil else {
+                pushTokenHandler?(taskID, nil)
                 Task { await activity.end(nil, dismissalPolicy: .immediate) }
                 continue
-            }
-            if activity.content.state.startedAt != startedAt {
-                let updated = TimeGrowLiveActivityAttributes.ContentState(startedAt: startedAt)
-                Task { await activity.update(.init(state: updated, staleDate: nil)) }
             }
             runningStartByTaskID.removeValue(forKey: taskID)
         }
@@ -41,6 +65,8 @@ final class LiveActivityManager {
             guard let id = task.id, let startedAt = runningStartByTaskID[id] else { continue }
             start(for: task, startedAt: startedAt)
         }
+
+        updateTimerScheduling()
     }
 
     private func start(for task: TGTask, startedAt: Date) {
@@ -49,9 +75,38 @@ final class LiveActivityManager {
         let contentState = TimeGrowLiveActivityAttributes.ContentState(startedAt: startedAt)
 
         do {
-            _ = try Activity.request(attributes: attributes, content: .init(state: contentState, staleDate: nil))
+            let activity = try Activity.request(attributes: attributes, content: .init(state: contentState, staleDate: nil))
+            observePushToken(of: activity, taskID: taskID)
         } catch {
             DiagnosticsLog.log("liveActivity", "Failed to start Live Activity for \(task.name): \(error.localizedDescription)")
+        }
+        updateTimerScheduling()
+    }
+
+    /// Streams this activity's per-activity push token to `pushTokenHandler` as ActivityKit
+    /// (re)issues it, so a server can push `end` events via APNs.
+    private func observePushToken(of activity: Activity<TimeGrowLiveActivityAttributes>, taskID: String) {
+        Task { [weak self] in
+            for await data in activity.pushTokenUpdates {
+                let hexToken = data.map { String(format: "%02x", $0) }.joined()
+                self?.pushTokenHandler?(taskID, hexToken)
+            }
+        }
+    }
+
+    /// Starts or stops the periodic re-check based on whether any activity is running.
+    private func updateTimerScheduling() {
+        let hasActivities = !Activity<TimeGrowLiveActivityAttributes>.activities.isEmpty
+        if hasActivities, recheckTimer == nil {
+            recheckTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.reconcile(tasks: self.lastKnownTasks)
+                }
+            }
+        } else if !hasActivities {
+            recheckTimer?.invalidate()
+            recheckTimer = nil
         }
     }
 

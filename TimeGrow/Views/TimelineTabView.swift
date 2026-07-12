@@ -486,7 +486,7 @@ struct TimelineTabView: View {
         var result: [PositionedSession] = []
         var clusterStartIndex = 0
         var clusterMaxEnd: CGFloat = -.infinity
-        let minPixelHeight: CGFloat = 16
+        let minPixelHeight: CGFloat = 22
         // Clusters are temporally sequential by construction (a new one only starts once the
         // previous one's time range is fully behind it), so tracking the lowest point reached
         // by any earlier cluster and never drawing above it prevents overlap *across* clusters

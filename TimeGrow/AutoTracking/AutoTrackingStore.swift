@@ -19,6 +19,10 @@ let minimumTrackedSessionDuration: TimeInterval = 3
 private let pendingEventsKey = "autoTracking.pendingEvents"
 private let debugEventsKey = "autoTracking.debugEvents"
 private let selectionDataKeyPrefix = "autoTracking.selectionData."
+/// Task display metadata (name/colorHex), mirrored into the App Group so
+/// `AutoTrackingExtension` can start a Live Activity directly — without a Firestore round
+/// trip — the moment a threshold event fires.
+private let taskMetaKeyPrefix = "autoTracking.taskMeta."
 
 struct PendingAutoTrackEvent {
     let taskID: String
@@ -83,6 +87,7 @@ final class AutoTrackingStore: ObservableObject {
 
         for task in tasks {
             guard let taskID = task.id else { continue }
+            writeTaskMetadata(taskID: taskID, name: task.name, colorHex: task.colorHex)
             let currentSelection = selection(for: taskID)
             let hasSelection = !currentSelection.applicationTokens.isEmpty || !currentSelection.categoryTokens.isEmpty || !currentSelection.webDomainTokens.isEmpty
 
@@ -152,6 +157,13 @@ final class AutoTrackingStore: ObservableObject {
         "\(selectionDataKeyPrefix)\(taskID)"
     }
 
+    private func writeTaskMetadata(taskID: String, name: String, colorHex: String) {
+        UserDefaults(suiteName: autoTrackingAppGroupID)?.set(
+            ["name": name, "colorHex": colorHex],
+            forKey: "\(taskMetaKeyPrefix)\(taskID)"
+        )
+    }
+
     /// Reads and clears the events the AutoTrackingExtension queued in the
     /// shared App Group container since the last time the app checked.
     func drainPendingEvents() -> [PendingAutoTrackEvent] {
@@ -163,13 +175,13 @@ final class AutoTrackingStore: ObservableObject {
             let taskID = entry["taskID"] as? String ?? "unknown"
             let activity = entry["activity"] as? String ?? "unknown"
             let occurredAt = Date(timeIntervalSince1970: entry["occurredAt"] as? Double ?? 0)
-            print("DeviceActivity debug: \(name) task=\(taskID) activity=\(activity) at=\(occurredAt)")
+            DiagnosticsLog.log("autoTrack", "extension debug: \(name) taskID=\(taskID) activity=\(activity) at=\(occurredAt)")
         }
 
         let raw = shared.array(forKey: pendingEventsKey) as? [[String: Any]] ?? []
         shared.removeObject(forKey: pendingEventsKey)
         if !raw.isEmpty {
-            print("Drained \(raw.count) pending auto-track event(s)")
+            DiagnosticsLog.log("autoTrack", "drained \(raw.count) pending event(s): \(raw)")
         }
 
         var uniqueEvents: [String: PendingAutoTrackEvent] = [:]

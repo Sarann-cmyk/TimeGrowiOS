@@ -29,6 +29,10 @@ struct TGTask: Identifiable, Codable, Equatable {
     /// grace period — using the same app again afterward starts a fresh session and clears
     /// this naturally, since that new session ends later than this cutoff.
     var autoTrackStoppedAt: Date?
+    /// ActivityKit per-activity push token (hex-encoded) for this task's running Live Activity,
+    /// letting a server push `update`/`end` events via APNs. Set once the activity starts, cleared
+    /// when it ends.
+    var liveActivityPushToken: String?
 
     static let defaultAccent = Color(red: 0.55, green: 0.84, blue: 0.09)
 

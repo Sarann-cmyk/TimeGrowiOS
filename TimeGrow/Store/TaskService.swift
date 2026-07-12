@@ -522,7 +522,7 @@ final class TaskService: NSObject, ObservableObject {
     /// sessions, backdated to when the usage threshold was actually reached.
     func processPendingAutoTrackEvents(_ events: [PendingAutoTrackEvent]) {
         guard !events.isEmpty else { return }
-        print("Queueing \(events.count) pending auto-track event(s). tasks=\(tasks.count)")
+        DiagnosticsLog.log("autoTrack", "queueing \(events.count) pending event(s) tasks=\(events.map(\.taskID)) loadedTasks=\(tasks.count)")
         queuedAutoTrackEvents.append(contentsOf: events)
         processQueuedAutoTrackEvents()
     }
@@ -533,17 +533,17 @@ final class TaskService: NSObject, ObservableObject {
         var remainingEvents: [PendingAutoTrackEvent] = []
         for event in queuedAutoTrackEvents {
             guard let task = tasks.first(where: { $0.id == event.taskID }) else {
-                print("Pending auto-track task not loaded yet: \(event.taskID)")
+                DiagnosticsLog.log("autoTrack", "task not loaded yet, re-queuing taskID=\(event.taskID)")
                 remainingEvents.append(event)
                 continue
             }
             guard !task.isTimerRunning, optimisticTimerStarts[event.taskID] == nil else {
-                print("Skipping auto-track event because task is already running: \(event.taskID)")
+                DiagnosticsLog.log("autoTrack", "skipping event for \(task.name), already running")
                 continue
             }
             let endedAt = event.occurredAt
             let startedAt = endedAt.addingTimeInterval(-autoTrackingThresholdSeconds)
-            print("Recording auto-tracked minute for task \(event.taskID) from \(startedAt) to \(endedAt)")
+            DiagnosticsLog.log("autoTrack", "recording minute for \(task.name) from=\(startedAt) to=\(endedAt) occurredAt=\(event.occurredAt)")
             recordAutoTrackedSession(for: task, startedAt: startedAt, endedAt: endedAt)
         }
         queuedAutoTrackEvents = remainingEvents
@@ -570,9 +570,9 @@ final class TaskService: NSObject, ObservableObject {
                 "endedAt": Timestamp(date: mergedEnd),
             ]) { error in
                 if let error {
-                    print("Failed to extend auto-tracked session \(existingSessionID): \(error.localizedDescription)")
+                    DiagnosticsLog.log("autoTrack", "failed to extend session \(existingSessionID) for \(task.name): \(error.localizedDescription)")
                 } else {
-                    print("Extended auto-tracked session \(existingSessionID) for task \(taskID) to \(mergedEnd)")
+                    DiagnosticsLog.log("autoTrack", "extended session \(existingSessionID) for \(task.name) to=\(mergedEnd)")
                 }
             }
             updateAutoTrackLiveState(
@@ -613,9 +613,9 @@ final class TaskService: NSObject, ObservableObject {
         do {
             try sessionRef.setData(from: session) { error in
                 if let error {
-                    print("Failed to write auto-tracked session \(sessionRef.documentID): \(error.localizedDescription)")
+                    DiagnosticsLog.log("autoTrack", "failed to write session \(sessionRef.documentID) for \(task.name): \(error.localizedDescription)")
                 } else {
-                    print("Wrote auto-tracked session \(sessionRef.documentID) for task \(taskID)")
+                    DiagnosticsLog.log("autoTrack", "wrote new session \(sessionRef.documentID) for \(task.name) startedAt=\(startedAt) endedAt=\(endedAt)")
                 }
             }
             updateAutoTrackLiveState(
@@ -626,7 +626,7 @@ final class TaskService: NSObject, ObservableObject {
                 lastUsageAt: endedAt
             )
         } catch {
-            print("Failed to record auto-tracked session: \(error.localizedDescription)")
+            DiagnosticsLog.log("autoTrack", "failed to record session for \(task.name): \(error.localizedDescription)")
         }
     }
 
@@ -827,6 +827,59 @@ final class TaskService: NSObject, ObservableObject {
     private func stopHeartbeatTimer() {
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
+    }
+
+    /// Persists this device's ActivityKit push-to-start token so a Cloud Function can start a
+    /// Live Activity remotely via APNs even while the app isn't running.
+    func updateActivityPushToStartToken(_ token: String) {
+        guard let uid = currentUser?.uid else { return }
+        currentDeviceDocument(for: uid).setData(["activityPushToStartToken": token], merge: true) { error in
+            if let error {
+                DiagnosticsLog.log("liveActivity", "Failed to write push-to-start token: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Persists this device's regular APNs device token, used for silent background-wake pushes.
+    func updateAPNsDeviceToken(_ token: String) {
+        guard let uid = currentUser?.uid else { return }
+        currentDeviceDocument(for: uid).setData(["apnsDeviceToken": token], merge: true) { error in
+            if let error {
+                DiagnosticsLog.log("push", "Failed to write APNs device token: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// One-shot fetch of the current tasks (bypassing the live listener), used when the app is
+    /// woken in the background by a silent push and needs fresh state before reconciling Live
+    /// Activities — the listener may not have reconnected yet in the brief background window.
+    func fetchTasksOnce(completion: @escaping ([TGTask]) -> Void) {
+        guard let uid = currentUser?.uid else {
+            completion([])
+            return
+        }
+        tasksCollection(for: uid).getDocuments { snapshot, error in
+            if let error {
+                DiagnosticsLog.log("push", "Background fetchTasksOnce failed: \(error.localizedDescription)")
+                completion([])
+                return
+            }
+            let tasks = snapshot?.documents.compactMap { try? $0.data(as: TGTask.self) } ?? []
+            completion(tasks)
+        }
+    }
+
+    /// Persists (or clears) the running Live Activity's per-activity push token on its task doc,
+    /// so a Cloud Function can push `update`/`end` events via APNs.
+    func updateLiveActivityPushToken(taskID: String, token: String?) {
+        guard let uid = currentUser?.uid else { return }
+        tasksCollection(for: uid).document(taskID).updateData([
+            "liveActivityPushToken": token ?? FieldValue.delete(),
+        ]) { error in
+            if let error {
+                DiagnosticsLog.log("liveActivity", "Failed to write activity push token for \(taskID): \(error.localizedDescription)")
+            }
+        }
     }
 
     private func writeCurrentDeviceHeartbeat(isActive: Bool, at date: Date = Date()) {
