@@ -52,7 +52,9 @@ enum TimerOwnerStatus: Equatable, CustomStringConvertible {
 
 @MainActor
 final class TaskService: NSObject, ObservableObject {
-    @Published private(set) var tasks: [TGTask] = []
+    @Published private(set) var tasks: [TGTask] = [] {
+        didSet { LiveActivityManager.shared.reconcile(tasks: tasks) }
+    }
     @Published private(set) var sessions: [TaskTimeSession] = []
     @Published private(set) var devices: [String: UserDeviceHeartbeat] = [:]
     @Published private(set) var trackingSettings: TrackingSettings = .defaults
