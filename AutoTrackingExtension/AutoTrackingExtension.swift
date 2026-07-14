@@ -20,7 +20,7 @@ private let projectIDKey = "autoTracking.firebase.projectID"
 private let lastUsageKeyPrefix = "autoTracking.lastUsage."
 private let sessionStartKeyPrefix = "autoTracking.sessionStart."
 private let thresholdSeconds: TimeInterval = 60
-private let inactivityGraceSeconds: TimeInterval = 120
+private let inactivityGraceSeconds: TimeInterval = 180
 
 final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     override func intervalDidStart(for activity: DeviceActivityName) {

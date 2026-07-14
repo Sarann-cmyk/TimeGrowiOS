@@ -511,20 +511,49 @@ struct TimelineTabView: View {
 
             // Pass 1: natural stacked position within this cluster only (lane-local), so
             // items sharing a lane never overlap each other.
-            var laneBottom: [Int: CGFloat] = [:]
+            //
+            // Uses each item's *true* (unpadded) end time to seed the next item's floor, not its
+            // rendered height. Several very short sessions in a row each get padded up to
+            // `minPixelHeight` for legibility/tappability — if that padded height fed back into
+            // the next item's minimum Y, the inflation compounds indefinitely (confirmed on real
+            // data: four ~1-3min sessions alone drifted later blocks by over an hour, visually
+            // swallowing a genuine 67-minute gap).
+            //
+            // That alone still lets a single short block's *own* padding stretch its rendered
+            // bottom edge past its real Reports end and into where the next lane-mate visually
+            // starts, even though the next block's own Y is correctly anchored. Safeguard: cap
+            // each block's padded height so it can never render past the next same-lane item's
+            // true start — the block's drawn end always matches (or stops short of) the moment
+            // Reports actually recorded it ending.
+            var laneItemIndices: [Int: [Int]] = [:]
+            for i in clusterStartIndex..<index {
+                laneItemIndices[laneOf[i] ?? 0, default: []].append(i)
+            }
+            var yByIndex: [Int: CGFloat] = [:]
+            var heightByIndex: [Int: CGFloat] = [:]
+            for (_, indices) in laneItemIndices {
+                var previousTrueBottom: CGFloat = -.infinity
+                for (pos, i) in indices.enumerated() {
+                    let item = intervals[i]
+                    var y = totalHeight * (item.start / 1440)
+                    if y < previousTrueBottom { y = previousTrueBottom }
+                    let trueBottomY = totalHeight * (item.end / 1440)
+                    var height = max(minPixelHeight, trueBottomY - y)
+                    if pos + 1 < indices.count {
+                        let nextItem = intervals[indices[pos + 1]]
+                        let nextFloorY = max(totalHeight * (nextItem.start / 1440), trueBottomY)
+                        height = min(height, max(4, nextFloorY - y))
+                    }
+                    yByIndex[i] = y
+                    heightByIndex[i] = height
+                    previousTrueBottom = trueBottomY
+                }
+            }
             var naiveY: [CGFloat] = []
             var naiveHeight: [CGFloat] = []
             for i in clusterStartIndex..<index {
-                let item = intervals[i]
-                let lane = laneOf[i] ?? 0
-                var y = totalHeight * (item.start / 1440)
-                let height = max(minPixelHeight, totalHeight * ((item.end - item.start) / 1440))
-                if let previousBottom = laneBottom[lane], y < previousBottom {
-                    y = previousBottom
-                }
-                laneBottom[lane] = y + height
-                naiveY.append(y)
-                naiveHeight.append(height)
+                naiveY.append(yByIndex[i] ?? 0)
+                naiveHeight.append(heightByIndex[i] ?? minPixelHeight)
             }
 
             // Pass 2: shift the whole cluster down if its top would land above the previous
@@ -532,7 +561,9 @@ struct TimelineTabView: View {
             let clusterTop = naiveY.min() ?? 0
             let shift = max(0, globalBottom - clusterTop)
 
-            var clusterBottom: CGFloat = 0
+            // Mirrors the `laneBottom` fix above, one level up: tracks the cluster's true extent
+            // (unpadded) so padding inside one cluster can't drift every later cluster down too.
+            var trueClusterBottom: CGFloat = 0
             for (offset, i) in (clusterStartIndex..<index).enumerated() {
                 let item = intervals[i]
                 let lane = laneOf[i] ?? 0
@@ -552,10 +583,10 @@ struct TimelineTabView: View {
                 y = min(y, capY - 4)
                 height = max(4, min(height, capY - y))
 
-                clusterBottom = max(clusterBottom, y + height)
+                trueClusterBottom = max(trueClusterBottom, totalHeight * (item.end / 1440) + shift)
                 result.append(PositionedSession(session: item.session, y: y, height: height, laneIndex: lane, laneCount: laneCount))
             }
-            globalBottom = max(globalBottom, clusterBottom)
+            globalBottom = max(globalBottom, trueClusterBottom)
         }
 
         for (index, item) in intervals.enumerated() {
@@ -645,7 +676,7 @@ struct TimelineTabView: View {
     // MARK: - Data
 
     private func daySessions(for bounds: (start: Date, end: Date), at date: Date) -> [TaskTimeSession] {
-        sessionsSource(at: date)
+        let filtered = sessionsSource(at: date)
             .filter { session in
                 let end = session.endedAt ?? date
                 guard end > bounds.start && session.startedAt < bounds.end else { return false }
@@ -655,6 +686,43 @@ struct TimelineTabView: View {
                 return duration >= TimeInterval(sessionListMinimumDuration)
             }
             .sorted { $0.startedAt < $1.startedAt }
+        return Self.mergingAdjacentAutoTrackedSessions(filtered)
+    }
+
+    /// Auto-tracking creates one real Firestore session per ~minute of usage, so a single
+    /// continuous stretch of scrolling shows up as dozens of same-task records with only a few
+    /// seconds between each — each one gets its own overlapping "TikTok" label in the block
+    /// layout, which reads as noise rather than one activity. This is purely a *display* merge
+    /// for Timeline blocks: it never touches Firestore, so Reports (which lists the real
+    /// records) is unaffected.
+    ///
+    /// Two Firestore session records only exist as separate documents because
+    /// `AutoTrackingExtension.resolveSessionStartedAt` already decided the gap between them
+    /// exceeded `autoTrackingInactivityGraceSeconds` — i.e. any already-split pair represents a
+    /// genuine break, not a display artifact. Because that extension also backdates a resumed
+    /// session's start by `autoTrackingThresholdSeconds`, the recorded gap between two genuinely
+    /// split sessions is always strictly greater than `autoTrackingInactivityGraceSeconds -
+    /// autoTrackingThresholdSeconds` — using that difference as the merge cutoff means a real
+    /// break (e.g. gone 4 minutes, which the grace period turns into a ~3 minute recorded gap)
+    /// always stays visible, while only true sub-minute polling artifacts get merged away.
+    private static func mergingAdjacentAutoTrackedSessions(_ sessions: [TaskTimeSession]) -> [TaskTimeSession] {
+        let mergeCutoff = autoTrackingInactivityGraceSeconds - autoTrackingThresholdSeconds
+        var merged: [TaskTimeSession] = []
+        for session in sessions {
+            if let last = merged.last,
+               last.taskID == session.taskID,
+               last.startedAutomatically == true,
+               session.startedAutomatically == true,
+               let lastEnd = last.endedAt,
+               session.startedAt.timeIntervalSince(lastEnd) < mergeCutoff {
+                var extended = last
+                extended.endedAt = session.endedAt
+                merged[merged.count - 1] = extended
+            } else {
+                merged.append(session)
+            }
+        }
+        return merged
     }
 
     private func sessionsSource(at date: Date) -> [TaskTimeSession] {

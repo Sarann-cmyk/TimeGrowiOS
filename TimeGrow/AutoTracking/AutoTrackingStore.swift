@@ -12,7 +12,7 @@ import Foundation
 // AutoTrackingExtension targets, and the suite name the extension writes to.
 let autoTrackingAppGroupID = "group.WINNER.ltd.TimeGrow"
 let autoTrackingThresholdSeconds: TimeInterval = 60
-let autoTrackingInactivityGraceSeconds: TimeInterval = 120
+let autoTrackingInactivityGraceSeconds: TimeInterval = 180
 /// Sessions shorter than this when stopped are discarded outright (deleted, not just
 /// hidden) — they're accidental taps or auto-tracking blips, not real tracked time.
 let minimumTrackedSessionDuration: TimeInterval = 3
