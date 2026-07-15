@@ -16,48 +16,78 @@ struct TaskRow: View {
     let editAction: () -> Void
     let deleteAction: () -> Void
     let autoTrackAction: () -> Void
+    var isReorderModeActive: Bool = false
 
     @State private var isShowingActionMenu = false
 
     var body: some View {
-        timerAwareRowContent
-            .contentShape(Rectangle())
-            .onTapGesture {
-                Haptics.impact(.light)
-                if !task.isTimerRunning, isAutoTrackLive(at: Date()) {
-                    stopAutoTrackAction()
-                } else {
-                    onToggleTimer()
-                }
-            }
-            .simultaneousGesture(
-                LongPressGesture(minimumDuration: 0.5).onEnded { _ in
-                    Haptics.impact(.medium)
-                    isShowingActionMenu = true
-                }
-            )
-            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                Button(role: .destructive) {
-                    Haptics.impact(.rigid)
-                    deleteAction()
-                } label: {
-                    Label("Delete", systemImage: "trash")
-                }
-            }
-            .confirmationDialog(task.name, isPresented: $isShowingActionMenu, titleVisibility: .visible) {
-                Button("Edit") {
+        if isReorderModeActive {
+            reorderModeRow
+        } else {
+            timerAwareRowContent
+                .contentShape(Rectangle())
+                .onTapGesture {
                     Haptics.impact(.light)
-                    editAction()
+                    if !task.isTimerRunning, isAutoTrackLive(at: Date()) {
+                        stopAutoTrackAction()
+                    } else {
+                        onToggleTimer()
+                    }
                 }
-                Button("Автотрекінг") {
-                    Haptics.impact(.light)
-                    autoTrackAction()
+                .simultaneousGesture(
+                    LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                        Haptics.impact(.medium)
+                        isShowingActionMenu = true
+                    }
+                )
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    Button(role: .destructive) {
+                        Haptics.impact(.rigid)
+                        deleteAction()
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
                 }
-                Button("Delete", role: .destructive) {
-                    Haptics.impact(.rigid)
-                    deleteAction()
+                .confirmationDialog(task.name, isPresented: $isShowingActionMenu, titleVisibility: .visible) {
+                    Button("Edit") {
+                        Haptics.impact(.light)
+                        editAction()
+                    }
+                    Button("Автотрекінг") {
+                        Haptics.impact(.light)
+                        autoTrackAction()
+                    }
+                    Button("Delete", role: .destructive) {
+                        Haptics.impact(.rigid)
+                        deleteAction()
+                    }
                 }
-            }
+        }
+    }
+
+    private var reorderModeRow: some View {
+        HStack(spacing: 13) {
+            TaskProgressStrip(color: task.color)
+            TaskAvatarCircle(color: task.color, symbol: task.symbol, isPulsing: false)
+
+            Text(task.name)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+
+            Spacer()
+
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 68)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(0.07))
+        )
+        .reorderJiggle()
     }
 
     @ViewBuilder
@@ -135,7 +165,7 @@ struct TaskRow: View {
             }
     }
 
-    private static func elapsedSeconds(startedAt: Date?, at date: Date) -> Int {
+    static func elapsedSeconds(startedAt: Date?, at date: Date) -> Int {
         guard let startedAt else { return 0 }
         return max(0, Int(date.timeIntervalSince(startedAt)))
     }
@@ -153,7 +183,7 @@ private struct TaskProgressStrip: View {
     }
 }
 
-private struct AutoTrackingBadge: View {
+struct AutoTrackingBadge: View {
     let color: Color
     let isEnabled: Bool
 
@@ -183,6 +213,11 @@ struct TaskAvatarCircle: View {
     /// minutes with a ring that fills clockwise over each minute (resetting as seconds roll
     /// over) instead of the task's letter.
     var elapsedSeconds: Int? = nil
+    var size: CGFloat = 31
+
+    private var letterFontSize: CGFloat { 14 * size / 31 }
+    private var ringFontSize: CGFloat { 11 * size / 31 }
+    private var strokeWidth: CGFloat { 1.2 * size / 31 }
 
     var body: some View {
         if isPulsing {
@@ -209,23 +244,23 @@ struct TaskAvatarCircle: View {
                     .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
                     .rotationEffect(.degrees(-90))
                 Text("\(minutes)")
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .font(.system(size: ringFontSize, weight: .bold, design: .rounded))
                     .foregroundStyle(color)
                     .lineLimit(1)
                     .minimumScaleFactor(0.6)
             }
-            .frame(width: 31, height: 31)
+            .frame(width: size, height: size)
         } else {
             Text(symbol.isEmpty ? "T" : symbol)
-                .font(.system(size: 14, weight: .bold))
+                .font(.system(size: letterFontSize, weight: .bold))
                 .foregroundStyle(color)
-                .frame(width: 31, height: 31)
+                .frame(width: size, height: size)
                 .background(
                     Circle()
                         .fill(Color.clear)
                         .overlay {
                             Circle()
-                                .stroke(color, lineWidth: 1.2)
+                                .stroke(color, lineWidth: strokeWidth)
                         }
                 )
         }
@@ -308,7 +343,7 @@ struct TaskDurationLabel: View {
 
             Text(Self.format(seconds))
                 .font(.system(size: 15, weight: .medium, design: .monospaced))
-                .foregroundStyle(ownerStatus.isInterrupted ? .orange : (isRunning ? task.color : .secondary))
+                .foregroundStyle(ownerStatus.isInterrupted ? .orange : (isRunning ? task.color : Color.white.opacity(0.65)))
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
         }
@@ -320,5 +355,27 @@ struct TaskDurationLabel: View {
         let hours = total / 3600
         let minutes = (total % 3600) / 60
         return String(format: "%02d:%02d", hours, minutes)
+    }
+}
+
+/// The subtle side-to-side rocking shown on every row/tile while "Change Order" reorder
+/// mode is active — same idea as the iOS home screen icon jiggle.
+private struct ReorderJiggleEffect: ViewModifier {
+    @State private var isJiggling = false
+
+    func body(content: Content) -> some View {
+        content
+            .rotationEffect(.degrees(isJiggling ? 1 : -1))
+            .animation(
+                .easeInOut(duration: 0.14).repeatForever(autoreverses: true).delay(.random(in: 0...0.12)),
+                value: isJiggling
+            )
+            .onAppear { isJiggling = true }
+    }
+}
+
+extension View {
+    func reorderJiggle() -> some View {
+        modifier(ReorderJiggleEffect())
     }
 }

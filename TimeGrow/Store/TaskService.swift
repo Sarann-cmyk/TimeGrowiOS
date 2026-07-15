@@ -241,7 +241,7 @@ final class TaskService: NSObject, ObservableObject {
                     let runningAfter = merged.filter(\.isTimerRunning)
                     let runningAfterIDs = Set(runningAfter.compactMap(\.id))
                     let stoppedSinceLastSnapshot = self.tasks.filter { runningBeforeIDs.contains($0.id ?? "") && !runningAfterIDs.contains($0.id ?? "") }
-                    self.tasks = merged
+                    self.tasks = Self.sortedByPosition(merged)
                     DiagnosticsLog.log("sync", "tasks snapshot count=\(merged.count) running=\(runningAfter.map(\.name))")
                     if !stoppedSinceLastSnapshot.isEmpty {
                         DiagnosticsLog.log("sync", "timer(s) stopped since last snapshot: \(stoppedSinceLastSnapshot.map(\.name))")
@@ -355,6 +355,35 @@ final class TaskService: NSObject, ObservableObject {
         } catch {
             print("Failed to create task: \(error.localizedDescription)")
             return nil
+        }
+    }
+
+    private static func sortedByPosition(_ tasks: [TGTask]) -> [TGTask] {
+        tasks.sorted { lhs, rhs in
+            let lhsOrder = lhs.sortOrder ?? lhs.createdAt.timeIntervalSince1970
+            let rhsOrder = rhs.sortOrder ?? rhs.createdAt.timeIntervalSince1970
+            return lhsOrder < rhsOrder
+        }
+    }
+
+    /// Persists the Tasks tab's "Change Order" drag result — renumbers every task's
+    /// `sortOrder` to match the given order and updates the local list immediately so
+    /// the UI doesn't wait on the round-trip through the Firestore listener.
+    func reorderTasks(_ orderedTasks: [TGTask]) {
+        guard let uid = currentUser?.uid else { return }
+
+        var updated = orderedTasks
+        let batch = db.batch()
+        for index in updated.indices {
+            updated[index].sortOrder = Double(index)
+            guard let id = updated[index].id else { continue }
+            batch.updateData(["sortOrder": Double(index)], forDocument: tasksCollection(for: uid).document(id))
+        }
+        tasks = updated
+        batch.commit { error in
+            if let error {
+                DiagnosticsLog.log("sync", "Failed to persist task order: \(error.localizedDescription)")
+            }
         }
     }
 

@@ -33,6 +33,9 @@ struct TGTask: Identifiable, Codable, Equatable {
     /// letting a server push `update`/`end` events via APNs. Set once the activity starts, cleared
     /// when it ends.
     var liveActivityPushToken: String?
+    /// Manual position from the Tasks tab's "Change Order" reorder mode. Tasks without one
+    /// yet (never reordered) fall back to `createdAt` ordering.
+    var sortOrder: Double? = nil
 
     static let defaultAccent = Color(red: 0.55, green: 0.84, blue: 0.09)
 
