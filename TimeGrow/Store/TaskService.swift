@@ -9,6 +9,7 @@ import CryptoKit
 import FirebaseAuth
 import FirebaseFirestore
 import Foundation
+import Security
 import SwiftUI
 import UIKit
 
@@ -89,6 +90,9 @@ final class TaskService: NSObject, ObservableObject {
     private let autoTrackingAuthUIDKey = "autoTracking.firebase.uid"
     private let autoTrackingAuthIDTokenKey = "autoTracking.firebase.idToken"
     private let autoTrackingAuthTokenExpirationKey = "autoTracking.firebase.idTokenExpiration"
+    private let autoTrackingDeviceIDKey = "autoTracking.deviceID"
+    private let autoTrackingDeviceSecretKey = "autoTracking.deviceSecret"
+    private let autoTrackingDeviceSecretHashField = "autoTrackingSecretHash"
 
     private struct OptimisticTimerStart {
         let sessionID: String?
@@ -126,6 +130,7 @@ final class TaskService: NSObject, ObservableObject {
                 self.isSignedIn = user != nil
                 if let user {
                     self.refreshAutoTrackingFirebaseAuthSnapshot(for: user)
+                    self.provisionAutoTrackingDeviceCredential(for: user)
                     self.observeTasks(uid: user.uid)
                     self.observeSessions(uid: user.uid)
                     self.observeDevices(uid: user.uid)
@@ -180,6 +185,37 @@ final class TaskService: NSObject, ObservableObject {
         shared.removeObject(forKey: autoTrackingAuthIDTokenKey)
         shared.removeObject(forKey: autoTrackingAuthTokenExpirationKey)
         shared.removeObject(forKey: "autoTracking.firebase.projectID")
+    }
+
+    /// DeviceActivityMonitor runs after the main app has been asleep for hours, when a Firebase
+    /// ID token is no longer usable. Give that extension its own random device credential instead:
+    /// the raw secret stays in the App Group and only its SHA-256 hash is stored in Firestore for
+    /// the HTTPS function to validate.
+    private func provisionAutoTrackingDeviceCredential(for user: User) {
+        guard let shared = UserDefaults(suiteName: autoTrackingAppGroupID) else { return }
+
+        let secret: String
+        if let existing = shared.string(forKey: autoTrackingDeviceSecretKey), !existing.isEmpty {
+            secret = existing
+        } else {
+            var bytes = [UInt8](repeating: 0, count: 32)
+            guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+                DiagnosticsLog.log("autoTrack", "Failed to create device credential")
+                return
+            }
+            secret = Data(bytes).base64EncodedString()
+            shared.set(secret, forKey: autoTrackingDeviceSecretKey)
+        }
+
+        let secretHash = SHA256.hash(data: Data(secret.utf8)).map { String(format: "%02x", $0) }.joined()
+        shared.set(Self.currentDeviceID, forKey: autoTrackingDeviceIDKey)
+        currentDeviceDocument(for: user.uid).setData([
+            autoTrackingDeviceSecretHashField: secretHash,
+        ], merge: true) { error in
+            if let error {
+                DiagnosticsLog.log("autoTrack", "Failed to provision device credential: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func observeTasks(uid: String) {

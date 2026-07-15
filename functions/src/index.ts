@@ -1,8 +1,10 @@
 import { onDocumentUpdated, onDocumentWritten } from "firebase-functions/v2/firestore";
+import { onRequest } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { defineSecret } from "firebase-functions/params";
 import * as admin from "firebase-admin";
 import type { Timestamp } from "firebase-admin/firestore";
+import { createHash, timingSafeEqual } from "crypto";
 import {
   sendBackgroundWake,
   sendLiveActivityEnd,
@@ -45,6 +47,8 @@ interface TaskDoc {
 
 interface DeviceDoc {
   activityPushToStartToken?: string;
+  /** SHA-256 only; the raw per-device secret never reaches Firestore. */
+  autoTrackingSecretHash?: string;
 }
 
 /** Mirrors `LiveActivityManager.activeTimerStart(for:)` on the iOS side. */
@@ -78,6 +82,105 @@ function contentState(startedAt: Date, now: Date = new Date()): Record<string, n
     minuteWindowStart: minuteWindowStart.getTime() / 1000 - appleReferenceDateUnixSeconds,
   };
 }
+
+const AUTO_TRACK_LIVE_GRACE_MS = 180_000;
+const MAX_CLIENT_EVENT_AGE_MS = 24 * 60 * 60 * 1_000;
+const MAX_CLIENT_FUTURE_SKEW_MS = 60_000;
+
+function requestDate(value: unknown, fallback: Date): Date {
+  const seconds = typeof value === "number" ? value : Number.NaN;
+  const candidate = new Date(seconds * 1_000);
+  if (!Number.isFinite(seconds)
+      || candidate.getTime() < fallback.getTime() - MAX_CLIENT_EVENT_AGE_MS
+      || candidate.getTime() > fallback.getTime() + MAX_CLIENT_FUTURE_SKEW_MS) {
+    return fallback;
+  }
+  return candidate;
+}
+
+function secretHash(secret: string): string {
+  return createHash("sha256").update(secret, "utf8").digest("hex");
+}
+
+function secureHashEquals(expected: string, receivedSecret: string): boolean {
+  const expectedBuffer = Buffer.from(expected, "utf8");
+  const receivedBuffer = Buffer.from(secretHash(receivedSecret), "utf8");
+  return expectedBuffer.length === receivedBuffer.length && timingSafeEqual(expectedBuffer, receivedBuffer);
+}
+
+/**
+ * Receives Screen Time threshold events even when TimeGrow itself has been inactive for hours.
+ * Firebase ID tokens expire in about one hour and cannot be refreshed reliably by a
+ * DeviceActivityMonitor extension, so this endpoint instead authenticates a randomly generated,
+ * per-device secret. The iOS app stores the raw secret in its App Group; Firestore holds only its
+ * SHA-256 hash. A successful transaction creates/extends the auto-track live window, after which
+ * `onTaskTimerChanged` immediately dispatches ActivityKit push-to-start to the user's devices.
+ */
+export const recordAutoTrackEvent = onRequest(async (request, response) => {
+  if (request.method !== "POST") {
+    response.status(405).json({ error: "method-not-allowed" });
+    return;
+  }
+
+  const body = request.body as Record<string, unknown> | undefined;
+  const uid = typeof body?.uid === "string" ? body.uid : "";
+  const deviceID = typeof body?.deviceID === "string" ? body.deviceID : "";
+  const deviceSecret = typeof body?.deviceSecret === "string" ? body.deviceSecret : "";
+  const taskID = typeof body?.taskID === "string" ? body.taskID : "";
+  if (!uid || !deviceID || !deviceSecret || !taskID) {
+    response.status(400).json({ error: "invalid-request" });
+    return;
+  }
+
+  const now = new Date();
+  const occurredAt = requestDate(body?.occurredAt, now);
+  const requestedSessionStart = requestDate(body?.sessionStartedAt, occurredAt);
+  const deviceRef = db.collection("users").doc(uid).collection("devices").doc(deviceID);
+  const taskRef = db.collection("users").doc(uid).collection("tasks").doc(taskID);
+
+  try {
+    const result = await db.runTransaction(async (transaction) => {
+      const deviceSnapshot = await transaction.get(deviceRef);
+      const expectedHash = deviceSnapshot.get("autoTrackingSecretHash");
+      if (typeof expectedHash !== "string" || !secureHashEquals(expectedHash, deviceSecret)) {
+        throw new Error("unauthorized-device");
+      }
+
+      const taskSnapshot = await transaction.get(taskRef);
+      if (!taskSnapshot.exists) {
+        throw new Error("task-not-found");
+      }
+      const task = taskSnapshot.data() as TaskDoc;
+      const wasRunning = activeTimerStart(task, now) !== null;
+      const previousAutoStart = task.autoTrackSessionStartedAt?.toDate();
+      const previousLiveUntil = task.autoTrackLiveUntil?.toDate();
+      const previousStoppedAt = task.autoTrackStoppedAt?.toDate();
+      const canContinuePreviousSession = !!previousAutoStart
+        && !!previousLiveUntil
+        && previousLiveUntil > now
+        && (!previousStoppedAt || previousStoppedAt < previousAutoStart);
+      const sessionStartedAt = canContinuePreviousSession ? previousAutoStart : requestedSessionStart;
+      const liveUntil = new Date(Math.max(now.getTime(), occurredAt.getTime()) + AUTO_TRACK_LIVE_GRACE_MS);
+
+      transaction.update(taskRef, {
+        autoTrackLastUsageAt: admin.firestore.Timestamp.fromDate(occurredAt),
+        autoTrackLiveUntil: admin.firestore.Timestamp.fromDate(liveUntil),
+        autoTrackSessionStartedAt: admin.firestore.Timestamp.fromDate(sessionStartedAt),
+        autoTrackStoppedAt: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.Timestamp.fromDate(now),
+      });
+      return { started: !wasRunning, sessionStartedAt };
+    });
+
+    console.log(`secure auto-track event accepted (task ${taskID}, device ${deviceID}, started=${result.started})`);
+    response.status(200).json({ ok: true, started: result.started });
+  } catch (error) {
+    const message = String(error instanceof Error ? error.message : error);
+    const status = message === "unauthorized-device" ? 401 : message === "task-not-found" ? 404 : 500;
+    if (status === 500) console.error("secure auto-track event failed", error);
+    response.status(status).json({ error: status === 500 ? "internal-error" : message });
+  }
+});
 
 /**
  * Reacts to every task write: starts a Live Activity via push-to-start on every device that has
