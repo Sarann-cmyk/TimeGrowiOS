@@ -8,7 +8,6 @@
 
 /* Begin PBXBuildFile section */
 		3B2F0CFAD0B725190E479602 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B784A23C4BE37256025CA5D8 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift */; };
-		EBC5C9D2A2420A439BC66B48 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B784A23C4BE37256025CA5D8 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift */; };
 		4056B7D989B53BED2634A480 /* AutoTrackingExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 104D9DA54C1EACFDE8DD2264 /* AutoTrackingExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		43CA1BAB4BAA87F84C13A908 /* DeviceActivity.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 383BE76F4E5A2DA6FFA7D60B /* DeviceActivity.framework */; };
 		6A6861BE315942EDFD5622F1 /* AutoTrackingExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8359DAA4B916ED508B7710A5 /* AutoTrackingExtension.swift */; };
@@ -19,6 +18,7 @@
 		E244C36A2FF97B530026734E /* FirebaseAnalytics in Frameworks */ = {isa = PBXBuildFile; productRef = E244C3692FF97B530026734E /* FirebaseAnalytics */; };
 		E244C36C2FF97B530026734E /* FirebaseAuth in Frameworks */ = {isa = PBXBuildFile; productRef = E244C36B2FF97B530026734E /* FirebaseAuth */; };
 		E244C36E2FF97B530026734E /* FirebaseFirestore in Frameworks */ = {isa = PBXBuildFile; productRef = E244C36D2FF97B530026734E /* FirebaseFirestore */; };
+		EBC5C9D2A2420A439BC66B48 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B784A23C4BE37256025CA5D8 /* TimeGrow/LiveActivity/TimeGrowLiveActivityAttributes.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */

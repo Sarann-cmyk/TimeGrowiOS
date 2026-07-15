@@ -64,7 +64,7 @@ struct TaskReportDetailView: View {
         nonmutating set { chartStyleRawValue = newValue.rawValue }
     }
 
-    private let calendar = Calendar.current
+    private var calendar: Calendar { WeekStartSettings.calendar }
 
     init(task: TGTask, initialPeriod: ReportPeriod, initialReferenceDate: Date) {
         self.task = task

@@ -60,6 +60,44 @@ enum SessionListDisplaySettings {
     }
 }
 
+enum WeekStartDay: Int, CaseIterable, Identifiable {
+    case sunday = 1
+    case monday = 2
+
+    var id: Int { rawValue }
+
+    var localizedTitle: String {
+        switch self {
+        case .sunday: return String(localized: "Sunday")
+        case .monday: return String(localized: "Monday")
+        }
+    }
+}
+
+enum WeekStartSettings {
+    static let dayKey = "settings.weekStartDay"
+
+    /// `Calendar.current` with `firstWeekday` overridden by the user's choice, or the
+    /// locale's own default when no preference has been stored yet.
+    static var calendar: Calendar {
+        var calendar = Calendar.current
+        let stored = UserDefaults.standard.integer(forKey: dayKey)
+        if let day = WeekStartDay(rawValue: stored) {
+            calendar.firstWeekday = day.rawValue
+        }
+        return calendar
+    }
+
+    static var selected: WeekStartDay {
+        get {
+            WeekStartDay(rawValue: UserDefaults.standard.integer(forKey: dayKey)) ?? WeekStartDay(rawValue: Calendar.current.firstWeekday) ?? .sunday
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: dayKey)
+        }
+    }
+}
+
 enum ReportFormatters {
     static let dayTitle: DateFormatter = { let f = DateFormatter(); f.locale = .current; f.dateFormat = "d MMMM yyyy"; return f }()
     static let shortDate: DateFormatter = { let f = DateFormatter(); f.locale = .current; f.dateFormat = "d MMM"; return f }()

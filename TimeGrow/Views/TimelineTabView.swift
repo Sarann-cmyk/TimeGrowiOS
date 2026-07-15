@@ -24,7 +24,7 @@ struct TimelineTabView: View {
     @State private var appearID = UUID()
     @AppStorage(SessionListDisplaySettings.minimumDurationKey) private var sessionListMinimumDuration = SessionListDisplaySettings.defaultMinimumDuration
 
-    private let calendar = Calendar.current
+    private var calendar: Calendar { WeekStartSettings.calendar }
     private let hourHeight: CGFloat = 64
     private let leadingLabelWidth: CGFloat = 46
 

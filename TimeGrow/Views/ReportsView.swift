@@ -100,7 +100,7 @@ struct ReportsView: View {
     @State private var sessionPendingDeletion: TaskTimeSession?
     @AppStorage(SessionListDisplaySettings.minimumDurationKey) private var sessionListMinimumDuration = SessionListDisplaySettings.defaultMinimumDuration
 
-    private let calendar = Calendar.current
+    private var calendar: Calendar { WeekStartSettings.calendar }
 
     /// Lets a report row for a task that was later deleted still open the
     /// detail screen, so its leftover sessions can be found and removed.

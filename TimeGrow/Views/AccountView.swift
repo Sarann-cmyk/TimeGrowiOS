@@ -8,51 +8,201 @@ import SwiftUI
 struct AccountView: View {
     @EnvironmentObject private var taskService: TaskService
     @EnvironmentObject private var accentColorManager: AccentColorManager
+    @Environment(\.openURL) private var openURL
 
     @AppStorage(SessionListDisplaySettings.minimumDurationKey) private var sessionListMinimumDuration = SessionListDisplaySettings.defaultMinimumDuration
+    @AppStorage(AppLanguageStub.storageKey) private var languageStubRawValue = AppLanguageStub.ukrainian.rawValue
+    @State private var weekStartSelection = WeekStartSettings.selected
+
     @State private var logExportItem: IdentifiableURL?
     @State private var didClearLogs = false
     @State private var isShowingAccentColorPicker = false
+    @State private var isShowingLicensing = false
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                Text("APPLE ID")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 8)
+            VStack(spacing: 18) {
+                    settingsSectionHeader("LICENSING")
+                    Button {
+                        Haptics.impact(.light)
+                        isShowingLicensing = true
+                    } label: {
+                        licensingCard
+                    }
+                    .buttonStyle(.plain)
 
-                if taskService.isAnonymous {
-                    notSignedInCard
-                } else {
-                    signedInCard
+                    settingsSectionHeader("GENERAL")
+                    settingsGroup {
+                        SettingsMenuRow(
+                            icon: "globe",
+                            iconColor: .blue,
+                            title: "Language",
+                            value: (AppLanguageStub(rawValue: languageStubRawValue) ?? .ukrainian).displayName,
+                            showDivider: true
+                        ) {
+                            ForEach(AppLanguageStub.allCases) { language in
+                                Button(language.displayName) {
+                                    languageStubRawValue = language.rawValue
+                                }
+                            }
+                        }
+
+                        Button {
+                            Haptics.impact(.light)
+                            isShowingAccentColorPicker = true
+                        } label: {
+                            SettingsLinkRow(
+                                icon: "paintpalette.fill",
+                                iconColor: accentColorManager.color,
+                                title: "Accent Color",
+                                showDivider: false
+                            ) {
+                                Circle()
+                                    .fill(accentColorManager.color)
+                                    .frame(width: 22, height: 22)
+                                    .overlay {
+                                        Circle().stroke(Color.white.opacity(0.15), lineWidth: 1)
+                                    }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    settingsSectionHeader("TRACKING")
+                    settingsGroup {
+                        SettingsMenuRow(
+                            icon: "line.3.horizontal.decrease.circle.fill",
+                            iconColor: accentColorManager.color,
+                            title: "Session List Noise",
+                            value: SessionListDisplaySettings.title(for: sessionListMinimumDuration),
+                            showDivider: false
+                        ) {
+                            ForEach(SessionListDisplaySettings.minimumDurationOptions, id: \.self) { seconds in
+                                Button {
+                                    Haptics.selection()
+                                    sessionListMinimumDuration = seconds
+                                } label: {
+                                    if sessionListMinimumDuration == seconds {
+                                        Label(SessionListDisplaySettings.title(for: seconds), systemImage: "checkmark")
+                                    } else {
+                                        Text(SessionListDisplaySettings.title(for: seconds))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Text(SessionListDisplaySettings.description(for: sessionListMinimumDuration))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 4)
+
+                    settingsSectionHeader("REPORTS")
+                    settingsGroup {
+                        SettingsMenuRow(
+                            icon: "calendar",
+                            iconColor: .purple,
+                            title: "First Day Of Week",
+                            value: weekStartSelection.localizedTitle,
+                            showDivider: false
+                        ) {
+                            ForEach(WeekStartDay.allCases) { day in
+                                Button(day.localizedTitle) {
+                                    Haptics.selection()
+                                    weekStartSelection = day
+                                    WeekStartSettings.selected = day
+                                }
+                            }
+                        }
+                    }
+
+                    settingsSectionHeader("RESOURCES")
+                    settingsGroup {
+                        Button {
+                            if let url = URL(string: "mailto:support@timegrow.app") {
+                                openURL(url)
+                            }
+                        } label: {
+                            SettingsValueRow(icon: "at", iconColor: .blue, title: "Contact Support", value: "", showsChevron: false, showDivider: true)
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            if let url = URL(string: "https://timegrow.app/privacy") {
+                                openURL(url)
+                            }
+                        } label: {
+                            SettingsValueRow(icon: "lock.shield.fill", iconColor: .blue, title: "Privacy Policy", value: "", showsChevron: true, showDivider: true)
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            if let url = URL(string: "https://apps.apple.com/app/id0000000000?action=write-review") {
+                                openURL(url)
+                            }
+                        } label: {
+                            SettingsValueRow(icon: "hand.thumbsup.fill", iconColor: .blue, title: "Rate This App", value: "", showsChevron: true, showDivider: true)
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            if let url = URL(string: "https://timegrow.app/mac") {
+                                openURL(url)
+                            }
+                        } label: {
+                            SettingsValueRow(icon: "waveform.path.ecg", iconColor: .cyan, title: "Get TimeGrow for Mac", value: "", showsChevron: true, showDivider: false)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    settingsSectionHeader("DIAGNOSTICS")
+                    Text("Логи запуску/зупинки таймерів (ручний трекінг та автотрекінг) для діагностики проблем із синхронізацією між пристроями.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 4)
+
+                    settingsGroup {
+                        Button {
+                            Haptics.impact(.light)
+                            if let url = DiagnosticsLog.writeExportFile() {
+                                logExportItem = IdentifiableURL(url: url)
+                            }
+                        } label: {
+                            SettingsValueRow(
+                                icon: "square.and.arrow.up",
+                                iconColor: .blue,
+                                title: "Export Logs",
+                                value: "",
+                                showsChevron: false,
+                                showDivider: true
+                            )
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            Haptics.impact(.rigid)
+                            DiagnosticsLog.clearAll()
+                            didClearLogs = true
+                        } label: {
+                            SettingsValueRow(
+                                icon: "trash.fill",
+                                iconColor: .red,
+                                title: didClearLogs ? "Logs cleared" : "Clear Logs",
+                                value: "",
+                                showsChevron: false,
+                                showDivider: false
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
-
-                Text("APPEARANCE")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 10)
-
-                appearanceCard
-
-                Text("REPORTS")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 10)
-
-                reportsCard
-
-                Text("DIAGNOSTICS")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 10)
-
-                diagnosticsCard
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+                .padding(.bottom, 40)
             }
-            .padding(.horizontal, 26)
-            .padding(.bottom, 40)
-        }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Color.black)
         .sheet(item: $logExportItem) { item in
             ShareSheet(items: [item.url])
         }
@@ -60,243 +210,38 @@ struct AccountView: View {
             AccentColorPickerSheet()
                 .environmentObject(accentColorManager)
         }
+        .fullScreenCover(isPresented: $isShowingLicensing) {
+            LicensingDetailView()
+                .environmentObject(taskService)
+                .environmentObject(accentColorManager)
+        }
     }
 
-    private var appearanceCard: some View {
-        VStack(spacing: 0) {
-            Button {
-                Haptics.impact(.light)
-                isShowingAccentColorPicker = true
-            } label: {
-                HStack(alignment: .center, spacing: 12) {
-                    Image(systemName: "paintpalette.fill")
-                        .font(.system(size: 20))
-                        .foregroundStyle(accentColorManager.color)
-                        .frame(width: 34, height: 34)
-                        .background(accentColorManager.color.opacity(0.14), in: Circle())
+    private var licensingCard: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "heart.fill")
+                .font(.title3)
+                .foregroundStyle(Color(red: 0.85, green: 0.35, blue: 0.9))
+                .padding(.top, 4)
 
-                    Text("Accent Color")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(.white)
-
-                    Spacer(minLength: 8)
-
-                    Circle()
-                        .fill(accentColorManager.color)
-                        .frame(width: 22, height: 22)
-                        .overlay {
-                            Circle().stroke(Color.white.opacity(0.15), lineWidth: 1)
-                        }
-
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-                .padding(16)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Full license purchased")
+                    .font(.headline.weight(.medium))
+                    .foregroundStyle(.white)
+                Text("Thanks for your support! Your contribution helps us continue improving TimeGrow for you.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .buttonStyle(.plain)
+
+            Spacer(minLength: 8)
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(white: 0.08))
-        }
-    }
-
-    private var reportsCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .center, spacing: 12) {
-                Image(systemName: "line.3.horizontal.decrease.circle.fill")
-                    .font(.system(size: 22))
-                    .foregroundStyle(accentColorManager.color)
-                    .frame(width: 34, height: 34)
-                    .background(accentColorManager.color.opacity(0.14), in: Circle())
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Session list noise")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(.white)
-                    Text(SessionListDisplaySettings.description(for: sessionListMinimumDuration))
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Spacer(minLength: 8)
-
-                Menu {
-                    ForEach(SessionListDisplaySettings.minimumDurationOptions, id: \.self) { seconds in
-                        Button {
-                            Haptics.selection()
-                            sessionListMinimumDuration = seconds
-                        } label: {
-                            if sessionListMinimumDuration == seconds {
-                                Label(SessionListDisplaySettings.title(for: seconds), systemImage: "checkmark")
-                            } else {
-                                Text(SessionListDisplaySettings.title(for: seconds))
-                            }
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 6) {
-                        Text(SessionListDisplaySettings.title(for: sessionListMinimumDuration))
-                            .font(.system(size: 14, weight: .semibold))
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(.system(size: 10, weight: .bold))
-                    }
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12)
-                    .frame(height: 36)
-                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                }
-            }
-        }
-        .padding(18)
-        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    private var diagnosticsCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Логи запуску/зупинки таймерів (ручний трекінг та автотрекінг) для діагностики проблем із синхронізацією між пристроями.")
-                .font(.system(size: 13))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Button {
-                Haptics.impact(.light)
-                if let url = DiagnosticsLog.writeExportFile() {
-                    logExportItem = IdentifiableURL(url: url)
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "square.and.arrow.up")
-                    Text("Export Logs")
-                        .font(.system(size: 15, weight: .semibold))
-                }
-                .foregroundStyle(.white)
-                .frame(maxWidth: .infinity)
-                .frame(height: 46)
-                .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            }
-            .buttonStyle(.plain)
-
-            Button(role: .destructive) {
-                Haptics.impact(.rigid)
-                DiagnosticsLog.clearAll()
-                didClearLogs = true
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "trash")
-                    Text(didClearLogs ? "Logs cleared" : "Clear Logs")
-                        .font(.system(size: 15, weight: .semibold))
-                }
-                .foregroundStyle(.red)
-                .frame(maxWidth: .infinity)
-                .frame(height: 46)
-                .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(18)
-        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    private var notSignedInCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 12) {
-                Image(systemName: "apple.logo")
-                    .font(.system(size: 20))
-                    .foregroundStyle(.white)
-
-                Text("Not signed in")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(.white)
-            }
-
-            Text("Sign in to sync your tasks across your iPhone and Mac. Without signing in, tasks stay private to this device only.")
-                .font(.system(size: 13))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Button {
-                taskService.signInWithApple()
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "apple.logo")
-                    Text("Sign in with Apple")
-                        .font(.system(size: 15, weight: .semibold))
-                }
-                .foregroundStyle(.black)
-                .frame(maxWidth: .infinity)
-                .frame(height: 46)
-                .background(Color.white, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(18)
-        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    private var signedInCard: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 12) {
-                ZStack {
-                    Circle()
-                        .fill(Color.green.opacity(0.18))
-                        .frame(width: 44, height: 44)
-                    Image(systemName: "apple.logo")
-                        .font(.system(size: 20))
-                        .foregroundStyle(.white)
-                }
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(taskService.displayName ?? "Apple Account")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(.white)
-
-                    if let email = taskService.email {
-                        Text(email)
-                            .font(.system(size: 13))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                Spacer()
-
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(Color.green)
-                        .frame(width: 7, height: 7)
-                    Text("Synced")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Color.green)
-                }
-            }
-            .padding(16)
-            .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(Color.green.opacity(0.35), lineWidth: 1)
-            }
-
-            Text("Your tasks sync across every device signed in with this Apple ID.")
-                .font(.system(size: 13))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Button(role: .destructive) {
-                taskService.signOut()
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "rectangle.portrait.and.arrow.right")
-                    Text("Sign Out")
-                        .font(.system(size: 15, weight: .semibold))
-                }
-                .foregroundStyle(.red)
-                .frame(maxWidth: .infinity)
-                .frame(height: 46)
-                .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            }
-            .buttonStyle(.plain)
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(0.07))
         }
     }
 }
