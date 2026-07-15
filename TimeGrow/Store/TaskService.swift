@@ -81,6 +81,10 @@ final class TaskService: NSObject, ObservableObject {
     private var optimisticTimerStarts: [String: OptimisticTimerStart] = [:]
     private let staleCheckInterval: TimeInterval = 5
     private let heartbeatInterval: TimeInterval = 15
+    /// This protects only an auto-tracked timer owned by a *different Mac*. It must never be
+    /// tied to the user's auto-track stop delay: that setting controls normal local inactivity,
+    /// while a remote close is an irreversible recovery action and needs a much safer window.
+    private let interruptedMacHeartbeatGrace: TimeInterval = 180
     private let autoTrackingFirebaseProjectID = "timegrowmac"
     private let autoTrackingAuthUIDKey = "autoTracking.firebase.uid"
     private let autoTrackingAuthIDTokenKey = "autoTracking.firebase.idToken"
@@ -1038,17 +1042,24 @@ final class TaskService: NSObject, ObservableObject {
         guard activeSession(for: task)?.startedAutomatically == true else { return .active }
 
         if task.timerOwnerPlatform?.localizedCaseInsensitiveContains("mac") == true {
+            let ownerHeartbeat = [
+                task.timerOwnerLastAliveAt,
+                task.timerOwnerDeviceID.flatMap { devices[$0]?.lastAliveAt }
+            ]
+            .compactMap { $0 }
+            .max()
+
             if task.timerOwnerIsActive == false {
-                guard let lastAliveAt = task.timerOwnerLastAliveAt else {
+                guard let lastAliveAt = ownerHeartbeat else {
                     return .inactive(deviceName: task.timerOwnerDeviceName, lastAliveAt: nil)
                 }
-                if date.timeIntervalSince(lastAliveAt) > TimeInterval(trackingSettings.autoTrackStopDelaySeconds) {
+                if date.timeIntervalSince(lastAliveAt) > interruptedMacHeartbeatGrace {
                     return .inactive(deviceName: task.timerOwnerDeviceName, lastAliveAt: lastAliveAt)
                 }
                 return .active
             }
-            if let lastAliveAt = task.timerOwnerLastAliveAt,
-               date.timeIntervalSince(lastAliveAt) > TimeInterval(trackingSettings.autoTrackStopDelaySeconds) {
+            if let lastAliveAt = ownerHeartbeat,
+               date.timeIntervalSince(lastAliveAt) > interruptedMacHeartbeatGrace {
                 return .stale(deviceName: task.timerOwnerDeviceName, lastAliveAt: lastAliveAt)
             }
             return .active
@@ -1081,6 +1092,8 @@ final class TaskService: NSObject, ObservableObject {
         for task in tasks {
             guard let taskID = task.id,
                   task.timerStartedAt != nil,
+                  task.timerOwnerPlatform?.localizedCaseInsensitiveContains("mac") == true,
+                  let ownerID = task.timerOwnerDeviceID,
                   !autoClosingTaskIDs.contains(taskID) else { continue }
 
             let status = timerOwnerStatus(for: task)
@@ -1092,44 +1105,96 @@ final class TaskService: NSObject, ObservableObject {
             )
 
             autoClosingTaskIDs.insert(taskID)
-            closeInterruptedTimer(task, uid: uid, endedAt: interruptedAt)
+            closeInterruptedTimer(
+                task,
+                uid: uid,
+                ownerID: ownerID,
+                observedHeartbeat: interruptedAt
+            )
         }
     }
 
-    private func closeInterruptedTimer(_ task: TGTask, uid: String, endedAt: Date) {
+    /// Stops an interrupted Mac-owned auto timer only if the facts that made it look interrupted
+    /// are still true at commit time. A plain batch could race a healthy Mac heartbeat and erase
+    /// its fresh owner fields; reading the task, owner device and session in one transaction makes
+    /// Firestore retry on such a change and then reject the stale close.
+    private func closeInterruptedTimer(
+        _ task: TGTask,
+        uid: String,
+        ownerID: String,
+        observedHeartbeat: Date
+    ) {
         guard let taskID = task.id else { return }
-        pendingStops.removeValue(forKey: taskID)
-
-        let batch = db.batch()
         let taskRef = tasksCollection(for: uid).document(taskID)
-        batch.updateData([
-            "timerStartedAt": FieldValue.delete(),
-            "activeSessionID": FieldValue.delete(),
-            "timerOwnerDeviceID": FieldValue.delete(),
-            "timerOwnerPlatform": FieldValue.delete(),
-            "timerOwnerDeviceName": FieldValue.delete(),
-            "timerOwnerLastAliveAt": FieldValue.delete(),
-            "timerOwnerIsActive": FieldValue.delete(),
-            "updatedAt": Timestamp(date: Date()),
-        ], forDocument: taskRef)
+        let ownerRef = devicesCollection(for: uid).document(ownerID)
 
-        if let sessionID = task.activeSessionID {
-            let sessionRef = sessionsCollection(for: uid).document(sessionID)
-            if let startedAt = task.timerStartedAt, endedAt.timeIntervalSince(startedAt) < minimumTrackedSessionDuration {
-                sessions.removeAll { $0.id == sessionID }
-                batch.deleteDocument(sessionRef)
-            } else {
-                batch.updateData([
-                    "endedAt": Timestamp(date: endedAt),
-                ], forDocument: sessionRef)
+        db.runTransaction({ transaction, errorPointer -> Any? in
+            do {
+                let taskSnapshot = try transaction.getDocument(taskRef)
+                guard let currentTask = try? taskSnapshot.data(as: TGTask.self),
+                      let startedAt = currentTask.timerStartedAt,
+                      currentTask.timerOwnerDeviceID == ownerID,
+                      currentTask.timerOwnerPlatform?.localizedCaseInsensitiveContains("mac") == true,
+                      let sessionID = currentTask.activeSessionID else {
+                    return nil
+                }
+
+                let ownerSnapshot = try transaction.getDocument(ownerRef)
+                let ownerDevice = try? ownerSnapshot.data(as: UserDeviceHeartbeat.self)
+                let freshestHeartbeat = [currentTask.timerOwnerLastAliveAt, ownerDevice?.lastAliveAt]
+                    .compactMap { $0 }
+                    .max()
+
+                // A newly written heartbeat (or a younger one than the conservative grace) means
+                // the Mac recovered while this iPhone was preparing the remote stop.
+                guard let freshestHeartbeat,
+                      freshestHeartbeat <= observedHeartbeat,
+                      Date().timeIntervalSince(freshestHeartbeat) > self.interruptedMacHeartbeatGrace else {
+                    return nil
+                }
+
+                let sessionRef = self.sessionsCollection(for: uid).document(sessionID)
+                let sessionSnapshot = try transaction.getDocument(sessionRef)
+                guard let session = try? sessionSnapshot.data(as: TaskTimeSession.self),
+                      session.startedAutomatically == true,
+                      session.endedAt == nil else {
+                    return nil
+                }
+
+                let endedAt = max(startedAt, freshestHeartbeat)
+                transaction.updateData([
+                    "timerStartedAt": FieldValue.delete(),
+                    "activeSessionID": FieldValue.delete(),
+                    "timerOwnerDeviceID": FieldValue.delete(),
+                    "timerOwnerPlatform": FieldValue.delete(),
+                    "timerOwnerDeviceName": FieldValue.delete(),
+                    "timerOwnerLastAliveAt": FieldValue.delete(),
+                    "timerOwnerIsActive": FieldValue.delete(),
+                    "updatedAt": Timestamp(date: Date()),
+                ], forDocument: taskRef)
+
+                if endedAt.timeIntervalSince(startedAt) < minimumTrackedSessionDuration {
+                    transaction.deleteDocument(sessionRef)
+                } else {
+                    transaction.updateData(["endedAt": Timestamp(date: endedAt)], forDocument: sessionRef)
+                }
+                return true
+            } catch {
+                errorPointer?.pointee = error as NSError
+                return nil
             }
-        }
-
-        batch.commit { error in
+        }) { [weak self] result, error in
             Task { @MainActor [weak self] in
                 self?.autoClosingTaskIDs.remove(taskID)
                 if let error {
-                    print("Failed to auto-close interrupted timer: \(error.localizedDescription)")
+                    DiagnosticsLog.log("interrupt", "Remote stop transaction failed task=\(taskID): \(error.localizedDescription)")
+                    return
+                }
+                if result != nil {
+                    self?.pendingStops.removeValue(forKey: taskID)
+                    DiagnosticsLog.log("interrupt", "Remote stop committed task=\(taskID) owner=\(ownerID)")
+                } else {
+                    DiagnosticsLog.log("interrupt", "Remote stop cancelled: Mac heartbeat/owner changed task=\(taskID)")
                 }
             }
         }
