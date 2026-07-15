@@ -105,7 +105,13 @@ Swift Package dependency:
   - пробує синхронізувати live-state задачі напряму у Firestore REST API;
   - re-arm monitoring з новим generation id.
 
-### Live Activity Extension (built 2026-07-12, see full writeup below)
+### Live Activity Extension
+
+**Застарілий розділ.** Все, що стосується Dynamic Island/Live Activity (архітектура, файли,
+push-to-start, Cloud Functions, доступ до Firebase, активні проблеми) — дивись
+`DYNAMIC_ISLAND.md` в корені репозиторію, там актуальний стан на 2026-07-14. Розділи нижче
+описують стан на 2026-07-12 і містять застарілі факти (кільце видалено, `AutoTrackingExtension`
+більше не стартує активність напряму, push-to-start тепер основний, а не резервний шлях).
 
 `TimeGrowLiveActivity/TimeGrowLiveActivityBundle.swift`
 
@@ -145,10 +151,11 @@ Swift Package dependency:
   `autoTrackSessionStartedAt`/`autoTrackLiveUntil`/`autoTrackStoppedAt` (auto-track).
 - Runs an internal `Timer` (10s tick, only while ≥1 activity is running) that refreshes
   `minuteWindowStart` roughly once a minute so the ring keeps sweeping.
-- Also owns push-token plumbing (see below): `pushToStartTokenUpdates` (device-level
-  `Activity.pushToStartTokenUpdates`, hex-encoded) and `pushTokenHandler` (fired with each
-  activity's own `pushTokenUpdates`, hex-encoded) — both wired up in `TimeGrowApp.onAppear`/`.task`
-  to `TaskService.updateActivityPushToStartToken`/`updateLiveActivityPushToken`.
+- Also owns push-token plumbing (see below): `startObservingPushToStartTokens()` subscribes to
+  device-level `Activity.pushToStartTokenUpdates` during `TimeGrowApp.init`, caches its
+  hex-encoded result, and delivers it through `pushToStartTokenHandler`; `pushTokenHandler`
+  receives each activity's own `pushTokenUpdates`. Both persist through `TaskService` once the
+  app's Firebase/UI wiring is ready.
 
 ### AutoTrackingExtension also starts the Live Activity directly (added 2026-07-12)
 
@@ -578,12 +585,12 @@ key — rather than pasting interactively, which is easy to corrupt via terminal
 true` in `functions/src/index.ts` matches the current `aps-environment = development` entitlement
 — flip to `false` for a production/TestFlight build.
 
-**Critical gotcha already hit and fixed**: Swift's synthesized `Codable` for `Date` uses
-`.deferredToDate` (a JSON *number* of seconds since 1970), which is what ActivityKit's push
-content decoder expects — NOT an ISO8601 string. Sending ISO strings in the push payload's
-`content-state` makes the activity silently fail to start/update on-device with zero server-side
-error. `functions/src/index.ts`'s `contentState()` helper encodes both `startedAt` and
-`minuteWindowStart` as `date.getTime() / 1000`.
+**Critical Date-encoding gotcha**: Swift's synthesized `Codable` for `Date` uses
+`.deferredToDate`: a JSON number of seconds since Apple's reference date (2001-01-01), **not**
+Unix seconds since 1970 and not ISO8601. ActivityKit uses that decoder for `content-state`.
+Sending a Unix timestamp decodes the date decades into the future (the elapsed timer shows
+`0:00`); sending ISO8601 can make the activity silently fail to start/update. Therefore
+`functions/src/index.ts`'s `contentState()` subtracts `978_307_200` from Unix seconds.
 
 **Known reliability gap (as of 2026-07-12, unresolved)**: on a freshly-reinstalled app, both
 push-to-start and the background-wake push are reliably accepted by APNs and correctly routed

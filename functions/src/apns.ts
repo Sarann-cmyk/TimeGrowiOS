@@ -54,10 +54,17 @@ function session(host: string): http2.ClientHttp2Session {
 }
 
 interface LiveActivityPayload {
-  event: "start" | "end";
+  event: "start" | "update" | "end";
   contentState: Record<string, unknown>;
   attributesType?: string;
   attributes?: Record<string, unknown>;
+  // Required by ActivityKit for a remote `start` event. Without it APNs may accept the request
+  // but iOS can decline to materialize the Live Activity.
+  alert?: {
+    title: string;
+    body: string;
+    sound?: "default";
+  };
   dismissalDate?: number;
 }
 
@@ -110,6 +117,7 @@ function send(creds: ApnsCredentials, deviceToken: string, payload: LiveActivity
   };
   if (payload.attributesType) aps["attributes-type"] = payload.attributesType;
   if (payload.attributes) aps["attributes"] = payload.attributes;
+  if (payload.alert) aps.alert = payload.alert;
   if (payload.dismissalDate) aps["dismissal-date"] = payload.dismissalDate;
 
   return sendRaw(creds, deviceToken, JSON.stringify({ aps }), {
@@ -127,7 +135,33 @@ export function sendLiveActivityStart(
   attributes: Record<string, unknown>,
   contentState: Record<string, unknown>
 ): Promise<void> {
-  return send(creds, pushToStartToken, { event: "start", contentState, attributesType, attributes });
+  const taskName = typeof attributes.taskName === "string" && attributes.taskName.trim()
+    ? attributes.taskName.trim()
+    : "Task";
+  return send(creds, pushToStartToken, {
+    event: "start",
+    contentState,
+    attributesType,
+    attributes,
+    // ActivityKit requires an alert for a remotely started Live Activity. Besides informing the
+    // user, its presence makes this a valid start payload rather than an APNs-accepted no-op.
+    alert: {
+      title: "TimeGrow",
+      body: `Tracking started: ${taskName}`,
+      // Make the remote start noticeable when the device is locked. iOS still respects Silent
+      // mode, Focus, and the user's Live Activities permissions.
+      sound: "default",
+    },
+  });
+}
+
+/** Updates an already-running Live Activity. */
+export function sendLiveActivityUpdate(
+  creds: ApnsCredentials,
+  activityPushToken: string,
+  contentState: Record<string, unknown>
+): Promise<void> {
+  return send(creds, activityPushToken, { event: "update", contentState });
 }
 
 /** Ends an already-running Live Activity. */

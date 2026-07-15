@@ -8,5 +8,14 @@
 	</array>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>timegrow</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

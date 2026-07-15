@@ -8,10 +8,20 @@
 import ActivityKit
 import WidgetKit
 import SwiftUI
+import Foundation
 
 /// Mirrors `TGTask.symbol` (first letter of the task name, uppercased).
 private func taskInitial(_ taskName: String) -> String {
     String(taskName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1)).uppercased()
+}
+
+private func liveActivityToggleURL(taskID: String) -> URL {
+    var components = URLComponents()
+    components.scheme = "timegrow"
+    components.host = "toggle-live-activity"
+    components.queryItems = [URLQueryItem(name: "taskID", value: taskID)]
+    // `taskID` comes from a required Activity attribute, so this URL is always constructible.
+    return components.url!
 }
 
 struct TimeGrowLiveActivityLiveActivity: Widget {
@@ -24,71 +34,121 @@ struct TimeGrowLiveActivityLiveActivity: Widget {
             return DynamicIsland {
                 // Expanded state — shown when the user long-presses the island.
                 DynamicIslandExpandedRegion(.leading) {
-                    Text(context.attributes.taskName)
-                        .font(.system(.subheadline, design: .rounded, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
+                    Link(destination: liveActivityToggleURL(taskID: context.attributes.taskID)) {
+                        ExpandedMinuteRing(
+                            minuteWindowStart: context.state.minuteWindowStart ?? context.state.startedAt,
+                            taskName: context.attributes.taskName,
+                            accent: accent
+                        )
+                    }
                 }
                 DynamicIslandExpandedRegion(.trailing) {
                     TimerDigitsText(startedAt: context.state.startedAt)
-                        .font(.system(.title3, design: .rounded, weight: .semibold))
+                        .font(.system(size: 34, weight: .semibold, design: .rounded))
                         .foregroundStyle(accent)
+                        // WidgetKit keeps a safe trailing inset in the expanded island. Shift
+                        // only the timer into that inset; the leading ring and task title stay put.
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                        .offset(x: 28)
                 }
-                DynamicIslandExpandedRegion(.bottom) {
-                    Capsule()
-                        .fill(accent)
-                        .frame(height: 3)
+                DynamicIslandExpandedRegion(.center) {
+                    Text(context.attributes.taskName)
+                        .font(.system(size: 28, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
                 }
             } compactLeading: {
-                // Compact state — single active Live Activity, oval pill next to the camera.
-                // Fixed width keeps iOS from stretching the pill to fit a hypothetical wider value.
+                // Compact state — show the task avatar next to the camera, with elapsed time on
+                // the opposite side. When another app also has an activity, the system switches
+                // this widget to `minimal`, which uses the same avatar treatment.
+                Link(destination: liveActivityToggleURL(taskID: context.attributes.taskID)) {
+                    Text(taskInitial(context.attributes.taskName))
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(accent)
+                        .frame(width: 20, height: 20)
+                        .overlay(Circle().stroke(accent, lineWidth: 1.2))
+                        .offset(x: -1)
+                }
+            } compactTrailing: {
+                // Fixed width keeps iOS from stretching the pill to fit a hypothetical wider
+                // value while still leaving room for minutes past one hour.
                 TimerDigitsText(startedAt: context.state.startedAt, compact: true)
                     .font(.system(.callout, design: .rounded, weight: .semibold))
                     .foregroundStyle(accent)
                     .lineLimit(1)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(accent.opacity(0.15)))
-                    .frame(width: 52, alignment: .leading)
-            } compactTrailing: {
-                EmptyView()
+                // `Text(timerInterval:)` reserves its own minimum width. Keep that width so
+                // WidgetKit doesn't drop the compact trailing view, then move only the rendered
+                // digits into the otherwise unused right-side space.
+                .frame(width: 60, alignment: .trailing)
+                .offset(x: 16)
             } minimal: {
                 // Minimal state — shown when two Live Activities are running at once. Digits don't
                 // fit here; show the task's initial letter, matching `TaskAvatarCircle` in the app
                 // (TaskRowView.swift): outlined circle, no fill, letter in the task's accent color.
-                Text(taskInitial(context.attributes.taskName))
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(accent)
-                    .frame(width: 20, height: 20)
-                    .overlay(Circle().stroke(accent, lineWidth: 1.2))
+                Link(destination: liveActivityToggleURL(taskID: context.attributes.taskID)) {
+                    Text(taskInitial(context.attributes.taskName))
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(accent)
+                        .frame(width: 20, height: 20)
+                        .overlay(Circle().stroke(accent, lineWidth: 1.2))
+                }
             }
             .keylineTint(accent)
         }
     }
 }
 
+/// Expanded 60-second task-colored ring. The task initial remains readable inside it while the
+/// system-driven progress view sweeps around the edge.
+private struct ExpandedMinuteRing: View {
+    let minuteWindowStart: Date
+    let taskName: String
+    let accent: Color
+
+    var body: some View {
+        let interval = minuteWindowStart...minuteWindowStart.addingTimeInterval(60)
+        ZStack {
+            Circle()
+                .stroke(accent.opacity(0.25), lineWidth: 5)
+            ProgressView(
+                timerInterval: interval,
+                countsDown: false,
+                label: { EmptyView() },
+                currentValueLabel: { EmptyView() }
+            )
+            .progressViewStyle(.circular)
+            .tint(accent)
+
+            Text(taskInitial(taskName))
+                .font(.system(size: 24, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+        }
+        .frame(width: 60, height: 60)
+    }
+}
+
 /// Renders elapsed time as digits only, without the app pushing per-second content updates —
-/// both styles below are part of the small set of SwiftUI APIs Live Activities animate
+/// `Text(timerInterval:)` is one of the small set of SwiftUI APIs Live Activities animate
 /// continuously on the system side.
 ///
-/// `compact: true` uses `Text(_:style:.timer)`, which sizes to its actual current content.
-/// `Text(timerInterval:)` (used for `compact: false`) pre-reserves layout width for the longest
-/// string reachable across its *entire* range — with a 24h range that's room for a huge minute
-/// count even with `showsHours: false` — which visibly bloats the compact Dynamic Island pill
-/// (confirmed on-device 2026-07-12: huge gap between `compactLeading`/`compactTrailing`). Keep
-/// `Text(timerInterval:)` only where there's headroom to spare (expanded, Lock Screen).
+/// Both cases use `showsHours: false` so the display keeps counting minutes past 60 instead of
+/// switching to an `H:MM:SS` format (e.g. `61:00`, not `1:01:00`) — `Text(_:style:.timer)` was
+/// used previously for `compact: true` but always auto-switches to hours after 60 minutes with
+/// no way to opt out, so it can't produce this behavior.
+///
+/// `Text(timerInterval:)` pre-reserves layout width for the longest string reachable across its
+/// *entire* range — a naive 24h range (up to `1439:59`) visibly bloated the compact Dynamic
+/// Island pill (confirmed on-device 2026-07-12). Bounding the compact range to ~10 hours
+/// (`599:59`, same digit count as anything above 99 minutes) keeps the reserved width modest
+/// while still covering any realistic single tracked session.
 private struct TimerDigitsText: View {
     let startedAt: Date
     var compact: Bool = false
 
     var body: some View {
-        if compact {
-            Text(startedAt, style: .timer)
-                .monospacedDigit()
-        } else {
-            Text(timerInterval: startedAt...startedAt.addingTimeInterval(24 * 60 * 60), countsDown: false, showsHours: true)
-                .monospacedDigit()
-        }
+        let rangeEnd = startedAt.addingTimeInterval(compact ? 10 * 60 * 60 : 24 * 60 * 60)
+        Text(timerInterval: startedAt...rangeEnd, countsDown: false, showsHours: false)
+            .monospacedDigit()
     }
 }
 
@@ -99,20 +159,34 @@ private struct LockScreenLiveActivityView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Circle()
-                .fill(accent)
-                .frame(width: 10, height: 10)
+            Link(destination: liveActivityToggleURL(taskID: context.attributes.taskID)) {
+                ExpandedMinuteRing(
+                    minuteWindowStart: context.state.minuteWindowStart ?? context.state.startedAt,
+                    taskName: context.attributes.taskName,
+                    accent: accent
+                )
+                .scaleEffect(0.72)
+                .frame(width: 44, height: 44)
+            }
+
             Text(context.attributes.taskName)
-                .font(.system(.headline, design: .rounded))
+                .font(.system(.headline, design: .rounded, weight: .semibold))
                 .foregroundStyle(.white)
                 .lineLimit(1)
-            Spacer()
+                .frame(maxWidth: .infinity, alignment: .leading)
+
             TimerDigitsText(startedAt: context.state.startedAt)
-                .font(.system(.title2, design: .rounded, weight: .semibold))
+                .font(.system(size: 23, weight: .semibold, design: .rounded))
                 .foregroundStyle(accent)
+                .monospacedDigit()
+                .frame(width: 90, alignment: .trailing)
         }
-        .padding()
-        .activityBackgroundTint(Color.black)
+        // Use nearly all of the system-provided banner width; its outer shape and width remain
+        // controlled by iOS, but the content area is about 10% wider than before.
+        .padding(.leading, 14)
+        .padding(.trailing, 4)
+        .padding(.vertical, 15)
+        .activityBackgroundTint(accent.opacity(0.10))
         .activitySystemActionForegroundColor(Color.white)
     }
 }
@@ -139,7 +213,10 @@ extension TimeGrowLiveActivityAttributes {
 
 extension TimeGrowLiveActivityAttributes.ContentState {
     fileprivate static var running: TimeGrowLiveActivityAttributes.ContentState {
-        TimeGrowLiveActivityAttributes.ContentState(startedAt: Date().addingTimeInterval(-125))
+        TimeGrowLiveActivityAttributes.ContentState(
+            startedAt: Date().addingTimeInterval(-125),
+            minuteWindowStart: Date().addingTimeInterval(-5)
+        )
     }
 }
 

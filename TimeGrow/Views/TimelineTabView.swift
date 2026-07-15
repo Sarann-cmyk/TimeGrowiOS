@@ -486,12 +486,11 @@ struct TimelineTabView: View {
         var result: [PositionedSession] = []
         var clusterStartIndex = 0
         var clusterMaxEnd: CGFloat = -.infinity
-        let minPixelHeight: CGFloat = 22
-        // Clusters are temporally sequential by construction (a new one only starts once the
-        // previous one's time range is fully behind it), so tracking the lowest point reached
-        // by any earlier cluster and never drawing above it prevents overlap *across* clusters
-        // too — not just between lanes inside the same cluster.
-        var globalBottom: CGFloat = -.infinity
+        // A minute on this scale is only ~1 pt. Short sessions must remain visible, but never be
+        // inflated into a tall card: the old 22 pt minimum represented ~20 minutes and made
+        // otherwise separate auto-track records visibly cover one another. Six points reads as a
+        // small, tappable marker; labels stay hidden until a block has real room for them.
+        let minPixelHeight: CGFloat = 6
 
         func flushCluster(upTo index: Int) {
             guard clusterStartIndex < index else { return }
@@ -556,18 +555,10 @@ struct TimelineTabView: View {
                 naiveHeight.append(heightByIndex[i] ?? minPixelHeight)
             }
 
-            // Pass 2: shift the whole cluster down if its top would land above the previous
-            // cluster's lowest point.
-            let clusterTop = naiveY.min() ?? 0
-            let shift = max(0, globalBottom - clusterTop)
-
-            // Mirrors the `laneBottom` fix above, one level up: tracks the cluster's true extent
-            // (unpadded) so padding inside one cluster can't drift every later cluster down too.
-            var trueClusterBottom: CGFloat = 0
             for (offset, i) in (clusterStartIndex..<index).enumerated() {
                 let item = intervals[i]
                 let lane = laneOf[i] ?? 0
-                var y = naiveY[offset] + shift
+                var y = naiveY[offset]
                 var height = naiveHeight[offset]
 
                 // Only after the shift above: no block may cross "now" (if this is today), and
@@ -583,10 +574,8 @@ struct TimelineTabView: View {
                 y = min(y, capY - 4)
                 height = max(4, min(height, capY - y))
 
-                trueClusterBottom = max(trueClusterBottom, totalHeight * (item.end / 1440) + shift)
                 result.append(PositionedSession(session: item.session, y: y, height: height, laneIndex: lane, laneCount: laneCount))
             }
-            globalBottom = max(globalBottom, trueClusterBottom)
         }
 
         for (index, item) in intervals.enumerated() {
@@ -705,24 +694,60 @@ struct TimelineTabView: View {
     /// autoTrackingThresholdSeconds` — using that difference as the merge cutoff means a real
     /// break (e.g. gone 4 minutes, which the grace period turns into a ~3 minute recorded gap)
     /// always stays visible, while only true sub-minute polling artifacts get merged away.
+    ///
+    /// Must merge per task, not by scanning the full time-sorted list positionally: if another
+    /// task's session started in between two records of this task, it sits between them once
+    /// everything's sorted together, so a purely positional "is this the previous element" check
+    /// would never see them as adjacent and would leave a task split into visibly overlapping
+    /// blocks even though there was no real gap (confirmed on-device 2026-07-14: concurrent
+    /// sessions from two devices left one task split).
+    ///
+    /// Only ever excludes a session explicitly marked `startedAutomatically == false` — a
+    /// deliberate manual start, which only ever happens from this app's own UI on iPhone
+    /// (`TaskService.startTimer` always writes an explicit `false` there). Auto-tracked sessions
+    /// from both iPhone and the current Mac auto-tracking client set `true`. Older Mac records
+    /// can omit the field (`nil`), so they remain mergeable for backward compatibility. Manual
+    /// starts are explicitly written as `false` by both current clients and stay separate.
     private static func mergingAdjacentAutoTrackedSessions(_ sessions: [TaskTimeSession]) -> [TaskTimeSession] {
         let mergeCutoff = autoTrackingInactivityGraceSeconds - autoTrackingThresholdSeconds
+        let byTask = Dictionary(grouping: sessions, by: { $0.taskID })
+
         var merged: [TaskTimeSession] = []
-        for session in sessions {
-            if let last = merged.last,
-               last.taskID == session.taskID,
-               last.startedAutomatically == true,
-               session.startedAutomatically == true,
-               let lastEnd = last.endedAt,
-               session.startedAt.timeIntervalSince(lastEnd) < mergeCutoff {
-                var extended = last
-                extended.endedAt = session.endedAt
-                merged[merged.count - 1] = extended
-            } else {
-                merged.append(session)
+        for taskSessions in byTask.values {
+            var current: TaskTimeSession?
+            for session in taskSessions.sorted(by: { $0.startedAt < $1.startedAt }) {
+                guard var previous = current else {
+                    current = session
+                    continue
+                }
+
+                // `nil` means a running session, whose effective end is in the future for merge
+                // purposes. Two sessions of the same auto-tracked task that overlap or have only
+                // a polling-sized gap are one visual block. Crucially, preserve the *furthest*
+                // end: assigning `session.endedAt` used to shrink a long session when a shorter
+                // duplicate interval was nested inside it, producing repeated overlapping cards.
+                let previousEnd = previous.endedAt ?? .distantFuture
+                let gap = session.startedAt.timeIntervalSince(previousEnd)
+                if previous.startedAutomatically != false,
+                   session.startedAutomatically != false,
+                   gap <= mergeCutoff {
+                    switch (previous.endedAt, session.endedAt) {
+                    case (nil, _), (_, nil):
+                        previous.endedAt = nil
+                    case let (.some(previousEnd), .some(sessionEnd)):
+                        previous.endedAt = max(previousEnd, sessionEnd)
+                    }
+                    current = previous
+                } else {
+                    merged.append(previous)
+                    current = session
+                }
+            }
+            if let current {
+                merged.append(current)
             }
         }
-        return merged
+        return merged.sorted { $0.startedAt < $1.startedAt }
     }
 
     private func sessionsSource(at date: Date) -> [TaskTimeSession] {

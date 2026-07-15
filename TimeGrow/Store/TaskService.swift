@@ -666,6 +666,35 @@ final class TaskService: NSObject, ObservableObject {
         stopTimer(for: task, endedAt: Date(), reason: "manual")
     }
 
+    /// Handles the explicit control exposed by the Live Activity. Widget extensions don't own
+    /// Firebase state, so they open this app URL and all mutations remain centralized here.
+    func toggleTrackingFromLiveActivity(taskID: String) {
+        guard let task = tasks.first(where: { $0.id == taskID }) else {
+            DiagnosticsLog.log("liveActivity", "Toggle ignored: task \(taskID) is not loaded")
+            return
+        }
+
+        if task.isTimerRunning {
+            stopTimer(for: task)
+            return
+        }
+
+        let isAutoTrackLive: Bool
+        if let autoStart = task.autoTrackSessionStartedAt,
+           let liveUntil = task.autoTrackLiveUntil,
+           liveUntil > Date() {
+            isAutoTrackLive = !(task.autoTrackStoppedAt.map { $0 >= autoStart } ?? false)
+        } else {
+            isAutoTrackLive = false
+        }
+
+        if isAutoTrackLive {
+            stopAutoTracking(for: task)
+        } else {
+            startTimer(for: task)
+        }
+    }
+
     /// Ends the current auto-tracked "live" grace period early, without touching the already
     /// closed session document. Using the same app again afterward starts a fresh session that
     /// ends later than this cutoff, so tracking resumes naturally — this only silences the
@@ -836,6 +865,8 @@ final class TaskService: NSObject, ObservableObject {
         currentDeviceDocument(for: uid).setData(["activityPushToStartToken": token], merge: true) { error in
             if let error {
                 DiagnosticsLog.log("liveActivity", "Failed to write push-to-start token: \(error.localizedDescription)")
+            } else {
+                DiagnosticsLog.log("liveActivity", "Wrote push-to-start token=\(token)")
             }
         }
     }
@@ -846,6 +877,8 @@ final class TaskService: NSObject, ObservableObject {
         currentDeviceDocument(for: uid).setData(["apnsDeviceToken": token], merge: true) { error in
             if let error {
                 DiagnosticsLog.log("push", "Failed to write APNs device token: \(error.localizedDescription)")
+            } else {
+                DiagnosticsLog.log("push", "Wrote APNs device token=\(token)")
             }
         }
     }
@@ -865,6 +898,7 @@ final class TaskService: NSObject, ObservableObject {
                 return
             }
             let tasks = snapshot?.documents.compactMap { try? $0.data(as: TGTask.self) } ?? []
+            DiagnosticsLog.log("push", "Background fetchTasksOnce got \(tasks.count) task(s), running=\(tasks.filter(\.isTimerRunning).map(\.name))")
             completion(tasks)
         }
     }

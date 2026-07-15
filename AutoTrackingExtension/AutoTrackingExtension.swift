@@ -3,7 +3,6 @@
 //  AutoTrackingExtension
 //
 
-import ActivityKit
 import DeviceActivity
 import FamilyControls
 import Foundation
@@ -12,7 +11,6 @@ private let appGroupID = "group.WINNER.ltd.TimeGrow"
 private let pendingEventsKey = "autoTracking.pendingEvents"
 private let debugEventsKey = "autoTracking.debugEvents"
 private let selectionDataKeyPrefix = "autoTracking.selectionData."
-private let taskMetaKeyPrefix = "autoTracking.taskMeta."
 private let authUIDKey = "autoTracking.firebase.uid"
 private let authIDTokenKey = "autoTracking.firebase.idToken"
 private let authTokenExpirationKey = "autoTracking.firebase.idTokenExpiration"
@@ -41,6 +39,7 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
 
         let resolvedTaskID = taskID(from: activity)
         let occurredAt = Date()
+        let liveUntil = occurredAt.addingTimeInterval(inactivityGraceSeconds)
 
         var pendingEvents = sharedDefaults.array(forKey: pendingEventsKey) as? [[String: Any]] ?? []
         pendingEvents.append([
@@ -50,8 +49,7 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         sharedDefaults.set(pendingEvents, forKey: pendingEventsKey)
 
         let sessionStartedAt = resolveSessionStartedAt(taskID: resolvedTaskID, occurredAt: occurredAt, sharedDefaults: sharedDefaults)
-        startLiveActivityIfNeeded(taskID: resolvedTaskID, startedAt: sessionStartedAt, sharedDefaults: sharedDefaults)
-        syncAutoTrackLiveState(taskID: resolvedTaskID, occurredAt: occurredAt, sessionStartedAt: sessionStartedAt, sharedDefaults: sharedDefaults)
+        syncAutoTrackLiveState(taskID: resolvedTaskID, occurredAt: occurredAt, sessionStartedAt: sessionStartedAt, liveUntil: liveUntil, sharedDefaults: sharedDefaults)
         rearmMonitoring(after: activity)
     }
 
@@ -76,40 +74,42 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         return sessionStartedAt
     }
 
-    /// Starts the Dynamic Island Live Activity directly from this extension, entirely locally —
-    /// no network call, no push, no dependency on the main app being woken. DeviceActivityMonitor
-    /// is already guaranteed to run right when the threshold fires, which makes it a far more
-    /// reliable trigger than push-to-start/background-wake (confirmed unreliable on-device,
-    /// especially soon after a fresh install — see 2026-07-12 debugging notes in git history).
-    private func startLiveActivityIfNeeded(taskID: String, startedAt: Date, sharedDefaults: UserDefaults) {
-        guard ActivityAuthorizationInfo().areActivitiesEnabled else {
-            appendDebugEvent("liveActivitySkipped:notEnabled", taskID: taskID, occurredAt: Date())
-            return
-        }
-        guard !Activity<TimeGrowLiveActivityAttributes>.activities.contains(where: { $0.attributes.taskID == taskID }) else {
-            appendDebugEvent("liveActivityAlreadyRunning", taskID: taskID, occurredAt: Date())
-            return
-        }
-
-        var taskName = taskID
-        var colorHex = "#8CD616"
-        if let metaData = sharedDefaults.dictionary(forKey: "\(taskMetaKeyPrefix)\(taskID)") {
-            taskName = metaData["name"] as? String ?? taskName
-            colorHex = metaData["colorHex"] as? String ?? colorHex
-        }
-
-        let attributes = TimeGrowLiveActivityAttributes(taskID: taskID, taskName: taskName, colorHex: colorHex)
-        let contentState = TimeGrowLiveActivityAttributes.ContentState(startedAt: startedAt)
-
-        do {
-            _ = try Activity.request(attributes: attributes, content: .init(state: contentState, staleDate: nil))
-            appendDebugEvent("liveActivityStarted", taskID: taskID, occurredAt: Date())
-        } catch {
-            appendDebugEvent("liveActivityStartFailed:\(error.localizedDescription)", taskID: taskID, occurredAt: Date())
-        }
+    /// Writes the auto-track session's live state to Firestore. This is the only signal the
+    /// remote-start path needs: `onTaskTimerChanged` (Cloud Function) reacts to this exact write,
+    /// and on a "not running" → "running" transition sends both a push-to-start and a background-
+    /// wake push. This is now the *only* mechanism that starts the Live Activity — a direct
+    /// `Activity.request()` call from this extension was tried (see git history, 2026-07-12) but
+    /// confirmed unreliable: `DeviceActivityMonitor` extensions hit a sandbox restriction around
+    /// starting Live Activities that a correctly-set `NSSupportsLiveActivities` plist key does not
+    /// fix (reproduced on-device 2026-07-14 with the key verified present in the built binary;
+    /// also independently reported by other developers on the Apple Developer forums). Routing
+    /// through Firestore instead means the same push-based path already used for cross-device
+    /// starts also covers the local case, instead of maintaining two mechanisms where one is
+    /// silently broken.
+    private func syncAutoTrackLiveState(taskID: String, occurredAt: Date, sessionStartedAt: Date, liveUntil: Date, sharedDefaults: UserDefaults) {
+        patchTaskFields(
+            taskID: taskID,
+            fields: [
+                "autoTrackLastUsageAt": ["timestampValue": Self.firestoreTimestamp(occurredAt)],
+                "autoTrackLiveUntil": ["timestampValue": Self.firestoreTimestamp(liveUntil)],
+                "autoTrackSessionStartedAt": ["timestampValue": Self.firestoreTimestamp(sessionStartedAt)],
+            ],
+            updateMaskFields: ["autoTrackLastUsageAt", "autoTrackLiveUntil", "autoTrackSessionStartedAt"],
+            eventLabel: "firebaseSynced",
+            sharedDefaults: sharedDefaults
+        )
     }
 
-    private func syncAutoTrackLiveState(taskID: String, occurredAt: Date, sessionStartedAt: Date, sharedDefaults: UserDefaults) {
+    /// Shared Firestore REST PATCH used by both the auto-track live-state sync and the push-token
+    /// sync above. `updatedAt` is always included so listeners elsewhere pick up the write.
+    private func patchTaskFields(
+        taskID: String,
+        fields: [String: [String: Any]],
+        updateMaskFields: [String],
+        eventLabel: String,
+        sharedDefaults: UserDefaults
+    ) {
+        let occurredAt = Date()
         guard let uid = sharedDefaults.string(forKey: authUIDKey),
               let idToken = sharedDefaults.string(forKey: authIDTokenKey),
               let projectID = sharedDefaults.string(forKey: projectIDKey) else {
@@ -123,30 +123,22 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
             return
         }
 
-        let liveUntil = occurredAt.addingTimeInterval(inactivityGraceSeconds)
-        let updatedAt = Date()
+        let allMaskFields = updateMaskFields + ["updatedAt"]
         let urlString = "https://firestore.googleapis.com/v1/projects/\(projectID)/databases/(default)/documents/users/\(uid)/tasks/\(taskID)"
-            + "?updateMask.fieldPaths=autoTrackLastUsageAt"
-            + "&updateMask.fieldPaths=autoTrackLiveUntil"
-            + "&updateMask.fieldPaths=autoTrackSessionStartedAt"
-            + "&updateMask.fieldPaths=updatedAt"
+            + "?" + allMaskFields.map { "updateMask.fieldPaths=\($0)" }.joined(separator: "&")
         guard let url = URL(string: urlString) else {
             appendDebugEvent("firebaseSyncSkipped:badURL", taskID: taskID, occurredAt: occurredAt)
             return
         }
 
+        var allFields = fields
+        allFields["updatedAt"] = ["timestampValue": Self.firestoreTimestamp(occurredAt)]
+
         var request = URLRequest(url: url)
         request.httpMethod = "PATCH"
         request.setValue("Bearer \(idToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "fields": [
-                "autoTrackLastUsageAt": ["timestampValue": Self.firestoreTimestamp(occurredAt)],
-                "autoTrackLiveUntil": ["timestampValue": Self.firestoreTimestamp(liveUntil)],
-                "autoTrackSessionStartedAt": ["timestampValue": Self.firestoreTimestamp(sessionStartedAt)],
-                "updatedAt": ["timestampValue": Self.firestoreTimestamp(updatedAt)],
-            ],
-        ])
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["fields": allFields])
 
         let semaphore = DispatchSemaphore(value: 0)
         var statusCode = 0
@@ -161,7 +153,7 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         if let requestError {
             appendDebugEvent("firebaseSyncFailed:\(requestError.localizedDescription)", taskID: taskID, occurredAt: occurredAt)
         } else if (200..<300).contains(statusCode) {
-            appendDebugEvent("firebaseSynced", taskID: taskID, occurredAt: occurredAt)
+            appendDebugEvent(eventLabel, taskID: taskID, occurredAt: occurredAt)
         } else {
             appendDebugEvent("firebaseSyncFailed:status\(statusCode)", taskID: taskID, occurredAt: occurredAt)
         }
