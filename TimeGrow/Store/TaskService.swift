@@ -194,6 +194,11 @@ final class TaskService: NSObject, ObservableObject {
     private func provisionAutoTrackingDeviceCredential(for user: User) {
         guard let shared = UserDefaults(suiteName: autoTrackingAppGroupID) else { return }
 
+        // The extension needs the stable routing identifiers, but deliberately does not need a
+        // current Firebase ID token for the secure endpoint.
+        shared.set(user.uid, forKey: autoTrackingAuthUIDKey)
+        shared.set(autoTrackingFirebaseProjectID, forKey: "autoTracking.firebase.projectID")
+
         let secret: String
         if let existing = shared.string(forKey: autoTrackingDeviceSecretKey), !existing.isEmpty {
             secret = existing
