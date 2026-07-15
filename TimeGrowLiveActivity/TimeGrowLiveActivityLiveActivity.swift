@@ -62,12 +62,12 @@ struct TimeGrowLiveActivityLiveActivity: Widget {
                 // the opposite side. When another app also has an activity, the system switches
                 // this widget to `minimal`, which uses the same avatar treatment.
                 Link(destination: liveActivityToggleURL(taskID: context.attributes.taskID)) {
-                    Text(taskInitial(context.attributes.taskName))
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(accent)
-                        .frame(width: 20, height: 20)
-                        .overlay(Circle().stroke(accent, lineWidth: 1.2))
-                        .offset(x: -1)
+                    CompactMinuteRing(
+                        minuteWindowStart: context.state.minuteWindowStart ?? context.state.startedAt,
+                        taskName: context.attributes.taskName,
+                        accent: accent
+                    )
+                    .offset(x: -1)
                 }
             } compactTrailing: {
                 // Fixed width keeps iOS from stretching the pill to fit a hypothetical wider
@@ -86,11 +86,11 @@ struct TimeGrowLiveActivityLiveActivity: Widget {
                 // fit here; show the task's initial letter, matching `TaskAvatarCircle` in the app
                 // (TaskRowView.swift): outlined circle, no fill, letter in the task's accent color.
                 Link(destination: liveActivityToggleURL(taskID: context.attributes.taskID)) {
-                    Text(taskInitial(context.attributes.taskName))
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(accent)
-                        .frame(width: 20, height: 20)
-                        .overlay(Circle().stroke(accent, lineWidth: 1.2))
+                    CompactMinuteRing(
+                        minuteWindowStart: context.state.minuteWindowStart ?? context.state.startedAt,
+                        taskName: context.attributes.taskName,
+                        accent: accent
+                    )
                 }
             }
             .keylineTint(accent)
@@ -124,6 +124,37 @@ private struct ExpandedMinuteRing: View {
                 .foregroundStyle(.white)
         }
         .frame(width: 60, height: 60)
+    }
+}
+
+/// The compact/minimal Island has room for only one 20pt circle. `ProgressView(timerInterval:)`
+/// is deliberately used here instead of a custom trim/TimelineView animation: WidgetKit keeps
+/// this system timer progress moving while the app is suspended.
+private struct CompactMinuteRing: View {
+    let minuteWindowStart: Date
+    let taskName: String
+    let accent: Color
+
+    var body: some View {
+        let interval = minuteWindowStart...minuteWindowStart.addingTimeInterval(60)
+        ZStack {
+            Circle()
+                .stroke(accent.opacity(0.25), lineWidth: 1.4)
+            ProgressView(
+                timerInterval: interval,
+                countsDown: false,
+                label: { EmptyView() },
+                currentValueLabel: { EmptyView() }
+            )
+            .progressViewStyle(.circular)
+            .tint(accent)
+            .scaleEffect(0.88)
+
+            Text(taskInitial(taskName))
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .foregroundStyle(accent)
+        }
+        .frame(width: 20, height: 20)
     }
 }
 
