@@ -168,21 +168,3 @@ struct SettingsToggleRow: View {
         }
     }
 }
-
-/// Placeholder language switch — the app has no localization catalog yet, so this only
-/// stores a preference; it doesn't retranslate any UI strings.
-enum AppLanguageStub: String, CaseIterable, Identifiable {
-    case ukrainian
-    case english
-
-    static let storageKey = "settings.languageStub"
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .ukrainian: return "Українська"
-        case .english: return "English"
-        }
-    }
-}

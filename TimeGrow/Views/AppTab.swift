@@ -16,13 +16,13 @@ enum AppTab: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .tasks:
-            "Tasks"
+            LanguageManager.localized("Tasks")
         case .timeline:
-            "Timeline"
+            LanguageManager.localized("Timeline")
         case .reports:
-            "Reports"
+            LanguageManager.localized("Reports")
         case .settings:
-            "Settings"
+            LanguageManager.localized("Settings")
         }
     }
 

@@ -16,6 +16,8 @@ private enum TaskListDisplayMode: String {
 struct ContentView: View {
     @EnvironmentObject private var taskService: TaskService
     @EnvironmentObject private var accentColorManager: AccentColorManager
+    @EnvironmentObject private var languageManager: LanguageManager
+    @Environment(\.locale) private var locale
 
     @AppStorage("settings.taskListDisplayMode") private var taskListDisplayModeRawValue = TaskListDisplayMode.list.rawValue
     @State private var selectedTab: AppTab = .tasks
@@ -83,6 +85,18 @@ struct ContentView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text("\"\(taskService.taskDeletionBlockedTaskName ?? "")\" still has tracked time. Delete its sessions in Reports first.")
+        }
+        .onAppear {
+            DiagnosticsLog.log(
+                "language",
+                "ContentView appeared current=\(languageManager.current.rawValue) environmentLocale=\(locale.identifier) selectedTab=\(selectedTab.rawValue)"
+            )
+        }
+        .onChange(of: languageManager.current) { oldLanguage, newLanguage in
+            DiagnosticsLog.log(
+                "language",
+                "ContentView observed change old=\(oldLanguage.rawValue) new=\(newLanguage.rawValue) environmentLocale=\(locale.identifier) selectedTab=\(selectedTab.rawValue)"
+            )
         }
         .preferredColorScheme(.dark)
     }
@@ -177,7 +191,7 @@ struct ContentView: View {
     private var tasksView: some View {
         Group {
             if taskService.tasks.isEmpty {
-                Text("No tasks yet")
+                Text(LanguageManager.localized("No tasks yet"))
                     .font(.system(size: 27, weight: .medium))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -360,4 +374,5 @@ private struct TaskReorderDropDelegate: DropDelegate {
     ContentView()
         .environmentObject(TaskService())
         .environmentObject(AccentColorManager())
+        .environmentObject(LanguageManager())
 }

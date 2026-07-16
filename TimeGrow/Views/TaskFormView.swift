@@ -12,8 +12,8 @@ struct TaskFormView: View {
     @State private var selectedColorIndex: Int
     @State private var isShowingCustomColorPicker = false
 
-    let navigationTitle: String
-    let confirmTitle: String
+    let navigationTitle: LocalizedStringKey
+    let confirmTitle: LocalizedStringKey
     let onSave: (String, Color) -> Void
 
     private static let colors: [Color] = [
@@ -39,8 +39,8 @@ struct TaskFormView: View {
     init(
         initialName: String = "",
         initialColor: Color = TGTask.defaultAccent,
-        navigationTitle: String,
-        confirmTitle: String,
+        navigationTitle: LocalizedStringKey,
+        confirmTitle: LocalizedStringKey,
         onSave: @escaping (String, Color) -> Void
     ) {
         _taskName = State(initialValue: initialName)

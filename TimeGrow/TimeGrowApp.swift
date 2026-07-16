@@ -73,6 +73,7 @@ struct TimeGrowApp: App {
     @StateObject private var taskService: TaskService
     @StateObject private var autoTrackingStore = AutoTrackingStore()
     @StateObject private var accentColorManager = AccentColorManager()
+    @StateObject private var languageManager = LanguageManager()
     @State private var pendingLiveActivityToggleTaskID: String?
     @Environment(\.scenePhase) private var scenePhase
 
@@ -88,7 +89,13 @@ struct TimeGrowApp: App {
                 .environmentObject(taskService)
                 .environmentObject(autoTrackingStore)
                 .environmentObject(accentColorManager)
+                .environmentObject(languageManager)
+                .environment(\.locale, languageManager.locale)
                 .onAppear {
+                    DiagnosticsLog.log(
+                        "language",
+                        "App root appeared current=\(languageManager.current.rawValue) appliedLocale=\(languageManager.locale.identifier) persisted=\(UserDefaults.standard.string(forKey: LanguageManager.storageKey) ?? "nil")"
+                    )
                     taskService.start()
                     autoTrackingStore.refreshMonitoring(for: taskService.tasks)
                     processPendingAutoTrackEvents()
@@ -108,6 +115,12 @@ struct TimeGrowApp: App {
                             done()
                         }
                     }
+                }
+                .onChange(of: languageManager.current) { oldLanguage, newLanguage in
+                    DiagnosticsLog.log(
+                        "language",
+                        "App root observed change old=\(oldLanguage.rawValue) new=\(newLanguage.rawValue) appliedLocale=\(languageManager.locale.identifier)"
+                    )
                 }
                 .onChange(of: scenePhase) { _, newPhase in
                     taskService.handleScenePhase(newPhase)

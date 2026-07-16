@@ -68,8 +68,8 @@ enum WeekStartDay: Int, CaseIterable, Identifiable {
 
     var localizedTitle: String {
         switch self {
-        case .sunday: return String(localized: "Sunday")
-        case .monday: return String(localized: "Monday")
+        case .sunday: return LanguageManager.localized("Sunday")
+        case .monday: return LanguageManager.localized("Monday")
         }
     }
 }

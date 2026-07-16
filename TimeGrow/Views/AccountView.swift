@@ -8,10 +8,10 @@ import SwiftUI
 struct AccountView: View {
     @EnvironmentObject private var taskService: TaskService
     @EnvironmentObject private var accentColorManager: AccentColorManager
+    @EnvironmentObject private var languageManager: LanguageManager
     @Environment(\.openURL) private var openURL
 
     @AppStorage(SessionListDisplaySettings.minimumDurationKey) private var sessionListMinimumDuration = SessionListDisplaySettings.defaultMinimumDuration
-    @AppStorage(AppLanguageStub.storageKey) private var languageStubRawValue = AppLanguageStub.ukrainian.rawValue
     @State private var weekStartSelection = WeekStartSettings.selected
 
     @State private var logExportItem: IdentifiableURL?
@@ -37,12 +37,17 @@ struct AccountView: View {
                             icon: "globe",
                             iconColor: .blue,
                             title: "Language",
-                            value: (AppLanguageStub(rawValue: languageStubRawValue) ?? .ukrainian).displayName,
+                            value: languageManager.current.displayName,
                             showDivider: true
                         ) {
-                            ForEach(AppLanguageStub.allCases) { language in
+                            ForEach(AppLanguage.allCases) { language in
                                 Button(language.displayName) {
-                                    languageStubRawValue = language.rawValue
+                                    Haptics.selection()
+                                    DiagnosticsLog.log(
+                                        "language",
+                                        "Settings option tapped requested=\(language.rawValue) currentBefore=\(languageManager.current.rawValue)"
+                                    )
+                                    languageManager.current = language
                                 }
                             }
                         }
@@ -250,6 +255,7 @@ struct AccountView: View {
     AccountView()
         .environmentObject(TaskService())
         .environmentObject(AccentColorManager())
+        .environmentObject(LanguageManager())
         .background(Color.black)
         .preferredColorScheme(.dark)
 }
