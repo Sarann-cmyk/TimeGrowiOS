@@ -234,6 +234,12 @@ struct ReportsView: View {
 
                     if period == .day || period == .week {
                         sessionsSection(groups: sessionGroups, at: date)
+                    } else {
+                        busiestSection(columns: columns, total: total)
+
+                        if period == .year {
+                            highlightsSection(sessions: reportSessions, at: date)
+                        }
                     }
                 }
                 .padding(.horizontal, 8)
@@ -405,19 +411,20 @@ struct ReportsView: View {
 
     private func summarySection(total: TimeInterval) -> some View {
         HStack(alignment: .top, spacing: 0) {
-            summaryMetric(title: "Time Tracked", value: durationText(total))
+            summaryMetric(title: "Time Tracked", value: durationText(total), centered: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             summaryMetric(
                 title: period == .year ? "Monthly Avg." : "Daily Avg.",
-                value: durationText(averageSeconds(total: total))
+                value: durationText(averageSeconds(total: total)),
+                centered: true
             )
             .frame(maxWidth: .infinity, alignment: .trailing)
         }
     }
 
-    private func summaryMetric(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+    private func summaryMetric(title: String, value: String, centered: Bool = false) -> some View {
+        VStack(alignment: centered ? .center : .leading, spacing: 4) {
             Text(title)
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(.secondary)
@@ -439,10 +446,11 @@ struct ReportsView: View {
 
     private func tasksSection(entries: [ReportTaskEntry], total: TimeInterval) -> some View {
         let usedEntries = entries.filter { $0.seconds > 0 }
-        return VStack(alignment: .leading, spacing: 16) {
+        return VStack(alignment: .leading, spacing: 18) {
             Text("BY TASKS")
-                .font(.system(size: 15, weight: .bold))
+                .font(.system(size: 16.5, weight: .bold))
                 .foregroundStyle(.white)
+                .padding(.leading, 16)
 
             reportCard {
                 if usedEntries.isEmpty {
@@ -472,19 +480,18 @@ struct ReportsView: View {
 
     private func taskRow(entry: ReportTaskEntry, total: TimeInterval) -> some View {
         let percent = total > 0 ? Int((entry.seconds / total * 100).rounded()) : 0
-        return HStack(alignment: .center, spacing: 12) {
-            ZStack {
-                Circle()
-                    .fill(entry.color)
-                    .frame(width: 30, height: 30)
-                Image(systemName: "checkmark")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(.white)
-            }
+        return HStack(alignment: .center, spacing: 13) {
+            Text(String(entry.title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1)).uppercased())
+                .font(.system(size: 14.5, weight: .bold))
+                .foregroundStyle(entry.color)
+                .frame(width: 33, height: 33)
+                .overlay {
+                    Circle().stroke(entry.color, lineWidth: 1.3)
+                }
 
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 7) {
                 Text(entry.title)
-                    .font(.system(size: 15))
+                    .font(.system(size: 16.5))
                     .foregroundStyle(.white)
                     .lineLimit(1)
                 usageScaleRow(color: entry.color, percent: percent)
@@ -493,28 +500,147 @@ struct ReportsView: View {
             Spacer(minLength: 8)
 
             Text(durationText(entry.seconds))
-                .font(.system(size: 15))
+                .font(.system(size: 16.5))
                 .foregroundStyle(.white)
                 .monospacedDigit()
         }
-        .padding(.vertical, 10)
+        .padding(.vertical, 11)
         .contentShape(Rectangle())
     }
 
-    private func usageScaleRow(color: Color, percent: Int) -> some View {
+    private func usageScaleRow(color: Color, percent: Int, barHeight: CGFloat = 5.5, percentTrailing: Bool = false) -> some View {
         GeometryReader { geo in
-            HStack(spacing: 6) {
-                Capsule()
-                    .fill(color)
-                    .frame(width: max(6, geo.size.width * CGFloat(percent) / 100), height: 5)
-                Text("\(percent)%")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize()
-                Spacer(minLength: 0)
+            if percentTrailing {
+                // Reserve fixed room for the "N%" label so the capsule (which can reach the
+                // full available width at 100%) never grows underneath/past it.
+                let labelWidth: CGFloat = 46
+                let barMaxWidth = max(0, geo.size.width - labelWidth - 6)
+                HStack(spacing: 6) {
+                    Capsule()
+                        .fill(color)
+                        .frame(width: max(6, barMaxWidth * CGFloat(percent) / 100), height: barHeight)
+                    Spacer(minLength: 0)
+                    Text("\(percent)%")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .frame(width: labelWidth, alignment: .trailing)
+                }
+            } else {
+                HStack(spacing: 6) {
+                    Capsule()
+                        .fill(color)
+                        .frame(width: max(6, geo.size.width * CGFloat(percent) / 100), height: barHeight)
+                    Text("\(percent)%")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                    Spacer(minLength: 0)
+                }
             }
         }
-        .frame(height: 8)
+        .frame(height: 9)
+    }
+
+    /// Shown instead of `sessionsSection` for Month/Year, where a full session list would be
+    /// too long to be useful — surfaces the top 5 days (Month) or months (Year) by tracked time.
+    private func busiestSection(columns: [ReportChartColumn], total: TimeInterval) -> some View {
+        let topColumns = columns
+            .filter { $0.totalSeconds > 0 }
+            .sorted { $0.totalSeconds > $1.totalSeconds }
+            .prefix(5)
+
+        return VStack(alignment: .leading, spacing: 18) {
+            Text(period == .year ? "BUSIEST MONTHS" : "BUSIEST DAYS")
+                .font(.system(size: 16.5, weight: .bold))
+                .foregroundStyle(.white)
+                .padding(.leading, 16)
+
+            reportCard {
+                if topColumns.isEmpty {
+                    Text("No time tracked")
+                        .font(.system(size: 15))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 12)
+                } else {
+                    ForEach(Array(topColumns.enumerated()), id: \.element.id) { index, column in
+                        busiestRow(column: column, total: total)
+
+                        if index < topColumns.count - 1 {
+                            Divider().background(Color.white.opacity(0.08))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func busiestRow(column: ReportChartColumn, total: TimeInterval) -> some View {
+        let percent = total > 0 ? Int((column.totalSeconds / total * 100).rounded()) : 0
+        return HStack(alignment: .center, spacing: 13) {
+            VStack(alignment: .leading, spacing: 7) {
+                Text(busiestDateLabel(column.date))
+                    .font(.system(size: 16.5))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                usageScaleRow(color: accentColorManager.color, percent: percent, barHeight: 4, percentTrailing: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(durationText(column.totalSeconds))
+                .font(.system(size: 16.5))
+                .foregroundStyle(.white)
+                .monospacedDigit()
+                .fixedSize()
+        }
+        .padding(.vertical, 11)
+    }
+
+    private func busiestDateLabel(_ date: Date) -> String {
+        period == .year
+            ? ReportFormatters.monthShort.string(from: date)
+            : ReportFormatters.shortDate.string(from: date)
+    }
+
+    /// Year-only summary strip at the very bottom of the tab — a quick "at a glance" recap
+    /// that doesn't need its own chart.
+    private func highlightsSection(sessions: [TaskTimeSession], at date: Date) -> some View {
+        let scoped = sessions.filter { sessionListDuration($0, at: date) > 0 }
+        let activeDays = Set(scoped.map { calendar.startOfDay(for: $0.startedAt) }).count
+        let longestSession = scoped.map { sessionListDuration($0, at: date) }.max() ?? 0
+
+        return VStack(alignment: .leading, spacing: 18) {
+            Text("HIGHLIGHTS")
+                .font(.system(size: 16.5, weight: .bold))
+                .foregroundStyle(.white)
+                .padding(.leading, 16)
+
+            reportCard {
+                HStack(spacing: 0) {
+                    highlightMetric(title: "Active Days", value: "\(activeDays)")
+                        .frame(maxWidth: .infinity, alignment: .center)
+                    highlightMetric(title: "Sessions", value: "\(scoped.count)")
+                        .frame(maxWidth: .infinity, alignment: .center)
+                    highlightMetric(title: "Longest Session", value: durationText(longestSession))
+                        .frame(maxWidth: .infinity, alignment: .center)
+                }
+                .padding(.vertical, 14)
+            }
+        }
+    }
+
+    private func highlightMetric(title: String, value: String) -> some View {
+        VStack(alignment: .center, spacing: 4) {
+            Text(title)
+                .font(.system(size: 14.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 20.5, weight: .regular, design: .rounded))
+                .foregroundStyle(.white)
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
     }
 
     private func sessionsSection(groups: [ReportSessionGroup], at date: Date) -> some View {
@@ -522,6 +648,7 @@ struct ReportsView: View {
             Text("SESSIONS")
                 .font(.system(size: 15, weight: .bold))
                 .foregroundStyle(.white)
+                .padding(.leading, 16)
 
             if groups.isEmpty {
                 reportCard {
@@ -538,10 +665,12 @@ struct ReportsView: View {
                             Text(daySectionHeader(group.date))
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
+                                .padding(.leading, 16)
                             Spacer()
                             Text(durationText(group.sessions.reduce(0) { $0 + $1.duration(at: date) }))
                                 .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(accentColorManager.color)
+                                .padding(.trailing, 16)
                         }
 
                         reportCard {
