@@ -628,7 +628,11 @@ final class TaskService: NSObject, ObservableObject {
               let taskID = task.id,
               endedAt > startedAt else { return }
 
-        if let existingSession = latestMergeableAutoTrackedSession(for: taskID, nextStartedAt: startedAt),
+        if let existingSession = latestMergeableAutoTrackedSession(
+            for: taskID,
+            nextStartedAt: startedAt,
+            afterExplicitStopAt: task.autoTrackStoppedAt
+        ),
            let existingSessionID = existingSession.id {
             let mergedEnd = max(existingSession.endedAt ?? existingSession.startedAt, endedAt)
             if let sessionIndex = sessions.firstIndex(where: { $0.id == existingSessionID }) {
@@ -710,6 +714,10 @@ final class TaskService: NSObject, ObservableObject {
         tasks[taskIndex].autoTrackLiveUntil = lastUsageAt.addingTimeInterval(autoTrackingInactivityGraceSeconds)
         tasks[taskIndex].autoTrackActiveSessionID = sessionID
         tasks[taskIndex].autoTrackSessionStartedAt = sessionStartedAt
+        // A new threshold event starts a fresh live window. Clear an earlier explicit stop
+        // locally as well as in Firestore, so the UI and Live Activity do not wait for the
+        // listener round-trip before treating the resumed tracking as active.
+        tasks[taskIndex].autoTrackStoppedAt = nil
         tasks[taskIndex].updatedAt = Date()
     }
 
@@ -719,16 +727,26 @@ final class TaskService: NSObject, ObservableObject {
             "autoTrackLiveUntil": Timestamp(date: lastUsageAt.addingTimeInterval(autoTrackingInactivityGraceSeconds)),
             "autoTrackActiveSessionID": sessionID,
             "autoTrackSessionStartedAt": Timestamp(date: sessionStartedAt),
+            "autoTrackStoppedAt": FieldValue.delete(),
             "updatedAt": Timestamp(date: Date()),
         ])
     }
 
-    private func latestMergeableAutoTrackedSession(for taskID: String, nextStartedAt: Date) -> TaskTimeSession? {
+    private func latestMergeableAutoTrackedSession(
+        for taskID: String,
+        nextStartedAt: Date,
+        afterExplicitStopAt stoppedAt: Date?
+    ) -> TaskTimeSession? {
         sessions
             .filter { session in
                 guard session.taskID == taskID,
                       session.startedAutomatically == true,
                       let endedAt = session.endedAt else { return false }
+                // A manual Stop ends the current auto-track window. A later threshold must
+                // create a fresh session/window instead of extending the pre-stop one; otherwise
+                // `autoTrackSessionStartedAt` remains before the stop and remote clients rightly
+                // continue to regard it as stopped.
+                if let stoppedAt, endedAt <= stoppedAt { return false }
                 return nextStartedAt.timeIntervalSince(endedAt) <= autoTrackingInactivityGraceSeconds
             }
             .max { first, second in
@@ -778,9 +796,14 @@ final class TaskService: NSObject, ObservableObject {
         let stoppedAt = Date()
         if let taskIndex = tasks.firstIndex(where: { $0.id == id }) {
             tasks[taskIndex].autoTrackStoppedAt = stoppedAt
+            // `autoTrackLiveUntil` is the original cross-device live-state field. Updating it
+            // to the stop time makes older clients that have not yet adopted
+            // `autoTrackStoppedAt` stop immediately too.
+            tasks[taskIndex].autoTrackLiveUntil = stoppedAt
         }
         tasksCollection(for: uid).document(id).updateData([
             "autoTrackStoppedAt": Timestamp(date: stoppedAt),
+            "autoTrackLiveUntil": Timestamp(date: stoppedAt),
             "updatedAt": Timestamp(date: stoppedAt),
         ])
     }
