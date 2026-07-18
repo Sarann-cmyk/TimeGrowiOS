@@ -23,6 +23,11 @@ const APNS_TEAM_ID = defineSecret("APNS_TEAM_ID");
 const BUNDLE_ID = "WINNER.ltd.TimeGrow";
 const ATTRIBUTES_TYPE = "TimeGrowLiveActivityAttributes";
 
+/** Keeps Cloud Logging useful without publishing a reusable APNs credential. */
+function tokenHint(token: string): string {
+  return `…${token.slice(-8)}`;
+}
+
 function credentials(): ApnsCredentials {
   return {
     authKey: APNS_AUTH_KEY.value(),
@@ -43,6 +48,13 @@ interface TaskDoc {
   autoTrackLiveUntil?: Timestamp;
   autoTrackStoppedAt?: Timestamp;
   liveActivityPushToken?: string;
+  /** Server-side claim that a push-to-start was already sent for this timer window. */
+  liveActivityStartRequestedAt?: Timestamp;
+}
+
+interface SessionDoc {
+  startedAutomatically?: boolean;
+  endedAt?: Timestamp;
 }
 
 interface DeviceDoc {
@@ -201,6 +213,30 @@ export const onTaskTimerChanged = onDocumentUpdated(
     const runningStart = activeTimerStart(after, now);
 
     if (!wasRunning && runningStart) {
+      // Function invocations can overlap and Firestore listeners can briefly replay an older
+      // before/after pair after a poor connection. Claim this exact timer window transactionally
+      // before asking APNs to create a Live Activity, otherwise each replay causes a visible
+      // push-to-start alert even though tracking never stopped.
+      const taskRef = db.collection("users").doc(uid).collection("tasks").doc(taskID);
+      const didClaimStart = await db.runTransaction(async (transaction) => {
+        const currentSnapshot = await transaction.get(taskRef);
+        const currentTask = currentSnapshot.data() as TaskDoc | undefined;
+        const currentStart = currentTask ? activeTimerStart(currentTask, now) : null;
+        if (!currentTask || !currentStart) return false;
+
+        const previousClaim = currentTask.liveActivityStartRequestedAt?.toDate();
+        if (previousClaim && previousClaim >= currentStart) return false;
+
+        transaction.update(taskRef, {
+          liveActivityStartRequestedAt: admin.firestore.Timestamp.fromDate(now),
+        });
+        return true;
+      });
+      if (!didClaimStart) {
+        console.log(`Live Activity start already claimed or task no longer active (task ${taskID})`);
+        return;
+      }
+
       const devicesSnap = await db.collection("users").doc(uid).collection("devices").get();
       const creds = credentials();
 
@@ -266,19 +302,43 @@ export const onTaskTimerChanged = onDocumentUpdated(
       after.liveActivityPushToken &&
       after.liveActivityPushToken !== before.liveActivityPushToken
     ) {
-      await sendLiveActivityUpdate(credentials(), after.liveActivityPushToken, contentState(runningStart)).catch((error) =>
-        console.error(`initial Live Activity update failed (task ${taskID})`, error)
-      );
+      await sendLiveActivityUpdate(credentials(), after.liveActivityPushToken, contentState(runningStart))
+        .then((response) => console.log(`initial Live Activity update accepted by APNs (task ${taskID}, token ${tokenHint(after.liveActivityPushToken!)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
+        .catch((error) => console.error(`initial Live Activity update failed (task ${taskID}, token ${tokenHint(after.liveActivityPushToken!)})`, error));
       return;
     }
 
-    if (wasRunning && !runningStart && before.liveActivityPushToken) {
+    if (wasRunning && !runningStart) {
       const beforeStart = activeTimerStart(before, now) ?? now;
-      const creds = credentials();
-      const state = contentState(beforeStart);
-      await sendLiveActivityEnd(creds, before.liveActivityPushToken, state).catch((error) =>
-        console.error(`end push failed (task ${taskID})`, error)
-      );
+      const token = before.liveActivityPushToken;
+      console.log(`timer stop transition observed (task ${taskID}, hadLiveActivityToken=${Boolean(token)}, previousStart=${beforeStart.toISOString()})`);
+      if (!token) {
+        // A push-to-start activity can be visible before iOS gives the app time to upload its
+        // per-activity token. Without that token APNs cannot receive an ActivityKit `end` push,
+        // but a normal background push lets the app fetch the stopped task and end the activity
+        // locally. This remains a best-effort fallback because iOS may defer silent pushes.
+        console.warn(`Live Activity end token missing; sending background reconciliation wake (task ${taskID})`);
+        const devicesSnap = await db.collection("users").doc(uid).collection("devices").get();
+        const wakeTokens = devicesSnap.docs
+          .map((doc) => doc.get("apnsDeviceToken") as string | undefined)
+          .filter((deviceToken): deviceToken is string => !!deviceToken);
+        if (wakeTokens.length === 0) {
+          console.warn(`Live Activity fallback wake skipped: no APNs device tokens (task ${taskID})`);
+          return;
+        }
+        await Promise.all(
+          wakeTokens.map((deviceToken) =>
+            sendBackgroundWake(credentials(), deviceToken)
+              .then((response) => console.log(`Live Activity fallback wake accepted by APNs (task ${taskID}, token ${tokenHint(deviceToken)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
+              .catch((error) => console.error(`Live Activity fallback wake failed (task ${taskID}, token ${tokenHint(deviceToken)})`, error))
+          )
+        );
+        return;
+      }
+
+      await sendLiveActivityEnd(credentials(), token, contentState(beforeStart))
+        .then((response) => console.log(`Live Activity end accepted by APNs (task ${taskID}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
+        .catch((error) => console.error(`Live Activity end push failed (task ${taskID}, token ${tokenHint(token)})`, error));
     }
   }
 );

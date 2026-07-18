@@ -11,6 +11,8 @@ private let appGroupID = "group.WINNER.ltd.TimeGrow"
 private let pendingEventsKey = "autoTracking.pendingEvents"
 private let debugEventsKey = "autoTracking.debugEvents"
 private let selectionDataKeyPrefix = "autoTracking.selectionData."
+private let monitoredActivityKeyPrefix = "autoTracking.monitoredActivity."
+private let lastQueuedThresholdKeyPrefix = "autoTracking.lastQueuedThreshold."
 private let authUIDKey = "autoTracking.firebase.uid"
 private let projectIDKey = "autoTracking.firebase.projectID"
 private let deviceIDKey = "autoTracking.deviceID"
@@ -19,6 +21,7 @@ private let lastUsageKeyPrefix = "autoTracking.lastUsage."
 private let sessionStartKeyPrefix = "autoTracking.sessionStart."
 private let thresholdSeconds: TimeInterval = 60
 private let inactivityGraceSeconds: TimeInterval = 180
+private let minimumDistinctThresholdInterval: TimeInterval = 55
 
 final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     override func intervalDidStart(for activity: DeviceActivityName) {
@@ -39,12 +42,31 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
 
         let resolvedTaskID = taskID(from: activity)
         let occurredAt = Date()
+
+        // DeviceActivity may deliver callbacks from a monitor that was already replaced. An old
+        // callback must never re-arm over the newer generation.
+        let monitoredActivityKey = "\(monitoredActivityKeyPrefix)\(resolvedTaskID)"
+        if let currentActivity = sharedDefaults.string(forKey: monitoredActivityKey),
+           currentActivity != activity.rawValue {
+            appendDebugEvent("eventIgnored:staleActivity", activity: activity)
+            return
+        }
+
+        let lastQueuedKey = "\(lastQueuedThresholdKeyPrefix)\(resolvedTaskID)"
+        if let previousTimestamp = sharedDefaults.object(forKey: lastQueuedKey) as? Double,
+           occurredAt.timeIntervalSince(Date(timeIntervalSince1970: previousTimestamp)) < minimumDistinctThresholdInterval {
+            appendDebugEvent("eventIgnored:duplicateThreshold", activity: activity)
+            rearmMonitoring(after: activity)
+            return
+        }
+
         var pendingEvents = sharedDefaults.array(forKey: pendingEventsKey) as? [[String: Any]] ?? []
         pendingEvents.append([
             "taskID": resolvedTaskID,
             "occurredAt": occurredAt.timeIntervalSince1970,
         ])
         sharedDefaults.set(pendingEvents, forKey: pendingEventsKey)
+        sharedDefaults.set(occurredAt.timeIntervalSince1970, forKey: lastQueuedKey)
 
         let sessionStartedAt = resolveSessionStartedAt(taskID: resolvedTaskID, occurredAt: occurredAt, sharedDefaults: sharedDefaults)
         syncAutoTrackLiveState(taskID: resolvedTaskID, occurredAt: occurredAt, sessionStartedAt: sessionStartedAt, sharedDefaults: sharedDefaults)
@@ -128,7 +150,9 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
             semaphore.signal()
         }.resume()
 
-        _ = semaphore.wait(timeout: .now() + 8)
+        // The pending App Group event is durable. Do not monopolize the extension for eight
+        // seconds while an unreliable network is attempting the faster server-side path.
+        _ = semaphore.wait(timeout: .now() + 3)
         if let requestError {
             appendDebugEvent("secureSyncFailed:\(requestError.localizedDescription)", taskID: taskID, occurredAt: occurredAt)
         } else if (200..<300).contains(statusCode) {
@@ -148,7 +172,9 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
             return
         }
 
-        let generation = Int(Date().timeIntervalSince1970)
+        // A second-resolution generation collides during rapid callback delivery and can make a
+        // monitor re-arm itself. Use an unambiguously new generation instead.
+        let generation = UUID().uuidString
         let nextActivity = DeviceActivityName("\(taskID)|\(generation)")
         let nextEventName = DeviceActivityEvent.Name("thresholdReached|\(generation)")
         let schedule = DeviceActivitySchedule(
@@ -167,6 +193,7 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         do {
             DeviceActivityCenter().stopMonitoring([activity])
             try DeviceActivityCenter().startMonitoring(nextActivity, during: schedule, events: [nextEventName: event])
+            sharedDefaults.set(nextActivity.rawValue, forKey: "\(monitoredActivityKeyPrefix)\(taskID)")
             appendDebugEvent("rearmed:\(nextActivity.rawValue)", activity: activity)
         } catch {
             appendDebugEvent("rearmFailed:\(error.localizedDescription)", activity: activity)

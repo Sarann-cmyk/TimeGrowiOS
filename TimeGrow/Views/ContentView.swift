@@ -190,7 +190,13 @@ struct ContentView: View {
 
     private var tasksView: some View {
         Group {
-            if taskService.tasks.isEmpty {
+            if !taskService.hasReceivedInitialTasksSnapshot {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.top, 88)
+            } else if taskService.tasks.isEmpty {
                 Text(LanguageManager.localized("No tasks yet"))
                     .font(.system(size: 27, weight: .medium))
                     .foregroundStyle(.secondary)

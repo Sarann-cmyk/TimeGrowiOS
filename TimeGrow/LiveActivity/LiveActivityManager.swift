@@ -43,6 +43,12 @@ final class LiveActivityManager {
     /// so a remote `end` push (sent when another device stops the task) has nothing to target
     /// and the Dynamic Island silently keeps counting until the app is opened locally.
     private var observedActivityIDs: Set<String> = []
+    /// A push-to-start activity may arrive just before the background wake has fetched its task
+    /// state. Do not end it based on that short-lived stale snapshot; give the server state one
+    /// reconciliation interval to arrive first.
+    private var remoteStartGraceUntilByActivityID: [String: Date] = [:]
+
+    private let remoteStartReconciliationGrace: TimeInterval = 30
 
     /// Called whenever a task's per-activity push token becomes known (activity just started) or
     /// should be cleared (activity ending). Set once from `TimeGrowApp` to persist it via
@@ -92,6 +98,10 @@ final class LiveActivityManager {
                     let taskID = activity.attributes.taskID
                     guard !self.observedActivityIDs.contains(activity.id) else { return }
                     self.observedActivityIDs.insert(activity.id)
+                    if UIApplication.shared.applicationState != .active {
+                        self.remoteStartGraceUntilByActivityID[activity.id] = Date()
+                            .addingTimeInterval(self.remoteStartReconciliationGrace)
+                    }
                     self.observePushToken(of: activity, taskID: taskID)
                     DiagnosticsLog.log("liveActivity", "Observed ActivityKit-created activity task=\(taskID)")
                 }
@@ -116,11 +126,23 @@ final class LiveActivityManager {
         for activity in Activity<TimeGrowLiveActivityAttributes>.activities {
             let taskID = activity.attributes.taskID
             guard runningStartByTaskID[taskID] != nil else {
+                if UIApplication.shared.applicationState != .active,
+                   let graceUntil = remoteStartGraceUntilByActivityID[activity.id],
+                   graceUntil > Date() {
+                    DiagnosticsLog.log(
+                        "liveActivity",
+                        "Preserving recent push-start activity task=\(taskID) while waiting for server state"
+                    )
+                    continue
+                }
+
+                remoteStartGraceUntilByActivityID.removeValue(forKey: activity.id)
                 observedActivityIDs.remove(activity.id)
                 pushTokenHandler?(taskID, nil)
                 Task { await activity.end(nil, dismissalPolicy: .immediate) }
                 continue
             }
+            remoteStartGraceUntilByActivityID.removeValue(forKey: activity.id)
             if !observedActivityIDs.contains(activity.id) {
                 observedActivityIDs.insert(activity.id)
                 observePushToken(of: activity, taskID: taskID)
@@ -158,7 +180,14 @@ final class LiveActivityManager {
         )
 
         do {
-            let activity = try Activity.request(attributes: attributes, content: .init(state: contentState, staleDate: nil))
+            // A Live Activity created locally must explicitly opt in to ActivityKit push
+            // updates. Without `.token`, `pushTokenUpdates` has no token to deliver and the
+            // server cannot end the activity while this app is suspended.
+            let activity = try Activity.request(
+                attributes: attributes,
+                content: .init(state: contentState, staleDate: nil),
+                pushType: .token
+            )
             observedActivityIDs.insert(activity.id)
             observePushToken(of: activity, taskID: taskID)
         } catch {
@@ -171,9 +200,18 @@ final class LiveActivityManager {
     /// (re)issues it, so a server can push `end` events via APNs.
     private func observePushToken(of activity: Activity<TimeGrowLiveActivityAttributes>, taskID: String) {
         Task { [weak self] in
+            // `activityUpdates` can hand us an activity after ActivityKit already issued its
+            // token. Read the current value before waiting for a later rotation so we never
+            // miss that initial token.
+            if let data = activity.pushToken {
+                let hexToken = data.map { String(format: "%02x", $0) }.joined()
+                self?.pushTokenHandler?(taskID, hexToken)
+                DiagnosticsLog.log("liveActivity", "Stored current per-activity push token task=\(taskID)")
+            }
             for await data in activity.pushTokenUpdates {
                 let hexToken = data.map { String(format: "%02x", $0) }.joined()
                 self?.pushTokenHandler?(taskID, hexToken)
+                DiagnosticsLog.log("liveActivity", "Received per-activity push token task=\(taskID)")
             }
         }
     }

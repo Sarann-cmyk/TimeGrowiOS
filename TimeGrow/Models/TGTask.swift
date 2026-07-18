@@ -33,6 +33,9 @@ struct TGTask: Identifiable, Codable, Equatable {
     /// letting a server push `update`/`end` events via APNs. Set once the activity starts, cleared
     /// when it ends.
     var liveActivityPushToken: String?
+    /// Server-side idempotency marker for ActivityKit push-to-start. It belongs to the current
+    /// timer window and prevents delayed Cloud Function replays from showing duplicate starts.
+    var liveActivityStartRequestedAt: Date?
     /// Manual position from the Tasks tab's "Change Order" reorder mode. Tasks without one
     /// yet (never reordered) fall back to `createdAt` ordering.
     var sortOrder: Double? = nil

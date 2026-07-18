@@ -19,6 +19,8 @@ let minimumTrackedSessionDuration: TimeInterval = 3
 private let pendingEventsKey = "autoTracking.pendingEvents"
 private let debugEventsKey = "autoTracking.debugEvents"
 private let selectionDataKeyPrefix = "autoTracking.selectionData."
+private let monitoredActivityKeyPrefix = "autoTracking.monitoredActivity."
+private let minimumDistinctPendingEventInterval: TimeInterval = 55
 
 struct PendingAutoTrackEvent {
     let taskID: String
@@ -100,15 +102,24 @@ final class AutoTrackingStore: ObservableObject {
     }
 
     private func stopMonitoring(for taskID: String) {
-        guard let activityName = monitoredActivitiesByTaskID.removeValue(forKey: taskID) else { return }
-        activityCenter.stopMonitoring([activityName])
-        print("Stopped DeviceActivity monitoring for task \(taskID) activity=\(activityName.rawValue)")
+        let inMemoryActivity = monitoredActivitiesByTaskID.removeValue(forKey: taskID)
+        let sharedDefaults = UserDefaults(suiteName: autoTrackingAppGroupID)
+        let sharedActivity = sharedDefaults
+            .flatMap { $0.string(forKey: "\(monitoredActivityKeyPrefix)\(taskID)") }
+            .map { DeviceActivityName($0) }
+        let activities = [inMemoryActivity, sharedActivity].compactMap { $0 }
+        let uniqueActivities = Array(Set(activities.map { $0.rawValue })).map { DeviceActivityName($0) }
+        if !uniqueActivities.isEmpty {
+            activityCenter.stopMonitoring(uniqueActivities)
+            print("Stopped DeviceActivity monitoring for task \(taskID) activities=\(uniqueActivities.map { $0.rawValue })")
+        }
+        sharedDefaults?.removeObject(forKey: "\(monitoredActivityKeyPrefix)\(taskID)")
     }
 
     /// Watches the picked apps/categories all day, every day, and reports
     /// back once the task has been used for at least a minute in a day.
     private func scheduleMonitoring(selection: FamilyActivitySelection, taskID: String) {
-        let generation = Int(Date().timeIntervalSince1970)
+        let generation = UUID().uuidString
         let activityName = DeviceActivityName("\(taskID)|\(generation)")
         let thresholdEventName = DeviceActivityEvent.Name("thresholdReached|\(generation)")
         guard !selection.applicationTokens.isEmpty || !selection.categoryTokens.isEmpty || !selection.webDomainTokens.isEmpty else {
@@ -136,6 +147,10 @@ final class AutoTrackingStore: ObservableObject {
         do {
             try activityCenter.startMonitoring(activityName, during: schedule, events: [thresholdEventName: event])
             monitoredActivitiesByTaskID[taskID] = activityName
+            UserDefaults(suiteName: autoTrackingAppGroupID)?.set(
+                activityName.rawValue,
+                forKey: "\(monitoredActivityKeyPrefix)\(taskID)"
+            )
             print(
                 "Started DeviceActivity monitoring for task \(taskID) activity=\(activityName.rawValue) event=\(thresholdEventName.rawValue) apps=\(selection.applicationTokens.count) categories=\(selection.categoryTokens.count)"
             )
@@ -172,13 +187,28 @@ final class AutoTrackingStore: ObservableObject {
             DiagnosticsLog.log("autoTrack", "drained \(raw.count) pending event(s): \(raw)")
         }
 
-        var uniqueEvents: [String: PendingAutoTrackEvent] = [:]
+        var events: [PendingAutoTrackEvent] = []
         for entry in raw {
             guard let taskID = entry["taskID"] as? String,
                   let occurredAt = entry["occurredAt"] as? Double else { continue }
-            let event = PendingAutoTrackEvent(taskID: taskID, occurredAt: Date(timeIntervalSince1970: occurredAt))
-            uniqueEvents["\(taskID)|\(Int(occurredAt))"] = event
+            events.append(PendingAutoTrackEvent(taskID: taskID, occurredAt: Date(timeIntervalSince1970: occurredAt)))
         }
-        return uniqueEvents.values.sorted { $0.occurredAt < $1.occurredAt }
+
+        var accepted: [PendingAutoTrackEvent] = []
+        var lastAcceptedByTaskID: [String: Date] = [:]
+        var discardedDuplicates = 0
+        for event in events.sorted(by: { $0.occurredAt < $1.occurredAt }) {
+            if let previous = lastAcceptedByTaskID[event.taskID],
+               event.occurredAt.timeIntervalSince(previous) < minimumDistinctPendingEventInterval {
+                discardedDuplicates += 1
+                continue
+            }
+            lastAcceptedByTaskID[event.taskID] = event.occurredAt
+            accepted.append(event)
+        }
+        if discardedDuplicates > 0 {
+            DiagnosticsLog.log("autoTrack", "discarded \(discardedDuplicates) duplicate pending threshold event(s)")
+        }
+        return accepted
     }
 }

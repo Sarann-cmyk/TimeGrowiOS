@@ -62,6 +62,8 @@ final class TaskService: NSObject, ObservableObject {
     @Published private(set) var pendingStops: [String: AutoTrackPendingStop] = [:]
     @Published private(set) var isSignedIn = false
     @Published private(set) var currentUser: User?
+    /// Separates the initial empty in-memory array from an account that genuinely has no tasks.
+    @Published private(set) var hasReceivedInitialTasksSnapshot = false
     @Published var taskDeletionBlockedTaskName: String?
 
     var isAnonymous: Bool { currentUser?.isAnonymous ?? true }
@@ -74,6 +76,11 @@ final class TaskService: NSObject, ObservableObject {
     private var devicesListener: ListenerRegistration?
     private var trackingSettingsListener: ListenerRegistration?
     private var authHandle: AuthStateDidChangeListenerHandle?
+    /// `ListenerRegistration.remove()` cannot revoke a callback that Firestore has already
+    /// queued. Increment this whenever the tasks listener is replaced so an old cached snapshot
+    /// cannot overwrite newer state after a reconnect or account change.
+    private var tasksListenerGeneration = 0
+    private var observedTasksUID: String?
     private var staleTimer: Timer?
     private var heartbeatTimer: Timer?
     private var currentNonce: String?
@@ -138,6 +145,9 @@ final class TaskService: NSObject, ObservableObject {
                     self.startStaleTimer()
                     self.handleScenePhase(.active)
                 } else {
+                    self.tasksListenerGeneration &+= 1
+                    self.observedTasksUID = nil
+                    self.hasReceivedInitialTasksSnapshot = false
                     self.listener?.remove()
                     self.sessionsListener?.remove()
                     self.devicesListener?.remove()
@@ -225,6 +235,12 @@ final class TaskService: NSObject, ObservableObject {
 
     private func observeTasks(uid: String) {
         listener?.remove()
+        tasksListenerGeneration &+= 1
+        let listenerGeneration = tasksListenerGeneration
+        if observedTasksUID != uid {
+            observedTasksUID = uid
+            hasReceivedInitialTasksSnapshot = false
+        }
         listener = tasksCollection(for: uid)
             .order(by: "createdAt")
             .addSnapshotListener { [weak self] snapshot, error in
@@ -234,15 +250,61 @@ final class TaskService: NSObject, ObservableObject {
                     return
                 }
                 let documents = snapshot?.documents ?? []
-                let decoded = documents.compactMap { try? $0.data(as: TGTask.self) }
+                var decoded: [TGTask] = []
+                var decodeFailures: [(id: String, message: String)] = []
+                for document in documents {
+                    do {
+                        decoded.append(try document.data(as: TGTask.self))
+                    } catch {
+                        decodeFailures.append((document.documentID, error.localizedDescription))
+                    }
+                }
+                let isFromCache = snapshot?.metadata.isFromCache ?? true
                 Task { @MainActor in
-                    let merged = decoded.map { self.mergingOptimisticTimerStart(into: $0) }
+                    guard self.tasksListenerGeneration == listenerGeneration,
+                          self.currentUser?.uid == uid else {
+                        DiagnosticsLog.log(
+                            "sync",
+                            "Ignored stale tasks snapshot generation=\(listenerGeneration)"
+                        )
+                        return
+                    }
+
+                    // A partial cache query can be emitted while Firestore reconnects after a
+                    // weak network period. It is not authoritative and must not make existing
+                    // task rows disappear; a later server snapshot will apply any real deletion.
+                    if isFromCache,
+                       !self.tasks.isEmpty,
+                       documents.count < self.tasks.count {
+                        DiagnosticsLog.log(
+                            "sync",
+                            "Ignored incomplete cached tasks snapshot documents=\(documents.count) current=\(self.tasks.count)"
+                        )
+                        return
+                    }
+
+                    var merged = decoded.map { self.mergingOptimisticTimerStart(into: $0) }
+                    let mergedIDs = Set(merged.compactMap(\.id))
+                    for failure in decodeFailures {
+                        if let previousTask = self.tasks.first(where: { $0.id == failure.id }),
+                           !mergedIDs.contains(failure.id) {
+                            merged.append(previousTask)
+                        }
+                        DiagnosticsLog.log(
+                            "sync",
+                            "Failed to decode task id=\(failure.id); keeping previous value when available: \(failure.message)"
+                        )
+                    }
                     let runningBeforeIDs = Set(self.tasks.filter(\.isTimerRunning).compactMap(\.id))
                     let runningAfter = merged.filter(\.isTimerRunning)
                     let runningAfterIDs = Set(runningAfter.compactMap(\.id))
                     let stoppedSinceLastSnapshot = self.tasks.filter { runningBeforeIDs.contains($0.id ?? "") && !runningAfterIDs.contains($0.id ?? "") }
                     self.tasks = Self.sortedByPosition(merged)
-                    DiagnosticsLog.log("sync", "tasks snapshot count=\(merged.count) running=\(runningAfter.map(\.name))")
+                    self.hasReceivedInitialTasksSnapshot = true
+                    DiagnosticsLog.log(
+                        "sync",
+                        "tasks snapshot documents=\(documents.count) decoded=\(decoded.count) applied=\(merged.count) source=\(isFromCache ? "cache" : "server") running=\(runningAfter.map(\.name))"
+                    )
                     if !stoppedSinceLastSnapshot.isEmpty {
                         DiagnosticsLog.log("sync", "timer(s) stopped since last snapshot: \(stoppedSinceLastSnapshot.map(\.name))")
                     }
@@ -605,20 +667,38 @@ final class TaskService: NSObject, ObservableObject {
         guard !queuedAutoTrackEvents.isEmpty else { return }
 
         var remainingEvents: [PendingAutoTrackEvent] = []
-        for event in queuedAutoTrackEvents {
-            guard let task = tasks.first(where: { $0.id == event.taskID }) else {
-                DiagnosticsLog.log("autoTrack", "task not loaded yet, re-queuing taskID=\(event.taskID)")
-                remainingEvents.append(event)
+        let eventsByTaskID = Dictionary(grouping: queuedAutoTrackEvents, by: \.taskID)
+        for taskID in eventsByTaskID.keys.sorted() {
+            guard let taskEvents = eventsByTaskID[taskID] else { continue }
+            guard let task = tasks.first(where: { $0.id == taskID }) else {
+                DiagnosticsLog.log("autoTrack", "task not loaded yet, re-queuing taskID=\(taskID)")
+                remainingEvents.append(contentsOf: taskEvents)
                 continue
             }
-            guard !task.isTimerRunning, optimisticTimerStarts[event.taskID] == nil else {
-                DiagnosticsLog.log("autoTrack", "skipping event for \(task.name), already running")
+            guard !task.isTimerRunning, optimisticTimerStarts[taskID] == nil else {
+                DiagnosticsLog.log("autoTrack", "skipping \(taskEvents.count) event(s) for \(task.name), already running")
                 continue
             }
-            let endedAt = event.occurredAt
-            let startedAt = endedAt.addingTimeInterval(-autoTrackingThresholdSeconds)
-            DiagnosticsLog.log("autoTrack", "recording minute for \(task.name) from=\(startedAt) to=\(endedAt) occurredAt=\(event.occurredAt)")
-            recordAutoTrackedSession(for: task, startedAt: startedAt, endedAt: endedAt)
+
+            // Replay adjacent offline threshold events as one usage window. This is equivalent
+            // to the existing 180-second session merge rule, but avoids dozens of UI publishes,
+            // Live Activity reconciliations, and Firestore writes when the app is reopened.
+            var windows: [(startedAt: Date, endedAt: Date)] = []
+            for event in taskEvents.sorted(by: { $0.occurredAt < $1.occurredAt }) {
+                let startedAt = event.occurredAt.addingTimeInterval(-autoTrackingThresholdSeconds)
+                if let last = windows.indices.last,
+                   startedAt.timeIntervalSince(windows[last].endedAt) <= autoTrackingInactivityGraceSeconds {
+                    var mergedWindow = windows[last]
+                    mergedWindow.endedAt = max(mergedWindow.endedAt, event.occurredAt)
+                    windows[last] = mergedWindow
+                } else {
+                    windows.append((startedAt: startedAt, endedAt: event.occurredAt))
+                }
+            }
+            for window in windows {
+                DiagnosticsLog.log("autoTrack", "recording usage window for \(task.name) from=\(window.startedAt) to=\(window.endedAt) events=\(taskEvents.count)")
+                recordAutoTrackedSession(for: task, startedAt: window.startedAt, endedAt: window.endedAt)
+            }
         }
         queuedAutoTrackEvents = remainingEvents
     }
@@ -710,15 +790,17 @@ final class TaskService: NSObject, ObservableObject {
 
     private func applyOptimisticAutoTrackLiveState(taskID: String, sessionID: String, sessionStartedAt: Date, lastUsageAt: Date) {
         guard let taskIndex = tasks.firstIndex(where: { $0.id == taskID }) else { return }
-        tasks[taskIndex].autoTrackLastUsageAt = lastUsageAt
-        tasks[taskIndex].autoTrackLiveUntil = lastUsageAt.addingTimeInterval(autoTrackingInactivityGraceSeconds)
-        tasks[taskIndex].autoTrackActiveSessionID = sessionID
-        tasks[taskIndex].autoTrackSessionStartedAt = sessionStartedAt
+        var updatedTask = tasks[taskIndex]
+        updatedTask.autoTrackLastUsageAt = lastUsageAt
+        updatedTask.autoTrackLiveUntil = lastUsageAt.addingTimeInterval(autoTrackingInactivityGraceSeconds)
+        updatedTask.autoTrackActiveSessionID = sessionID
+        updatedTask.autoTrackSessionStartedAt = sessionStartedAt
         // A new threshold event starts a fresh live window. Clear an earlier explicit stop
         // locally as well as in Firestore, so the UI and Live Activity do not wait for the
         // listener round-trip before treating the resumed tracking as active.
-        tasks[taskIndex].autoTrackStoppedAt = nil
-        tasks[taskIndex].updatedAt = Date()
+        updatedTask.autoTrackStoppedAt = nil
+        updatedTask.updatedAt = Date()
+        tasks[taskIndex] = updatedTask
     }
 
     private func updateAutoTrackLiveState(uid: String, taskID: String, sessionID: String, sessionStartedAt: Date, lastUsageAt: Date) {
@@ -983,19 +1065,19 @@ final class TaskService: NSObject, ObservableObject {
     /// One-shot fetch of the current tasks (bypassing the live listener), used when the app is
     /// woken in the background by a silent push and needs fresh state before reconciling Live
     /// Activities — the listener may not have reconnected yet in the brief background window.
-    func fetchTasksOnce(completion: @escaping ([TGTask]) -> Void) {
+    func fetchTasksOnce(completion: @escaping ([TGTask]?) -> Void) {
         guard let uid = currentUser?.uid else {
-            completion([])
+            completion(nil)
             return
         }
-        tasksCollection(for: uid).getDocuments { snapshot, error in
+        tasksCollection(for: uid).getDocuments(source: .server) { snapshot, error in
             if let error {
-                DiagnosticsLog.log("push", "Background fetchTasksOnce failed: \(error.localizedDescription)")
-                completion([])
+                DiagnosticsLog.log("push", "Background server fetchTasksOnce failed: \(error.localizedDescription)")
+                completion(nil)
                 return
             }
             let tasks = snapshot?.documents.compactMap { try? $0.data(as: TGTask.self) } ?? []
-            DiagnosticsLog.log("push", "Background fetchTasksOnce got \(tasks.count) task(s), running=\(tasks.filter(\.isTimerRunning).map(\.name))")
+            DiagnosticsLog.log("push", "Background server fetchTasksOnce got \(tasks.count) task(s), running=\(tasks.filter(\.isTimerRunning).map(\.name))")
             completion(tasks)
         }
     }
@@ -1009,6 +1091,8 @@ final class TaskService: NSObject, ObservableObject {
         ]) { error in
             if let error {
                 DiagnosticsLog.log("liveActivity", "Failed to write activity push token for \(taskID): \(error.localizedDescription)")
+            } else {
+                DiagnosticsLog.log("liveActivity", "Wrote per-activity push token task=\(taskID) present=\(token != nil)")
             }
         }
     }

@@ -111,6 +111,14 @@ struct TimeGrowApp: App {
                     }
                     delegate.backgroundNotificationHandler = { done in
                         taskService.fetchTasksOnce { tasks in
+                            guard let tasks else {
+                                DiagnosticsLog.log(
+                                    "push",
+                                    "Background reconciliation skipped: server task fetch unavailable"
+                                )
+                                done()
+                                return
+                            }
                             LiveActivityManager.shared.reconcile(tasks: tasks)
                             done()
                         }
