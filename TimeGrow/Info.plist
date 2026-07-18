@@ -8,6 +8,8 @@
 	</array>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>TimeGrow needs Calendar access to mirror your tracked work sessions into a separate TimeGrow calendar.</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>

@@ -22,7 +22,7 @@ struct AccountView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 18) {
-                    settingsSectionHeader("LICENSING")
+                    settingsSectionHeader(LanguageManager.localized("LICENSING"))
                     Button {
                         Haptics.impact(.light)
                         isShowingLicensing = true
@@ -31,12 +31,12 @@ struct AccountView: View {
                     }
                     .buttonStyle(.plain)
 
-                    settingsSectionHeader("GENERAL")
+                    settingsSectionHeader(LanguageManager.localized("GENERAL"))
                     settingsGroup {
                         SettingsMenuRow(
                             icon: "globe",
                             iconColor: .blue,
-                            title: "Language",
+                            title: LanguageManager.localized("Language"),
                             value: languageManager.current.displayName,
                             showDivider: true
                         ) {
@@ -59,7 +59,7 @@ struct AccountView: View {
                             SettingsLinkRow(
                                 icon: "paintpalette.fill",
                                 iconColor: accentColorManager.color,
-                                title: "Accent Color",
+                                title: LanguageManager.localized("Accent Color"),
                                 showDivider: false
                             ) {
                                 Circle()
@@ -73,12 +73,12 @@ struct AccountView: View {
                         .buttonStyle(.plain)
                     }
 
-                    settingsSectionHeader("TRACKING")
+                    settingsSectionHeader(LanguageManager.localized("TRACKING"))
                     settingsGroup {
                         SettingsMenuRow(
                             icon: "line.3.horizontal.decrease.circle.fill",
                             iconColor: accentColorManager.color,
-                            title: "Session List Noise",
+                            title: LanguageManager.localized("Session List Noise"),
                             value: SessionListDisplaySettings.title(for: sessionListMinimumDuration),
                             showDivider: false
                         ) {
@@ -102,12 +102,12 @@ struct AccountView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 4)
 
-                    settingsSectionHeader("REPORTS")
+                    settingsSectionHeader(LanguageManager.localized("REPORTS"))
                     settingsGroup {
                         SettingsMenuRow(
                             icon: "calendar",
                             iconColor: .purple,
-                            title: "First Day Of Week",
+                            title: LanguageManager.localized("First Day Of Week"),
                             value: weekStartSelection.localizedTitle,
                             showDivider: false
                         ) {
@@ -121,14 +121,14 @@ struct AccountView: View {
                         }
                     }
 
-                    settingsSectionHeader("RESOURCES")
+                    settingsSectionHeader(LanguageManager.localized("RESOURCES"))
                     settingsGroup {
                         Button {
                             if let url = URL(string: "mailto:support@timegrow.app") {
                                 openURL(url)
                             }
                         } label: {
-                            SettingsValueRow(icon: "at", iconColor: .blue, title: "Contact Support", value: "", showsChevron: false, showDivider: true)
+                            SettingsValueRow(icon: "at", iconColor: .blue, title: LanguageManager.localized("Contact Support"), value: "", showsChevron: false, showDivider: true)
                         }
                         .buttonStyle(.plain)
 
@@ -137,7 +137,7 @@ struct AccountView: View {
                                 openURL(url)
                             }
                         } label: {
-                            SettingsValueRow(icon: "lock.shield.fill", iconColor: .blue, title: "Privacy Policy", value: "", showsChevron: true, showDivider: true)
+                            SettingsValueRow(icon: "lock.shield.fill", iconColor: .blue, title: LanguageManager.localized("Privacy Policy"), value: "", showsChevron: true, showDivider: true)
                         }
                         .buttonStyle(.plain)
 
@@ -146,7 +146,7 @@ struct AccountView: View {
                                 openURL(url)
                             }
                         } label: {
-                            SettingsValueRow(icon: "hand.thumbsup.fill", iconColor: .blue, title: "Rate This App", value: "", showsChevron: true, showDivider: true)
+                            SettingsValueRow(icon: "hand.thumbsup.fill", iconColor: .blue, title: LanguageManager.localized("Rate This App"), value: "", showsChevron: true, showDivider: true)
                         }
                         .buttonStyle(.plain)
 
@@ -155,13 +155,13 @@ struct AccountView: View {
                                 openURL(url)
                             }
                         } label: {
-                            SettingsValueRow(icon: "waveform.path.ecg", iconColor: .cyan, title: "Get TimeGrow for Mac", value: "", showsChevron: true, showDivider: false)
+                            SettingsValueRow(icon: "waveform.path.ecg", iconColor: .cyan, title: LanguageManager.localized("Get TimeGrow for Mac"), value: "", showsChevron: true, showDivider: false)
                         }
                         .buttonStyle(.plain)
                     }
 
-                    settingsSectionHeader("DIAGNOSTICS")
-                    Text("Логи запуску/зупинки таймерів (ручний трекінг та автотрекінг) для діагностики проблем із синхронізацією між пристроями.")
+                    settingsSectionHeader(LanguageManager.localized("DIAGNOSTICS"))
+                    Text(LanguageManager.localized("Logs of timer start/stop events (manual + auto-tracking), used to diagnose cross-device sync issues."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -177,7 +177,7 @@ struct AccountView: View {
                             SettingsValueRow(
                                 icon: "square.and.arrow.up",
                                 iconColor: .blue,
-                                title: "Export Logs",
+                                title: LanguageManager.localized("Export Logs"),
                                 value: "",
                                 showsChevron: false,
                                 showDivider: true
@@ -193,7 +193,7 @@ struct AccountView: View {
                             SettingsValueRow(
                                 icon: "trash.fill",
                                 iconColor: .red,
-                                title: didClearLogs ? "Logs cleared" : "Clear Logs",
+                                title: LanguageManager.localized(didClearLogs ? "Logs cleared" : "Clear Logs"),
                                 value: "",
                                 showsChevron: false,
                                 showDivider: false
@@ -219,6 +219,7 @@ struct AccountView: View {
             LicensingDetailView()
                 .environmentObject(taskService)
                 .environmentObject(accentColorManager)
+                .environmentObject(CalendarSyncManager.shared)
         }
     }
 

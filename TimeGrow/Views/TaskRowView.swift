@@ -53,7 +53,7 @@ struct TaskRow: View {
                         Haptics.impact(.light)
                         editAction()
                     }
-                    Button("Автотрекінг") {
+                    Button("Auto-tracking") {
                         Haptics.impact(.light)
                         autoTrackAction()
                     }

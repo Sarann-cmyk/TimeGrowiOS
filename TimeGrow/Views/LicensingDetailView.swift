@@ -9,9 +9,10 @@ import SwiftUI
 /// account sign-in already used for sync, plus a placeholder activation code field.
 struct LicensingDetailView: View {
     @EnvironmentObject private var accentColorManager: AccentColorManager
+    @EnvironmentObject private var taskService: TaskService
+    @EnvironmentObject private var calendarSyncManager: CalendarSyncManager
     @Environment(\.dismiss) private var dismiss
 
-    @AppStorage("settings.calendarSyncStub") private var isCalendarSyncEnabled = false
     @State private var activationCode = ""
     @State private var showActivationAlert = false
 
@@ -20,10 +21,10 @@ struct LicensingDetailView: View {
             VStack(alignment: .leading, spacing: 18) {
                 topBar
 
-                settingsSectionHeader("ACCOUNT")
+                settingsSectionHeader(LanguageManager.localized("ACCOUNT"))
                 AppleAccountCard()
 
-                settingsSectionHeader("ACTIVATION")
+                settingsSectionHeader(LanguageManager.localized("ACTIVATION"))
                 settingsGroup {
                     HStack(spacing: 12) {
                         settingsIcon("key.fill", color: .purple)
@@ -48,17 +49,20 @@ struct LicensingDetailView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 4)
 
-                settingsSectionHeader("CALENDAR")
+                settingsSectionHeader(LanguageManager.localized("CALENDAR"))
                 settingsGroup {
                     SettingsToggleRow(
                         icon: "calendar.badge.clock",
                         iconColor: .red,
-                        title: "Sync with Apple Calendar",
-                        isOn: $isCalendarSyncEnabled,
+                        title: LanguageManager.localized("Sync with Apple Calendar"),
+                        isOn: calendarSyncBinding,
                         showDivider: false
                     )
                 }
-                Text("Not wired up yet — this only remembers your preference until calendar sync is implemented.")
+                Text(calendarSyncManager.statusMessage
+                     ?? (calendarSyncManager.isEnabled
+                         ? LanguageManager.localized("Timeline sessions are mirrored to the separate TimeGrow calendar. Turning this off removes those mirrored events.")
+                         : LanguageManager.localized("Turn this on to mirror Timeline sessions to a separate TimeGrow calendar.")))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -89,6 +93,13 @@ struct LicensingDetailView: View {
         .preferredColorScheme(.dark)
     }
 
+    private var calendarSyncBinding: Binding<Bool> {
+        Binding(
+            get: { calendarSyncManager.isEnabled },
+            set: { calendarSyncManager.setEnabled($0, taskService: taskService) }
+        )
+    }
+
     private var topBar: some View {
         HStack(spacing: 10) {
             Button {
@@ -117,5 +128,6 @@ struct LicensingDetailView: View {
     LicensingDetailView()
         .environmentObject(TaskService())
         .environmentObject(AccentColorManager())
+        .environmentObject(CalendarSyncManager.shared)
         .preferredColorScheme(.dark)
 }

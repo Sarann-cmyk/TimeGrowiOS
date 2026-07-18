@@ -58,7 +58,7 @@ struct AccentColorPickerSheet: View {
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(isSelected ? "Selected accent color" : hex)
+        .accessibilityLabel(isSelected ? LanguageManager.localized("Selected accent color") : hex)
     }
 }
 

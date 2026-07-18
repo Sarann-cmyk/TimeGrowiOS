@@ -217,7 +217,7 @@ struct TaskReportDetailView: View {
                     .padding(.horizontal, 8)
 
                 if groups.isEmpty {
-                    placeholderCard("No sessions")
+                    placeholderCard(LanguageManager.localized("No sessions"))
                         .padding(.horizontal, 8)
                 } else {
                     ForEach(groups) { group in
@@ -286,6 +286,8 @@ struct TaskReportDetailView: View {
                     Text(candidate.title)
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(period == candidate ? .white : .secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
                         .frame(maxWidth: .infinity)
                         .frame(height: 34)
                         .background {
@@ -406,9 +408,9 @@ struct TaskReportDetailView: View {
 
     private var periodNavigator: some View {
         HStack(spacing: 8) {
-            navigatorPill(text: ReportDateMath.neighborLabel(period, referenceDate: referenceDate, offset: -1, calendar: calendar), isEnabled: true) { step(-1) }
+            navigatorPill(text: ReportDateMath.neighborLabel(period, referenceDate: referenceDate, offset: -1, calendar: calendar, locale: locale), isEnabled: true) { step(-1) }
 
-            Text(ReportDateMath.periodLabel(period, referenceDate: referenceDate, calendar: calendar))
+            Text(ReportDateMath.periodLabel(period, referenceDate: referenceDate, calendar: calendar, locale: locale))
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(.white)
                 .lineLimit(1)
@@ -417,7 +419,7 @@ struct TaskReportDetailView: View {
                 .padding(.vertical, 10)
                 .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(task.color))
 
-            navigatorPill(text: ReportDateMath.neighborLabel(period, referenceDate: referenceDate, offset: 1, calendar: calendar), isEnabled: !isCurrentPeriod) { step(1) }
+            navigatorPill(text: ReportDateMath.neighborLabel(period, referenceDate: referenceDate, offset: 1, calendar: calendar, locale: locale), isEnabled: !isCurrentPeriod) { step(1) }
         }
     }
 
@@ -481,7 +483,7 @@ struct TaskReportDetailView: View {
         let divisor = ReportDateMath.averageDivisor(for: period, referenceDate: referenceDate, calendar: calendar)
         let average = total / Double(divisor)
         return HStack(alignment: .top, spacing: 0) {
-            statColumn(title: "Time Tracked", value: ReportDateMath.formatDuration(total))
+            statColumn(title: LanguageManager.localized("Time Tracked"), value: ReportDateMath.formatDuration(total))
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             chartStylePicker
@@ -658,7 +660,7 @@ struct TaskReportDetailView: View {
                 .foregroundStyle(Color.white.opacity(0.45))
         case .week:
             VStack(spacing: 2) {
-                Text(ReportFormatters.weekday.string(from: date).uppercased())
+                Text(ReportFormatters.weekday(locale: locale).string(from: date).uppercased())
                 Text(ReportFormatters.day.string(from: date))
             }
             .font(.system(size: 10, weight: .medium))
@@ -668,7 +670,7 @@ struct TaskReportDetailView: View {
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(Color.white.opacity(0.45))
         case .year:
-            Text(ReportFormatters.monthShort.string(from: date))
+            Text(ReportFormatters.monthShort(locale: locale).string(from: date))
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(Color.white.opacity(0.45))
         }
@@ -747,7 +749,7 @@ struct TaskReportDetailView: View {
                 Text(task.name)
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(task.color)
-                Text(session.notes?.isEmpty == false ? session.notes! : "No notes")
+                Text(session.notes?.isEmpty == false ? session.notes! : LanguageManager.localized("No notes"))
                     .font(.system(size: 15))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -826,8 +828,8 @@ struct TaskReportDetailView: View {
     private func writeShareFile(at date: Date) -> IdentifiableURL? {
         let total = totalSeconds(at: date)
         let divisor = ReportDateMath.averageDivisor(for: period, referenceDate: referenceDate, calendar: calendar)
-        var text = "TimeGrow — \(task.name) — \(ReportDateMath.periodLabel(period, referenceDate: referenceDate, calendar: calendar))\n\n"
-        text += "Time Tracked: \(ReportDateMath.formatDuration(total))\n"
+        var text = "TimeGrow — \(task.name) — \(ReportDateMath.periodLabel(period, referenceDate: referenceDate, calendar: calendar, locale: locale))\n\n"
+        text += "\(LanguageManager.localized("Time Tracked")): \(ReportDateMath.formatDuration(total))\n"
         text += "\(period.averageLabel): \(ReportDateMath.formatDuration(total / Double(divisor)))\n"
 
         let fileNameFormatter = DateFormatter()

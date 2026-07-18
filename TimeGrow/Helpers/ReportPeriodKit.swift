@@ -13,15 +13,15 @@ enum ReportPeriod: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .day: "Day"
-        case .week: "Week"
-        case .month: "Month"
-        case .year: "Year"
+        case .day: LanguageManager.localized("Day")
+        case .week: LanguageManager.localized("Week")
+        case .month: LanguageManager.localized("Month")
+        case .year: LanguageManager.localized("Year")
         }
     }
 
     var averageLabel: String {
-        self == .year ? "Monthly Avg." : "Daily Avg."
+        LanguageManager.localized(self == .year ? "Monthly Avg." : "Daily Avg.")
     }
 }
 
@@ -47,16 +47,18 @@ enum SessionListDisplaySettings {
     static func title(for seconds: Int) -> String {
         switch seconds {
         case 0:
-            return "Show all"
+            return LanguageManager.localized("Show all")
         case 60:
-            return "1 minute"
+            return LanguageManager.localized("1 minute")
         default:
-            return "\(seconds / 60) minutes"
+            return String(format: LanguageManager.localized("%d minutes"), seconds / 60)
         }
     }
 
     static func description(for seconds: Int) -> String {
-        seconds == 0 ? "All session records are visible." : "Hide sessions shorter than \(title(for: seconds))."
+        seconds == 0
+            ? LanguageManager.localized("All session records are visible.")
+            : String(format: LanguageManager.localized("Hide sessions shorter than %@."), title(for: seconds))
     }
 }
 
@@ -99,17 +101,28 @@ enum WeekStartSettings {
 }
 
 enum ReportFormatters {
-    static let dayTitle: DateFormatter = { let f = DateFormatter(); f.locale = .current; f.dateFormat = "d MMMM yyyy"; return f }()
-    static let shortDate: DateFormatter = { let f = DateFormatter(); f.locale = .current; f.dateFormat = "d MMM"; return f }()
-    static let monthTitle: DateFormatter = { let f = DateFormatter(); f.locale = .current; f.dateFormat = "LLLL yyyy"; return f }()
-    static let monthShort: DateFormatter = { let f = DateFormatter(); f.locale = .current; f.dateFormat = "LLL"; return f }()
     static let year: DateFormatter = { let f = DateFormatter(); f.locale = .current; f.dateFormat = "yyyy"; return f }()
     static let hour: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH"; return f }()
-    static let weekday: DateFormatter = { let f = DateFormatter(); f.locale = .current; f.dateFormat = "EEE"; return f }()
     static let day: DateFormatter = { let f = DateFormatter(); f.dateFormat = "d"; return f }()
     static let time: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
-    static let weekdayFull: DateFormatter = { let f = DateFormatter(); f.locale = .current; f.dateFormat = "EEEE"; return f }()
-    static let monthDay: DateFormatter = { let f = DateFormatter(); f.locale = .current; f.dateFormat = "MMMM d"; return f }()
+
+    /// These render month/weekday names, so — unlike the numeric-only formatters above — they
+    /// take the app's selected language explicitly instead of defaulting to `.current`, matching
+    /// the rest of the UI's independent in-app language switch (see `LanguageManager`).
+    static func dayTitle(locale: Locale) -> DateFormatter { formatter("d MMMM yyyy", locale: locale) }
+    static func shortDate(locale: Locale) -> DateFormatter { formatter("d MMM", locale: locale) }
+    static func monthTitle(locale: Locale) -> DateFormatter { formatter("LLLL yyyy", locale: locale) }
+    static func monthShort(locale: Locale) -> DateFormatter { formatter("LLL", locale: locale) }
+    static func weekday(locale: Locale) -> DateFormatter { formatter("EEE", locale: locale) }
+    static func weekdayFull(locale: Locale) -> DateFormatter { formatter("EEEE", locale: locale) }
+    static func monthDay(locale: Locale) -> DateFormatter { formatter("MMMM d", locale: locale) }
+
+    private static func formatter(_ dateFormat: String, locale: Locale) -> DateFormatter {
+        let f = DateFormatter()
+        f.locale = locale
+        f.dateFormat = dateFormat
+        return f
+    }
 }
 
 enum ReportDateMath {
@@ -143,33 +156,38 @@ enum ReportDateMath {
         calendar.date(byAdding: component(for: period), value: delta, to: referenceDate) ?? referenceDate
     }
 
-    static func periodLabel(_ period: ReportPeriod, referenceDate: Date, calendar: Calendar) -> String {
+    static func periodLabel(_ period: ReportPeriod, referenceDate: Date, calendar: Calendar, locale: Locale) -> String {
         let bounds = range(for: period, containing: referenceDate, calendar: calendar)
         switch period {
         case .day:
-            if calendar.isDateInToday(referenceDate) { return "Today" }
-            return ReportFormatters.dayTitle.string(from: referenceDate)
+            if calendar.isDateInToday(referenceDate) { return LanguageManager.localized("Today") }
+            return ReportFormatters.dayTitle(locale: locale).string(from: referenceDate)
         case .week:
             let weekNumber = calendar.component(.weekOfYear, from: referenceDate)
             let end = calendar.date(byAdding: .day, value: 6, to: bounds.start) ?? bounds.start
-            return "Week \(weekNumber) (\(ReportFormatters.shortDate.string(from: bounds.start)) – \(ReportFormatters.shortDate.string(from: end)))"
+            return String(
+                format: LanguageManager.localized("Week %d (%@ – %@)"),
+                weekNumber,
+                ReportFormatters.shortDate(locale: locale).string(from: bounds.start),
+                ReportFormatters.shortDate(locale: locale).string(from: end)
+            )
         case .month:
-            return ReportFormatters.monthTitle.string(from: referenceDate).capitalized
+            return ReportFormatters.monthTitle(locale: locale).string(from: referenceDate).capitalized
         case .year:
             return ReportFormatters.year.string(from: referenceDate)
         }
     }
 
-    static func neighborLabel(_ period: ReportPeriod, referenceDate: Date, offset: Int, calendar: Calendar) -> String {
+    static func neighborLabel(_ period: ReportPeriod, referenceDate: Date, offset: Int, calendar: Calendar, locale: Locale) -> String {
         guard let neighbor = neighborDate(period, referenceDate: referenceDate, offset: offset, calendar: calendar) else { return "" }
         switch period {
         case .day:
-            return ReportFormatters.shortDate.string(from: neighbor)
+            return ReportFormatters.shortDate(locale: locale).string(from: neighbor)
         case .week:
             let weekNumber = calendar.component(.weekOfYear, from: neighbor)
-            return "Week \(weekNumber)"
+            return String(format: LanguageManager.localized("Week %d"), weekNumber)
         case .month:
-            return ReportFormatters.monthShort.string(from: neighbor)
+            return ReportFormatters.monthShort(locale: locale).string(from: neighbor)
         case .year:
             return ReportFormatters.year.string(from: neighbor)
         }

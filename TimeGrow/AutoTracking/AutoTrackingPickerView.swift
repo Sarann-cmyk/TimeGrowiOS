@@ -23,15 +23,15 @@ struct AutoTrackingPickerView: View {
                     permissionPrompt
                 }
             }
-            .navigationTitle("Автотрекінг")
+            .navigationTitle("Auto-tracking")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Скасувати") { dismiss() }
+                    Button("Cancel") { dismiss() }
                 }
                 if autoTrackingStore.authorizationStatus == .approved {
                     ToolbarItem(placement: .confirmationAction) {
-                        Button("Готово") {
+                        Button("Done") {
                             if let taskID = task.id {
                                 autoTrackingStore.saveSelection(selection, for: taskID)
                             }
@@ -55,7 +55,7 @@ struct AutoTrackingPickerView: View {
                 .font(.system(size: 40, weight: .medium))
                 .foregroundStyle(.secondary)
 
-            Text("Щоб автоматично стартувати «\(task.name)», коли ви відкриваєте вибрані застосунки, дозвольте доступ до Screen Time.")
+            Text("To automatically start “\(task.name)” when you open the selected apps, allow access to Screen Time.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 32)
@@ -70,7 +70,7 @@ struct AutoTrackingPickerView: View {
                 if isRequestingAuthorization {
                     ProgressView()
                 } else {
-                    Text("Надати дозвіл")
+                    Text("Grant Access")
                 }
             }
             .buttonStyle(.borderedProminent)

@@ -56,7 +56,11 @@ final class TaskService: NSObject, ObservableObject {
     @Published private(set) var tasks: [TGTask] = [] {
         didSet { LiveActivityManager.shared.reconcile(tasks: tasks) }
     }
-    @Published private(set) var sessions: [TaskTimeSession] = []
+    @Published private(set) var sessions: [TaskTimeSession] = [] {
+        didSet {
+            CalendarSyncManager.shared.observeSessions(sessions, userID: currentUser?.uid, taskService: self)
+        }
+    }
     @Published private(set) var devices: [String: UserDeviceHeartbeat] = [:]
     @Published private(set) var trackingSettings: TrackingSettings = .defaults
     @Published private(set) var pendingStops: [String: AutoTrackPendingStop] = [:]
@@ -495,6 +499,7 @@ final class TaskService: NSObject, ObservableObject {
         guard let uid = currentUser?.uid, let sessionID = session.id else { return }
 
         sessions.removeAll { $0.id == sessionID }
+        CalendarSyncManager.shared.removeSession(sessionID, userID: uid)
         if let taskIndex = tasks.firstIndex(where: { $0.activeSessionID == sessionID }) {
             tasks[taskIndex].timerStartedAt = nil
             tasks[taskIndex].activeSessionID = nil
@@ -956,6 +961,16 @@ final class TaskService: NSObject, ObservableObject {
         return snapshot.documents
             .compactMap { try? $0.data(as: TaskTimeSession.self) }
             .filter { ($0.endedAt ?? endDate) > startDate }
+    }
+
+    /// Calendar export needs the same complete history a user can navigate to in Timeline, not
+    /// only the 30-day live-listener cache.
+    func fetchAllSessionsForCalendarSync() async throws -> [TaskTimeSession] {
+        guard let uid = currentUser?.uid else { return [] }
+        let snapshot = try await sessionsCollection(for: uid)
+            .order(by: "startedAt", descending: true)
+            .getDocuments()
+        return snapshot.documents.compactMap { try? $0.data(as: TaskTimeSession.self) }
     }
 
     private func importTasks(_ tasksToImport: [TGTask], into uid: String) async {

@@ -10,7 +10,7 @@ struct TimelineTabView: View {
         case day, week
 
         var id: String { rawValue }
-        var title: String { self == .day ? "Day" : "Week" }
+        var title: String { LanguageManager.localized(self == .day ? "Day" : "Week") }
     }
 
     @EnvironmentObject private var taskService: TaskService
@@ -25,7 +25,10 @@ struct TimelineTabView: View {
     @AppStorage(SessionListDisplaySettings.minimumDurationKey) private var sessionListMinimumDuration = SessionListDisplaySettings.defaultMinimumDuration
 
     private var calendar: Calendar { WeekStartSettings.calendar }
-    private let hourHeight: CGFloat = 64
+    // Day mode favors legibility and touch targets; Week retains the denser overview scale.
+    private let dayHourHeight: CGFloat = 96
+    private let weekHourHeight: CGFloat = 64
+    private var hourHeight: CGFloat { scope == .day ? dayHourHeight : weekHourHeight }
     private let leadingLabelWidth: CGFloat = 46
 
     private func dayBounds(for day: Date) -> (start: Date, end: Date) {
@@ -137,7 +140,9 @@ struct TimelineTabView: View {
     }
 
     private var subtitle: String {
-        selectedDate.formatted(.dateTime.weekday(.wide).month(.wide).day().locale(locale))
+        let text = selectedDate.formatted(.dateTime.weekday(.wide).month(.wide).day().locale(locale))
+        guard let first = text.first else { return text }
+        return first.uppercased() + text.dropFirst()
     }
 
     private var scopePicker: some View {
@@ -151,6 +156,8 @@ struct TimelineTabView: View {
                     Text(candidate.title)
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(scope == candidate ? accentColorManager.color : Color.white.opacity(0.7))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
                         .padding(.horizontal, 14)
                         .frame(height: 34)
                         .background {

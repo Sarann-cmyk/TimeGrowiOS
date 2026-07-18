@@ -288,6 +288,8 @@ struct ContentView: View {
 
                         Text(tab.title)
                             .font(.system(size: 12, weight: .semibold))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
                     }
                     .foregroundStyle(selectedTab == tab ? accentColorManager.color : .white)
                     .frame(maxWidth: .infinity, minHeight: 62)

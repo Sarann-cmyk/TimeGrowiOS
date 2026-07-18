@@ -74,11 +74,13 @@ struct TimeGrowApp: App {
     @StateObject private var autoTrackingStore = AutoTrackingStore()
     @StateObject private var accentColorManager = AccentColorManager()
     @StateObject private var languageManager = LanguageManager()
+    @StateObject private var calendarSyncManager = CalendarSyncManager.shared
     @State private var pendingLiveActivityToggleTaskID: String?
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
         FirebaseApp.configure()
+        HangDetector.start()
         LiveActivityManager.shared.startObservingPushToStartTokens()
         _taskService = StateObject(wrappedValue: TaskService())
     }
@@ -90,6 +92,7 @@ struct TimeGrowApp: App {
                 .environmentObject(autoTrackingStore)
                 .environmentObject(accentColorManager)
                 .environmentObject(languageManager)
+                .environmentObject(calendarSyncManager)
                 .environment(\.locale, languageManager.locale)
                 .onAppear {
                     DiagnosticsLog.log(

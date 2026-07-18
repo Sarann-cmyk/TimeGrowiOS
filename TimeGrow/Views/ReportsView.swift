@@ -271,6 +271,8 @@ struct ReportsView: View {
                         Text(candidate.title)
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(period == candidate ? .white : .secondary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
                             .frame(maxWidth: .infinity)
                             .frame(height: 34)
                             .background {
@@ -379,9 +381,9 @@ struct ReportsView: View {
             return date.formatted(.dateTime.day().month(.abbreviated).locale(locale))
         case .week:
             let week = calendar.component(.weekOfYear, from: date)
-            guard selected else { return "Week \(week)" }
+            guard selected else { return String(format: LanguageManager.localized("Week %d"), week) }
             let end = calendar.date(byAdding: .day, value: 6, to: date) ?? date
-            return "Week \(week) (\(shortDate(date)) - \(shortDate(end)))"
+            return String(format: LanguageManager.localized("Week %d (%@ – %@)"), week, shortDate(date), shortDate(end))
         case .month:
             return date.formatted(.dateTime.month(.wide).year().locale(locale))
         case .year:
@@ -411,11 +413,11 @@ struct ReportsView: View {
 
     private func summarySection(total: TimeInterval) -> some View {
         HStack(alignment: .top, spacing: 0) {
-            summaryMetric(title: "Time Tracked", value: durationText(total), centered: true)
+            summaryMetric(title: LanguageManager.localized("Time Tracked"), value: durationText(total), centered: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             summaryMetric(
-                title: period == .year ? "Monthly Avg." : "Daily Avg.",
+                title: period.averageLabel,
                 value: durationText(averageSeconds(total: total)),
                 centered: true
             )
@@ -598,8 +600,8 @@ struct ReportsView: View {
 
     private func busiestDateLabel(_ date: Date) -> String {
         period == .year
-            ? ReportFormatters.monthShort.string(from: date)
-            : ReportFormatters.shortDate.string(from: date)
+            ? ReportFormatters.monthShort(locale: locale).string(from: date)
+            : ReportFormatters.shortDate(locale: locale).string(from: date)
     }
 
     /// Year-only summary strip at the very bottom of the tab — a quick "at a glance" recap
@@ -617,11 +619,11 @@ struct ReportsView: View {
 
             reportCard {
                 HStack(spacing: 0) {
-                    highlightMetric(title: "Active Days", value: "\(activeDays)")
+                    highlightMetric(title: LanguageManager.localized("Active Days"), value: "\(activeDays)")
                         .frame(maxWidth: .infinity, alignment: .center)
-                    highlightMetric(title: "Sessions", value: "\(scoped.count)")
+                    highlightMetric(title: LanguageManager.localized("Sessions"), value: "\(scoped.count)")
                         .frame(maxWidth: .infinity, alignment: .center)
-                    highlightMetric(title: "Longest Session", value: durationText(longestSession))
+                    highlightMetric(title: LanguageManager.localized("Longest Session"), value: durationText(longestSession))
                         .frame(maxWidth: .infinity, alignment: .center)
                 }
                 .padding(.vertical, 14)
@@ -714,7 +716,7 @@ struct ReportsView: View {
                 Text(session.taskName)
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(session.color)
-                Text(session.notes?.isEmpty == false ? session.notes! : "No notes")
+                Text(session.notes?.isEmpty == false ? session.notes! : LanguageManager.localized("No notes"))
                     .font(.system(size: 15))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -908,12 +910,12 @@ struct ReportsView: View {
     private func writeShareFile(at date: Date) -> IdentifiableURL? {
         let entries = taskEntries(displaySessions, at: date)
         let total = entries.reduce(0) { $0 + $1.seconds }
-        var text = "TimeGrow - \(ReportDateMath.periodLabel(period, referenceDate: referenceDate, calendar: calendar))\n\n"
-        text += "Time Tracked: \(durationText(total))\n"
+        var text = "TimeGrow - \(ReportDateMath.periodLabel(period, referenceDate: referenceDate, calendar: calendar, locale: locale))\n\n"
+        text += "\(LanguageManager.localized("Time Tracked")): \(durationText(total))\n"
         text += "\(period.averageLabel): \(durationText(averageSeconds(total: total)))\n\n"
-        text += "By tasks:\n"
+        text += "\(LanguageManager.localized("By tasks:"))\n"
         if entries.isEmpty {
-            text += "  (no time tracked)\n"
+            text += "  \(LanguageManager.localized("(no time tracked)"))\n"
         } else {
             for entry in entries {
                 text += "  \(entry.title): \(durationText(entry.seconds))\n"
@@ -1018,7 +1020,7 @@ private struct ReportsActivityTimelineView: View {
         case .month:
             return ReportFormatters.day.string(from: date)
         case .year:
-            return ReportFormatters.monthShort.string(from: date)
+            return ReportFormatters.monthShort(locale: locale).string(from: date)
         }
     }
 }
@@ -1160,7 +1162,7 @@ private struct ReportsStackedBarChart: View {
                                 Text(String(calendar.component(.day, from: column.date)))
                             }
                         } else if period == .year {
-                            Text(ReportFormatters.monthShort.string(from: column.date))
+                            Text(ReportFormatters.monthShort(locale: locale).string(from: column.date))
                         } else {
                             Text(" ")
                         }

@@ -14,6 +14,12 @@ export interface ApnsCredentials {
   useSandbox: boolean;
 }
 
+/** APNs accepted a request; this is not a device-delivery guarantee. */
+export interface ApnsResponse {
+  status: number;
+  apnsID?: string;
+}
+
 interface CachedToken {
   value: string;
   issuedAt: number;
@@ -58,6 +64,8 @@ interface LiveActivityPayload {
   contentState: Record<string, unknown>;
   attributesType?: string;
   attributes?: Record<string, unknown>;
+  /** On iOS/iPadOS 18+, ask a push-started activity to issue its update/end token. */
+  inputPushToken?: 1;
   // Required by ActivityKit for a remote `start` event. Without it APNs may accept the request
   // but iOS can decline to materialize the Live Activity.
   alert?: {
@@ -73,7 +81,7 @@ function sendRaw(
   deviceToken: string,
   body: string,
   headers: { topic: string; pushType: string; priority: "5" | "10" }
-): Promise<void> {
+): Promise<ApnsResponse> {
   return new Promise((resolve, reject) => {
     const host = creds.useSandbox ? APNS_HOST_SANDBOX : APNS_HOST_PRODUCTION;
     const client = session(host);
@@ -90,8 +98,11 @@ function sendRaw(
 
     let status = 0;
     let responseBody = "";
+    let apnsID: string | undefined;
     req.on("response", (responseHeaders) => {
       status = Number(responseHeaders[":status"] ?? 0);
+      const value = responseHeaders["apns-id"];
+      apnsID = Array.isArray(value) ? value[0] : value;
     });
     req.setEncoding("utf8");
     req.on("data", (chunk) => {
@@ -99,7 +110,7 @@ function sendRaw(
     });
     req.on("end", () => {
       if (status >= 200 && status < 300) {
-        resolve();
+        resolve({ status, apnsID });
       } else {
         reject(new Error(`APNs responded ${status}: ${responseBody}`));
       }
@@ -109,7 +120,7 @@ function sendRaw(
   });
 }
 
-function send(creds: ApnsCredentials, deviceToken: string, payload: LiveActivityPayload): Promise<void> {
+function send(creds: ApnsCredentials, deviceToken: string, payload: LiveActivityPayload): Promise<ApnsResponse> {
   const aps: Record<string, unknown> = {
     timestamp: Math.floor(Date.now() / 1000),
     event: payload.event,
@@ -117,6 +128,7 @@ function send(creds: ApnsCredentials, deviceToken: string, payload: LiveActivity
   };
   if (payload.attributesType) aps["attributes-type"] = payload.attributesType;
   if (payload.attributes) aps["attributes"] = payload.attributes;
+  if (payload.inputPushToken) aps["input-push-token"] = payload.inputPushToken;
   if (payload.alert) aps.alert = payload.alert;
   if (payload.dismissalDate) aps["dismissal-date"] = payload.dismissalDate;
 
@@ -134,7 +146,7 @@ export function sendLiveActivityStart(
   attributesType: string,
   attributes: Record<string, unknown>,
   contentState: Record<string, unknown>
-): Promise<void> {
+): Promise<ApnsResponse> {
   const taskName = typeof attributes.taskName === "string" && attributes.taskName.trim()
     ? attributes.taskName.trim()
     : "Task";
@@ -143,6 +155,9 @@ export function sendLiveActivityStart(
     contentState,
     attributesType,
     attributes,
+    // Push-to-start otherwise gives the server only the one-use start token. Request a
+    // per-activity token so the app can upload it and a later `end` push works while suspended.
+    inputPushToken: 1,
     // ActivityKit requires an alert for a remotely started Live Activity. Besides informing the
     // user, its presence makes this a valid start payload rather than an APNs-accepted no-op.
     alert: {
@@ -160,7 +175,7 @@ export function sendLiveActivityUpdate(
   creds: ApnsCredentials,
   activityPushToken: string,
   contentState: Record<string, unknown>
-): Promise<void> {
+): Promise<ApnsResponse> {
   return send(creds, activityPushToken, { event: "update", contentState });
 }
 
@@ -169,7 +184,7 @@ export function sendLiveActivityEnd(
   creds: ApnsCredentials,
   activityPushToken: string,
   contentState: Record<string, unknown>
-): Promise<void> {
+): Promise<ApnsResponse> {
   return send(creds, activityPushToken, {
     event: "end",
     contentState,
@@ -183,7 +198,7 @@ export function sendLiveActivityEnd(
  * ActivityKit push-to-start channel. Uses the app's bare bundle ID as topic and
  * `apns-push-type: background` — a different channel from the Live Activity push above.
  */
-export function sendBackgroundWake(creds: ApnsCredentials, apnsDeviceToken: string): Promise<void> {
+export function sendBackgroundWake(creds: ApnsCredentials, apnsDeviceToken: string): Promise<ApnsResponse> {
   const body = JSON.stringify({ aps: { "content-available": 1 } });
   return sendRaw(creds, apnsDeviceToken, body, {
     topic: creds.bundleId,

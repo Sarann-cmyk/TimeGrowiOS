@@ -44,6 +44,9 @@ interface TaskDoc {
   name?: string;
   colorHex?: string;
   timerStartedAt?: Timestamp;
+  activeSessionID?: string;
+  timerOwnerPlatform?: string;
+  timerOwnerLastAliveAt?: Timestamp;
   autoTrackSessionStartedAt?: Timestamp;
   autoTrackLiveUntil?: Timestamp;
   autoTrackStoppedAt?: Timestamp;
@@ -96,6 +99,10 @@ function contentState(startedAt: Date, now: Date = new Date()): Record<string, n
 }
 
 const AUTO_TRACK_LIVE_GRACE_MS = 180_000;
+// Mac writes both the device and owned-timer heartbeat every few seconds. Two minutes tolerates
+// short network stalls, but ensures force-quit/crash cannot leave an automatic session running
+// until somebody later opens TimeGrow on an iPhone.
+const INTERRUPTED_MAC_AUTO_TIMER_GRACE_MS = 120_000;
 const MAX_CLIENT_EVENT_AGE_MS = 24 * 60 * 60 * 1_000;
 const MAX_CLIENT_FUTURE_SKEW_MS = 60_000;
 
@@ -261,9 +268,9 @@ export const onTaskTimerChanged = onDocumentUpdated(
         await Promise.all(
           startTokensByDoc.map(({ doc, token }) =>
             sendLiveActivityStart(creds, token, ATTRIBUTES_TYPE, attributes, state)
-              .then(() => console.log(`push-to-start sent OK (task ${taskID}, device token ${token})`))
+              .then((response) => console.log(`push-to-start accepted by APNs (task ${taskID}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
               .catch(async (error) => {
-                console.error(`push-to-start failed (task ${taskID}, device token ${token})`, error);
+                console.error(`push-to-start failed (task ${taskID}, token ${tokenHint(token)})`, error);
                 // Apple returns 410 "Unregistered" for a token that no longer resolves to any
                 // installed app instance (e.g. a stale token left over from a previous install).
                 // Clearing it here keeps future writes from repeatedly retrying dead tokens.
@@ -285,8 +292,8 @@ export const onTaskTimerChanged = onDocumentUpdated(
       await Promise.all(
         wakeTokens.map((token) =>
           sendBackgroundWake(creds, token)
-            .then(() => console.log(`background wake sent OK (task ${taskID}, device token ${token})`))
-            .catch((error) => console.error(`background wake failed (task ${taskID}, device token ${token})`, error))
+            .then((response) => console.log(`background wake accepted by APNs (task ${taskID}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
+            .catch((error) => console.error(`background wake failed (task ${taskID}, token ${tokenHint(token)})`, error))
         )
       );
       return;
@@ -424,11 +431,96 @@ export const refreshLiveActivities = onSchedule(
           return;
         }
 
-        await sendLiveActivityEnd(creds, token, contentState(now)).catch((error) =>
-          console.error(`scheduled end push failed (${doc.ref.path})`, error)
-        );
+        await sendLiveActivityEnd(creds, token, contentState(now))
+          .then((response) => console.log(`scheduled Live Activity end accepted by APNs (task ${doc.ref.path}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
+          .catch((error) => console.error(`scheduled Live Activity end push failed (task ${doc.ref.path}, token ${tokenHint(token)})`, error));
         await doc.ref.update({ liveActivityPushToken: admin.firestore.FieldValue.delete() });
       })
     );
+  }
+);
+
+/**
+ * A force-quit or crash cannot run macOS's graceful `applicationWillTerminate` stop path.
+ * Close only automatic Mac-owned sessions after a conservative heartbeat grace; manual timers
+ * deliberately survive app/device inactivity and must remain untouched. Updating the task
+ * triggers `onTaskTimerChanged`, which sends the ActivityKit end push to every affected iPhone.
+ */
+export const closeInterruptedMacAutoTimers = onSchedule(
+  { schedule: "every 1 minutes" },
+  async () => {
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - INTERRUPTED_MAC_AUTO_TIMER_GRACE_MS);
+    // Avoid a collection-group index dependency here. A per-user subcollection query uses
+    // Firestore's normal automatic single-field index and is sufficient for this scheduled
+    // recovery path; only users with a Mac-owned timer contribute a candidate.
+    const users = await db.collection("users").get();
+    const taskSnapshots = await Promise.all(users.docs.map((user) =>
+      user.ref.collection("tasks").where("timerOwnerPlatform", "==", "macOS").get()
+    ));
+    const candidates = taskSnapshots.flatMap((snapshot) => snapshot.docs);
+
+    let closed = 0;
+    await Promise.all(candidates.map(async (taskSnapshot) => {
+      const task = taskSnapshot.data() as TaskDoc;
+      const heartbeat = task.timerOwnerLastAliveAt?.toDate();
+      if (!task.timerStartedAt || !task.activeSessionID || !heartbeat || heartbeat > cutoff) return;
+
+      const userRef = taskSnapshot.ref.parent.parent;
+      if (!userRef) return;
+
+      try {
+        const didClose = await db.runTransaction(async (transaction) => {
+          const currentTaskSnapshot = await transaction.get(taskSnapshot.ref);
+          const currentTask = currentTaskSnapshot.data() as TaskDoc | undefined;
+          const currentHeartbeat = currentTask?.timerOwnerLastAliveAt?.toDate();
+          const startedAt = currentTask?.timerStartedAt?.toDate();
+          const sessionID = currentTask?.activeSessionID;
+          if (!currentTask
+              || currentTask.timerOwnerPlatform !== "macOS"
+              || !startedAt
+              || !sessionID
+              || !currentHeartbeat
+              || currentHeartbeat > cutoff
+              || sessionID !== task.activeSessionID) {
+            return false;
+          }
+
+          const currentSessionRef = userRef.collection("sessions").doc(sessionID);
+          const sessionSnapshot = await transaction.get(currentSessionRef);
+          const session = sessionSnapshot.data() as SessionDoc | undefined;
+          if (!session || session.startedAutomatically !== true || session.endedAt) {
+            return false;
+          }
+
+          const endedAt = new Date(Math.max(startedAt.getTime(), currentHeartbeat.getTime()));
+          transaction.update(taskSnapshot.ref, {
+            timerStartedAt: admin.firestore.FieldValue.delete(),
+            activeSessionID: admin.firestore.FieldValue.delete(),
+            timerOwnerDeviceID: admin.firestore.FieldValue.delete(),
+            timerOwnerPlatform: admin.firestore.FieldValue.delete(),
+            timerOwnerDeviceName: admin.firestore.FieldValue.delete(),
+            timerOwnerLastAliveAt: admin.firestore.FieldValue.delete(),
+            timerOwnerIsActive: admin.firestore.FieldValue.delete(),
+            updatedAt: admin.firestore.Timestamp.fromDate(now),
+          });
+          transaction.update(currentSessionRef, {
+            endedAt: admin.firestore.Timestamp.fromDate(endedAt),
+          });
+          return true;
+        });
+
+        if (didClose) {
+          closed += 1;
+          console.log(`closed interrupted Mac auto timer (task ${taskSnapshot.id}, last heartbeat ${heartbeat.toISOString()})`);
+        }
+      } catch (error) {
+        console.error(`failed to close interrupted Mac auto timer (task ${taskSnapshot.ref.path})`, error);
+      }
+    }));
+
+    if (closed > 0) {
+      console.log(`interrupted Mac auto-timer watchdog closed ${closed} task(s)`);
+    }
   }
 );
