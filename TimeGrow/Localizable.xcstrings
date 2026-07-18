@@ -139,6 +139,7 @@
     },
     "Activate" : {
       "comment" : "A button that activates a license.",
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -174,6 +175,7 @@
     },
     "Activation code" : {
       "comment" : "A label for the activation code field.",
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -191,6 +193,7 @@
     },
     "Activation isn't wired up yet — this is a placeholder for a future licensing flow." : {
       "comment" : "A description of the licensing flow.",
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -507,6 +510,7 @@
     },
     "Coming soon" : {
       "comment" : "A title for an alert that's shown when the user tries to activate a license.",
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -621,7 +625,7 @@
         "uk" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Середнє на день"
+            "value" : "На день"
           }
         }
       }
@@ -930,6 +934,7 @@
     },
     "License activation isn't available yet." : {
       "comment" : "A message displayed in an alert when the user tries to activate a license.",
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -1099,7 +1104,7 @@
         "uk" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Середнє на місяць"
+            "value" : "На місяць"
           }
         }
       }
@@ -1740,7 +1745,7 @@
         "uk" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Відстежений час"
+            "value" : "Відстежено"
           }
         }
       }
@@ -1885,7 +1890,7 @@
         "uk" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Тиждень %d"
+            "value" : "Тиж.%d"
           }
         }
       }
@@ -1903,7 +1908,7 @@
         "uk" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Тиждень %d (%@ – %@)"
+            "value" : "Тиж.%d (%@ – %@)"
           }
         }
       }

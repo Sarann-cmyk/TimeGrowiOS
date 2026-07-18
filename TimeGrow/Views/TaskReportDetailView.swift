@@ -376,9 +376,9 @@ struct TaskReportDetailView: View {
             return date.formatted(.dateTime.day().month(.abbreviated).locale(locale))
         case .week:
             let week = calendar.component(.weekOfYear, from: date)
-            guard selected else { return "Week \(week)" }
+            guard selected else { return String(format: LanguageManager.localized("Week %d"), week) }
             let end = calendar.date(byAdding: .day, value: 6, to: date) ?? date
-            return "Week \(week) (\(shortDate(date)) - \(shortDate(end)))"
+            return String(format: LanguageManager.localized("Week %d (%@ – %@)"), week, shortDate(date), shortDate(end))
         case .month:
             return date.formatted(.dateTime.month(.wide).year().locale(locale))
         case .year:
@@ -496,7 +496,7 @@ struct TaskReportDetailView: View {
     }
 
     private func statColumn(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .center, spacing: 4) {
             Text(title)
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(.secondary)
@@ -699,10 +699,12 @@ struct TaskReportDetailView: View {
                 Text(daySectionHeader(group.day))
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(isSelected ? task.color : .secondary)
+                    .padding(.leading, 16)
                 Spacer()
                 Text(ReportDateMath.formatDuration(dayTotal))
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(isSelected ? task.color : .secondary)
+                    .foregroundStyle(task.color)
+                    .padding(.trailing, 16)
             }
 
             reportCard {

@@ -969,7 +969,7 @@ private struct ReportsActivityTimelineView: View {
                         .frame(height: 10)
 
                     ForEach(segments) { segment in
-                        Capsule()
+                        Rectangle()
                             .fill(segment.color)
                             .frame(width: segmentWidth(segment, totalWidth: geo.size.width), height: 10)
                             .offset(x: segment.startRatio * geo.size.width)
@@ -981,12 +981,27 @@ private struct ReportsActivityTimelineView: View {
 
             GeometryReader { geo in
                 ZStack(alignment: .topLeading) {
-                    ForEach(axisDates, id: \.timeIntervalSince1970) { date in
-                        Text(axisLabel(for: date))
+                    ForEach(Array(axisDates.enumerated()), id: \.offset) { index, date in
+                        let label = Text(axisLabel(for: date))
                             .font(.system(size: 9, weight: .medium))
                             .foregroundStyle(.secondary)
                             .fixedSize()
-                            .position(x: xPosition(for: date, width: geo.size.width), y: 6)
+
+                        // The first/last labels sit exactly at the scale's edges (ratio 0/1), so
+                        // centering them there — like the labels in between — would push half the
+                        // text past the edge. Anchor those two to the edge instead of the center.
+                        if index == 0 {
+                            label
+                                .frame(width: geo.size.width, height: 14, alignment: .leading)
+                                .position(x: geo.size.width / 2, y: 6)
+                        } else if index == axisDates.count - 1 {
+                            label
+                                .frame(width: geo.size.width, height: 14, alignment: .trailing)
+                                .position(x: geo.size.width / 2, y: 6)
+                        } else {
+                            label
+                                .position(x: xPosition(for: date, width: geo.size.width), y: 6)
+                        }
                     }
                 }
             }

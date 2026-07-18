@@ -6,15 +6,12 @@
 import SwiftUI
 
 /// No StoreKit product or trial logic exists yet — this screen only offers the
-/// account sign-in already used for sync, plus a placeholder activation code field.
+/// account sign-in already used for sync.
 struct LicensingDetailView: View {
     @EnvironmentObject private var accentColorManager: AccentColorManager
     @EnvironmentObject private var taskService: TaskService
     @EnvironmentObject private var calendarSyncManager: CalendarSyncManager
     @Environment(\.dismiss) private var dismiss
-
-    @State private var activationCode = ""
-    @State private var showActivationAlert = false
 
     var body: some View {
         ScrollView {
@@ -23,31 +20,6 @@ struct LicensingDetailView: View {
 
                 settingsSectionHeader(LanguageManager.localized("ACCOUNT"))
                 AppleAccountCard()
-
-                settingsSectionHeader(LanguageManager.localized("ACTIVATION"))
-                settingsGroup {
-                    HStack(spacing: 12) {
-                        settingsIcon("key.fill", color: .purple)
-                        TextField("Activation code", text: $activationCode)
-                            .textInputAutocapitalization(.characters)
-                            .autocorrectionDisabled()
-                            .foregroundStyle(.white)
-                        Button("Activate") {
-                            Haptics.impact(.light)
-                            showActivationAlert = true
-                        }
-                        .font(.system(size: 14, weight: .semibold))
-                        .disabled(activationCode.isEmpty)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 12)
-                }
-
-                Text("Activation isn't wired up yet — this is a placeholder for a future licensing flow.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 4)
 
                 settingsSectionHeader(LanguageManager.localized("CALENDAR"))
                 settingsGroup {
@@ -85,11 +57,6 @@ struct LicensingDetailView: View {
                     dismiss()
                 }
         )
-        .alert("Coming soon", isPresented: $showActivationAlert) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("License activation isn't available yet.")
-        }
         .preferredColorScheme(.dark)
     }
 
