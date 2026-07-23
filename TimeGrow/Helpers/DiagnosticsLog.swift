@@ -29,6 +29,8 @@ struct ShareSheet: UIViewControllerRepresentable {
 enum DiagnosticsLog {
     private static let logFileName = "diagnostics.log"
     private static let debugEventsKey = "autoTracking.debugEvents"
+    private static let creditedSecondsKeyPrefix = "autoTracking.creditedSecondsToday."
+    private static let unaccountedSecondsKeyPrefix = "autoTracking.unaccountedSecondsToday."
     private static let maxStoredCharacters = 400_000
     private static let queue = DispatchQueue(label: "TimeGrow.DiagnosticsLog")
 
@@ -65,7 +67,33 @@ enum DiagnosticsLog {
                 result += "\(timestampText) [extension] \(name) task=\(taskID)\n"
             }
         }
+
+        result += autoTrackTotalsSummary()
         return result
+    }
+
+    /// Reads the running daily counters `AutoTrackingExtension` maintains per task — exact
+    /// credited usage versus wall-clock time that produced no credit at all (real pauses or
+    /// delayed/dropped DeviceActivity callbacks) — so a discrepancy against iOS Screen Time can
+    /// be sized directly from the export instead of by diffing raw event timestamps by hand.
+    private static func autoTrackTotalsSummary() -> String {
+        guard let sharedDefaults = UserDefaults(suiteName: autoTrackingAppGroupID) else { return "" }
+        let creditedKeys = sharedDefaults.dictionaryRepresentation().keys.filter { $0.hasPrefix(creditedSecondsKeyPrefix) }
+        guard !creditedKeys.isEmpty else { return "" }
+
+        var summary = "\n--- Auto-track totals today (per task) ---\n"
+        for creditedKey in creditedKeys.sorted() {
+            let taskID = String(creditedKey.dropFirst(creditedSecondsKeyPrefix.count))
+            let credited = sharedDefaults.double(forKey: creditedKey)
+            let unaccounted = sharedDefaults.double(forKey: "\(unaccountedSecondsKeyPrefix)\(taskID)")
+            summary += "task=\(taskID) credited=\(formatDuration(credited)) unaccounted~=\(formatDuration(unaccounted))\n"
+        }
+        return summary
+    }
+
+    private static func formatDuration(_ seconds: Double) -> String {
+        let totalSeconds = Int(seconds.rounded())
+        return "\(totalSeconds / 60)m \(totalSeconds % 60)s"
     }
 
     static func writeExportFile() -> URL? {

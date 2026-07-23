@@ -3,6 +3,7 @@
 //  AutoTrackingExtension
 //
 
+import CryptoKit
 import DeviceActivity
 import FamilyControls
 import Foundation
@@ -20,8 +21,18 @@ private let deviceSecretKey = "autoTracking.deviceSecret"
 private let lastUsageKeyPrefix = "autoTracking.lastUsage."
 private let sessionStartKeyPrefix = "autoTracking.sessionStart."
 private let thresholdSeconds: TimeInterval = 60
-private let inactivityGraceSeconds: TimeInterval = 180
+// Must match `autoTrackingInactivityGraceSeconds` in AutoTrackingStore.swift — same
+// "still one session" window, applied here to session-start bookkeeping instead of Firestore
+// session merging. See that file for why 300s (DeviceActivity delivery delays observed up to 299s).
+private let inactivityGraceSeconds: TimeInterval = 300
 private let minimumDistinctThresholdInterval: TimeInterval = 55
+/// A threshold that takes noticeably longer than ~60s to fire means that stretch of wall-clock
+/// time produced no credited usage — either the app genuinely wasn't used, or iOS delayed/dropped
+/// the callback. 90s gives normal delivery jitter room without hiding real gaps.
+private let thresholdDelayWarningSeconds: TimeInterval = 90
+private let creditedSecondsKeyPrefix = "autoTracking.creditedSecondsToday."
+private let unaccountedSecondsKeyPrefix = "autoTracking.unaccountedSecondsToday."
+private let countersDayKeyPrefix = "autoTracking.countersDay."
 
 final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     override func intervalDidStart(for activity: DeviceActivityName) {
@@ -53,12 +64,20 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         }
 
         let lastQueuedKey = "\(lastQueuedThresholdKeyPrefix)\(resolvedTaskID)"
-        if let previousTimestamp = sharedDefaults.object(forKey: lastQueuedKey) as? Double,
-           occurredAt.timeIntervalSince(Date(timeIntervalSince1970: previousTimestamp)) < minimumDistinctThresholdInterval {
+        let previousQueuedTimestamp = sharedDefaults.object(forKey: lastQueuedKey) as? Double
+        if let previousQueuedTimestamp,
+           occurredAt.timeIntervalSince(Date(timeIntervalSince1970: previousQueuedTimestamp)) < minimumDistinctThresholdInterval {
             appendDebugEvent("eventIgnored:duplicateThreshold", activity: activity)
             rearmMonitoring(after: activity)
             return
         }
+
+        recordThresholdAccounting(
+            taskID: resolvedTaskID,
+            occurredAt: occurredAt,
+            previousQueuedTimestamp: previousQueuedTimestamp,
+            sharedDefaults: sharedDefaults
+        )
 
         var pendingEvents = sharedDefaults.array(forKey: pendingEventsKey) as? [[String: Any]] ?? []
         pendingEvents.append([
@@ -71,6 +90,51 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         let sessionStartedAt = resolveSessionStartedAt(taskID: resolvedTaskID, occurredAt: occurredAt, sharedDefaults: sharedDefaults)
         syncAutoTrackLiveState(taskID: resolvedTaskID, occurredAt: occurredAt, sessionStartedAt: sessionStartedAt, sharedDefaults: sharedDefaults)
         rearmMonitoring(after: activity)
+    }
+
+    private static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.timeZone = .current
+        return formatter
+    }()
+
+    /// Keeps a running daily total of credited usage (exactly `thresholdSeconds` per accepted
+    /// threshold — what `TaskService` turns into a session) alongside a running total of
+    /// wall-clock time that produced no credit at all. `DiagnosticsLog.exportText()` surfaces
+    /// both totals directly so a report of "the numbers don't match Screen Time" doesn't require
+    /// manually diffing timestamps across the whole log.
+    private func recordThresholdAccounting(
+        taskID: String,
+        occurredAt: Date,
+        previousQueuedTimestamp: Double?,
+        sharedDefaults: UserDefaults
+    ) {
+        let today = Self.dayFormatter.string(from: occurredAt)
+        let dayKey = "\(countersDayKeyPrefix)\(taskID)"
+        let creditedKey = "\(creditedSecondsKeyPrefix)\(taskID)"
+        let unaccountedKey = "\(unaccountedSecondsKeyPrefix)\(taskID)"
+
+        if sharedDefaults.string(forKey: dayKey) != today {
+            sharedDefaults.set(0.0, forKey: creditedKey)
+            sharedDefaults.set(0.0, forKey: unaccountedKey)
+            sharedDefaults.set(today, forKey: dayKey)
+        }
+
+        let creditedSeconds = sharedDefaults.double(forKey: creditedKey) + thresholdSeconds
+        sharedDefaults.set(creditedSeconds, forKey: creditedKey)
+
+        guard let previousQueuedTimestamp else { return }
+        let gap = occurredAt.timeIntervalSince(Date(timeIntervalSince1970: previousQueuedTimestamp))
+        guard gap > thresholdDelayWarningSeconds else { return }
+
+        let unaccountedSeconds = sharedDefaults.double(forKey: unaccountedKey) + (gap - thresholdSeconds)
+        sharedDefaults.set(unaccountedSeconds, forKey: unaccountedKey)
+        appendDebugEvent(
+            "thresholdDelay expected=\(Int(thresholdSeconds))s actual=\(Int(gap))s creditedToday=\(Int(creditedSeconds))s unaccountedToday=\(Int(unaccountedSeconds))s",
+            taskID: taskID,
+            occurredAt: occurredAt
+        )
     }
 
     /// Reuses (if within the inactivity grace period) or starts a new session-start timestamp,
@@ -194,10 +258,22 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
             DeviceActivityCenter().stopMonitoring([activity])
             try DeviceActivityCenter().startMonitoring(nextActivity, during: schedule, events: [nextEventName: event])
             sharedDefaults.set(nextActivity.rawValue, forKey: "\(monitoredActivityKeyPrefix)\(taskID)")
-            appendDebugEvent("rearmed:\(nextActivity.rawValue)", activity: activity)
+            // Apple's tokens are opaque — this can never say *which* apps are armed — but the
+            // counts and a fingerprint of the raw selection let a later cross-task comparison
+            // prove (or rule out) a shared/duplicated selection if two unrelated tasks ever fire
+            // together again, instead of only being able to guess.
+            let fingerprint = fingerprint(for: selectionData)
+            appendDebugEvent(
+                "rearmed:\(nextActivity.rawValue) apps=\(selection.applicationTokens.count) categories=\(selection.categoryTokens.count) webDomains=\(selection.webDomainTokens.count) selectionFingerprint=\(fingerprint)",
+                activity: activity
+            )
         } catch {
             appendDebugEvent("rearmFailed:\(error.localizedDescription)", activity: activity)
         }
+    }
+
+    private func fingerprint(for data: Data) -> String {
+        String(SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined().prefix(8))
     }
 
     private func appendDebugEvent(_ name: String, activity: DeviceActivityName) {

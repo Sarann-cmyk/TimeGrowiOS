@@ -19,6 +19,7 @@ struct TaskRow: View {
     var isReorderModeActive: Bool = false
 
     @State private var isShowingActionMenu = false
+    @State private var isShowingDeleteConfirmation = false
 
     var body: some View {
         if isReorderModeActive {
@@ -43,7 +44,7 @@ struct TaskRow: View {
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button(role: .destructive) {
                         Haptics.impact(.rigid)
-                        deleteAction()
+                        isShowingDeleteConfirmation = true
                     } label: {
                         Label("Delete", systemImage: "trash")
                     }
@@ -59,8 +60,16 @@ struct TaskRow: View {
                     }
                     Button("Delete", role: .destructive) {
                         Haptics.impact(.rigid)
+                        isShowingDeleteConfirmation = true
+                    }
+                }
+                .alert("Delete “\(task.name)”?", isPresented: $isShowingDeleteConfirmation) {
+                    Button("Cancel", role: .cancel) {}
+                    Button("Delete", role: .destructive) {
                         deleteAction()
                     }
+                } message: {
+                    Text("This also permanently deletes all its tracked sessions.")
                 }
         }
     }

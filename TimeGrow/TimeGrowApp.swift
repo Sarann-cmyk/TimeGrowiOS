@@ -81,6 +81,7 @@ struct TimeGrowApp: App {
     init() {
         FirebaseApp.configure()
         HangDetector.start()
+        LiveActivityManager.shared.startObservingActivityEnablement()
         LiveActivityManager.shared.startObservingPushToStartTokens()
         _taskService = StateObject(wrappedValue: TaskService())
     }

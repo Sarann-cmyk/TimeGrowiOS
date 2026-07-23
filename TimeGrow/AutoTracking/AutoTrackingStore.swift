@@ -4,6 +4,7 @@
 //
 
 import Combine
+import CryptoKit
 import DeviceActivity
 import FamilyControls
 import Foundation
@@ -12,7 +13,14 @@ import Foundation
 // AutoTrackingExtension targets, and the suite name the extension writes to.
 let autoTrackingAppGroupID = "group.WINNER.ltd.TimeGrow"
 let autoTrackingThresholdSeconds: TimeInterval = 60
-let autoTrackingInactivityGraceSeconds: TimeInterval = 180
+/// How long a gap since the last confirmed minute of usage is still treated as the same
+/// session (same Firestore session record, same live Live Activity). DeviceActivityMonitor's
+/// `eventDidReachThreshold` delivery has no documented upper bound on latency — it's best-effort,
+/// and 180s proved too short: a genuinely continuous TikTok session on 2026-07-21 saw iOS defer
+/// delivery for 299s, splitting one session into two and dropping the Dynamic Island mid-use.
+/// 300s comfortably covers the delays observed so far without being so long it risks merging
+/// genuinely separate sessions.
+let autoTrackingInactivityGraceSeconds: TimeInterval = 300
 /// Sessions shorter than this when stopped are discarded outright (deleted, not just
 /// hidden) — they're accidental taps or auto-tracking blips, not real tracked time.
 let minimumTrackedSessionDuration: TimeInterval = 3
@@ -77,10 +85,8 @@ final class AutoTrackingStore: ObservableObject {
         guard !tasks.isEmpty else { return }
 
         if !didResetMonitoringThisRun {
-            activityCenter.stopMonitoring()
-            monitoredActivitiesByTaskID = [:]
+            adoptExistingMonitoring(for: tasks)
             didResetMonitoringThisRun = true
-            print("Reset all DeviceActivity monitoring for this app run")
         }
 
         for task in tasks {
@@ -101,6 +107,38 @@ final class AutoTrackingStore: ObservableObject {
         }
     }
 
+    /// On the first `refreshMonitoring` call of a launch, DeviceActivity monitoring the
+    /// extension armed before the app was last closed may still be live and mid-way toward its
+    /// next 1-minute threshold. Blindly calling `stopMonitoring()` here (as this used to do)
+    /// discards that in-flight progress for every auto-tracked task on every cold start, which
+    /// compounds into a real chunk of missed usage on days the app gets relaunched often. Adopt
+    /// whatever's still genuinely running and matches the task's current selection instead, and
+    /// only stop what's actually orphaned (stale generation, cleared selection, deleted task).
+    private func adoptExistingMonitoring(for tasks: [TGTask]) {
+        let liveActivityNames = Set(activityCenter.activities.map(\.rawValue))
+        let sharedDefaults = UserDefaults(suiteName: autoTrackingAppGroupID)
+
+        for task in tasks {
+            guard let taskID = task.id, !task.isTimerRunning else { continue }
+            let currentSelection = selection(for: taskID)
+            let hasSelection = !currentSelection.applicationTokens.isEmpty || !currentSelection.categoryTokens.isEmpty || !currentSelection.webDomainTokens.isEmpty
+            guard hasSelection,
+                  let storedActivityName = sharedDefaults?.string(forKey: "\(monitoredActivityKeyPrefix)\(taskID)"),
+                  storedActivityName.hasPrefix("\(taskID)|"),
+                  liveActivityNames.contains(storedActivityName) else { continue }
+
+            monitoredActivitiesByTaskID[taskID] = DeviceActivityName(storedActivityName)
+            DiagnosticsLog.log("autoTrack", "adopted live DeviceActivity monitor for task \(taskID) activity=\(storedActivityName)")
+        }
+
+        let adoptedNames = Set(monitoredActivitiesByTaskID.values.map(\.rawValue))
+        let orphaned = liveActivityNames.subtracting(adoptedNames)
+        if !orphaned.isEmpty {
+            activityCenter.stopMonitoring(orphaned.map { DeviceActivityName($0) })
+            DiagnosticsLog.log("autoTrack", "stopped \(orphaned.count) orphaned DeviceActivity monitor(s) at launch: \(orphaned)")
+        }
+    }
+
     private func stopMonitoring(for taskID: String) {
         let inMemoryActivity = monitoredActivitiesByTaskID.removeValue(forKey: taskID)
         let sharedDefaults = UserDefaults(suiteName: autoTrackingAppGroupID)
@@ -111,7 +149,7 @@ final class AutoTrackingStore: ObservableObject {
         let uniqueActivities = Array(Set(activities.map { $0.rawValue })).map { DeviceActivityName($0) }
         if !uniqueActivities.isEmpty {
             activityCenter.stopMonitoring(uniqueActivities)
-            print("Stopped DeviceActivity monitoring for task \(taskID) activities=\(uniqueActivities.map { $0.rawValue })")
+            DiagnosticsLog.log("autoTrack", "stopped DeviceActivity monitoring for task \(taskID) activities=\(uniqueActivities.map { $0.rawValue })")
         }
         sharedDefaults?.removeObject(forKey: "\(monitoredActivityKeyPrefix)\(taskID)")
     }
@@ -127,8 +165,10 @@ final class AutoTrackingStore: ObservableObject {
             return
         }
 
+        var selectionDataFingerprint = "?"
         if let data = try? JSONEncoder().encode(selection) {
             UserDefaults(suiteName: autoTrackingAppGroupID)?.set(data, forKey: sharedSelectionKey(for: taskID))
+            selectionDataFingerprint = Self.fingerprint(for: data)
         }
 
         let schedule = DeviceActivitySchedule(
@@ -151,12 +191,22 @@ final class AutoTrackingStore: ObservableObject {
                 activityName.rawValue,
                 forKey: "\(monitoredActivityKeyPrefix)\(taskID)"
             )
-            print(
-                "Started DeviceActivity monitoring for task \(taskID) activity=\(activityName.rawValue) event=\(thresholdEventName.rawValue) apps=\(selection.applicationTokens.count) categories=\(selection.categoryTokens.count)"
+            DiagnosticsLog.log(
+                "autoTrack",
+                "started DeviceActivity monitoring for task \(taskID) activity=\(activityName.rawValue) event=\(thresholdEventName.rawValue) apps=\(selection.applicationTokens.count) categories=\(selection.categoryTokens.count) webDomains=\(selection.webDomainTokens.count) selectionFingerprint=\(selectionDataFingerprint)"
             )
         } catch {
-            print("Failed to start DeviceActivity monitoring: \(error.localizedDescription)")
+            DiagnosticsLog.log("autoTrack", "failed to start DeviceActivity monitoring: \(error.localizedDescription)")
         }
+    }
+
+    /// A short, non-reversible fingerprint of the encoded `FamilyActivitySelection`. Apple's
+    /// tokens are opaque — we can never log which apps are actually selected — but two tasks
+    /// showing the identical fingerprint is direct proof their selections are byte-for-byte the
+    /// same (e.g. a picker/save bug duplicating one task's selection into another's), which a
+    /// bare token count can't distinguish from "coincidentally the same size."
+    static func fingerprint(for data: Data) -> String {
+        String(SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined().prefix(8))
     }
 
     private func selectionKey(for taskID: String) -> String {

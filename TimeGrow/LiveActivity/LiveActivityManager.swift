@@ -36,6 +36,11 @@ final class LiveActivityManager {
     private var pushToStartTokenUpdatesTask: Task<Void, Never>?
     private var latestPushToStartToken: String?
 
+    /// Tracks the system-level Live Activities toggle (Settings > Face ID & Passcode >
+    /// Live Activities, or per-app). A user flipping this off is the single most common reason
+    /// the Dynamic Island silently never appears while everything else keeps working.
+    private var activityEnablementUpdatesTask: Task<Void, Never>?
+
     /// Activities whose push token stream we've already subscribed to, keyed by `Activity.id`.
     /// Needed because `reconcile(tasks:)` can discover an activity it didn't start itself (e.g.
     /// `AutoTrackingExtension` starts activities directly, bypassing `start(for:startedAt:)`
@@ -43,6 +48,11 @@ final class LiveActivityManager {
     /// so a remote `end` push (sent when another device stops the task) has nothing to target
     /// and the Dynamic Island silently keeps counting until the app is opened locally.
     private var observedActivityIDs: Set<String> = []
+    /// Firestore can briefly expose an incomplete/intermediate task document while concurrent
+    /// auto-track, push-token and timer writes are being merged. Ending an Activity immediately
+    /// from that one snapshot causes a visible Dynamic Island flicker even when the following
+    /// snapshot still says the task is running. Keep the end reversible for this short window.
+    private var pendingEndTasksByActivityID: [String: Task<Void, Never>] = [:]
     /// A push-to-start activity may arrive just before the background wake has fetched its task
     /// state. Do not end it based on that short-lived stale snapshot; give the server state one
     /// reconciliation interval to arrive first.
@@ -67,6 +77,24 @@ final class LiveActivityManager {
     }
 
     private init() {}
+
+    /// Begin this at application launch alongside the other observers below. Logs the current
+    /// enablement immediately, then every subsequent flip, so a report of "it just stopped
+    /// appearing" can be cross-checked against whether the user (or a Focus mode) disabled Live
+    /// Activities system-wide, versus a bug in our own start/end logic.
+    func startObservingActivityEnablement() {
+        guard activityEnablementUpdatesTask == nil else { return }
+        let info = ActivityAuthorizationInfo()
+        DiagnosticsLog.log(
+            "liveActivity",
+            "Live Activities authorization enabled=\(info.areActivitiesEnabled) frequentPushesEnabled=\(info.frequentPushesEnabled)"
+        )
+        activityEnablementUpdatesTask = Task {
+            for await enabled in info.activityEnablementUpdates {
+                DiagnosticsLog.log("liveActivity", "Live Activities authorization changed enabled=\(enabled)")
+            }
+        }
+    }
 
     /// Begin this at application launch, not from a view `.task`. The app must still be opened
     /// once after installation for iOS to issue a token, but afterwards the server can start
@@ -121,7 +149,10 @@ final class LiveActivityManager {
             guard let id = task.id, let startedAt = Self.activeTimerStart(for: task) else { continue }
             runningStartByTaskID[id] = startedAt
         }
-        DiagnosticsLog.log("liveActivity", "reconcile tasks=\(tasks.count) running=\(runningStartByTaskID.keys) existingActivities=\(Activity<TimeGrowLiveActivityAttributes>.activities.map(\.attributes.taskID))")
+        let existingActivitySummary = Activity<TimeGrowLiveActivityAttributes>.activities.map {
+            "\($0.attributes.taskID):\($0.activityState)"
+        }
+        DiagnosticsLog.log("liveActivity", "reconcile tasks=\(tasks.count) running=\(runningStartByTaskID.keys) existingActivities=\(existingActivitySummary)")
 
         for activity in Activity<TimeGrowLiveActivityAttributes>.activities {
             let taskID = activity.attributes.taskID
@@ -136,13 +167,11 @@ final class LiveActivityManager {
                     continue
                 }
 
-                remoteStartGraceUntilByActivityID.removeValue(forKey: activity.id)
-                observedActivityIDs.remove(activity.id)
-                pushTokenHandler?(taskID, nil)
-                Task { await activity.end(nil, dismissalPolicy: .immediate) }
+                scheduleEndAfterReconciliationGrace(for: activity, taskID: taskID)
                 continue
             }
             remoteStartGraceUntilByActivityID.removeValue(forKey: activity.id)
+            cancelPendingEnd(forActivityID: activity.id)
             if !observedActivityIDs.contains(activity.id) {
                 observedActivityIDs.insert(activity.id)
                 observePushToken(of: activity, taskID: taskID)
@@ -171,6 +200,65 @@ final class LiveActivityManager {
         updateTimerScheduling()
     }
 
+    /// Wait briefly before ending an activity from a non-running snapshot. A subsequent
+    /// reconciliation cancels this task if that snapshot was only a transient merge state.
+    private func scheduleEndAfterReconciliationGrace(
+        for activity: Activity<TimeGrowLiveActivityAttributes>,
+        taskID: String
+    ) {
+        guard pendingEndTasksByActivityID[activity.id] == nil else { return }
+
+        let activityID = activity.id
+        DiagnosticsLog.log(
+            "liveActivity",
+            "Deferring Live Activity end task=\(taskID) id=\(activityID) while confirming stopped state"
+        )
+        pendingEndTasksByActivityID[activityID] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            self.pendingEndTasksByActivityID.removeValue(forKey: activityID)
+
+            let taskIsStillRunning = self.lastKnownTasks.contains {
+                $0.id == taskID && Self.activeTimerStart(for: $0) != nil
+            }
+            guard !taskIsStillRunning else {
+                DiagnosticsLog.log(
+                    "liveActivity",
+                    "Cancelled deferred end task=\(taskID) id=\(activityID); task resumed in later snapshot"
+                )
+                return
+            }
+
+            guard let currentActivity = Activity<TimeGrowLiveActivityAttributes>.activities.first(where: {
+                $0.id == activityID
+            }) else {
+                return
+            }
+
+            self.remoteStartGraceUntilByActivityID.removeValue(forKey: activityID)
+            self.observedActivityIDs.remove(activityID)
+            self.pushTokenHandler?(taskID, nil)
+            // Surface why `activeTimerStart` returned nil for this task, so a report of "the
+            // Dynamic Island vanished mid-use" can be matched against the exact auto-track state
+            // (grace window expired vs. an explicit stop vs. never live) without re-deriving it
+            // from separate task-snapshot log lines.
+            let staleTask = self.lastKnownTasks.first { $0.id == taskID }
+            DiagnosticsLog.log(
+                "liveActivity",
+                "Ending Live Activity task=\(taskID) id=\(activityID) after reconciliation grace autoTrackLiveUntil=\(String(describing: staleTask?.autoTrackLiveUntil)) autoTrackStoppedAt=\(String(describing: staleTask?.autoTrackStoppedAt)) autoTrackSessionStartedAt=\(String(describing: staleTask?.autoTrackSessionStartedAt))"
+            )
+            await currentActivity.end(nil, dismissalPolicy: .immediate)
+            DiagnosticsLog.log("liveActivity", "Ended Live Activity task=\(taskID) id=\(activityID)")
+        }
+    }
+
+    private func cancelPendingEnd(forActivityID activityID: String) {
+        guard let pendingEnd = pendingEndTasksByActivityID.removeValue(forKey: activityID) else { return }
+        pendingEnd.cancel()
+        DiagnosticsLog.log("liveActivity", "Cancelled deferred end id=\(activityID); task is running")
+    }
+
     private func start(for task: TGTask, startedAt: Date) {
         guard let taskID = task.id else { return }
         let attributes = TimeGrowLiveActivityAttributes(taskID: taskID, taskName: task.name, colorHex: task.colorHex)
@@ -190,6 +278,10 @@ final class LiveActivityManager {
             )
             observedActivityIDs.insert(activity.id)
             observePushToken(of: activity, taskID: taskID)
+            DiagnosticsLog.log(
+                "liveActivity",
+                "Started Live Activity for \(task.name) id=\(activity.id) state=\(activity.activityState)"
+            )
         } catch {
             DiagnosticsLog.log("liveActivity", "Failed to start Live Activity for \(task.name): \(error.localizedDescription)")
         }
@@ -212,6 +304,27 @@ final class LiveActivityManager {
                 let hexToken = data.map { String(format: "%02x", $0) }.joined()
                 self?.pushTokenHandler?(taskID, hexToken)
                 DiagnosticsLog.log("liveActivity", "Received per-activity push token task=\(taskID)")
+            }
+        }
+        observeActivityState(of: activity, taskID: taskID)
+    }
+
+    /// Surfaces ActivityKit's own lifecycle for this activity (`active`/`stale`/`ended`/
+    /// `dismissed`) as it happens. This is what actually explains a Dynamic Island that goes
+    /// quiet or drops to its minimal presentation while the lock screen entry — driven by the
+    /// same activity, just rendered differently — keeps counting: the state transition shows up
+    /// here even though nothing on screen says why.
+    private func observeActivityState(of activity: Activity<TimeGrowLiveActivityAttributes>, taskID: String) {
+        Task {
+            DiagnosticsLog.log(
+                "liveActivity",
+                "Activity state task=\(taskID) id=\(activity.id) state=\(activity.activityState)"
+            )
+            for await state in activity.activityStateUpdates {
+                DiagnosticsLog.log(
+                    "liveActivity",
+                    "Activity state changed task=\(taskID) id=\(activity.id) state=\(state)"
+                )
             }
         }
     }

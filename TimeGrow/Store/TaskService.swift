@@ -68,7 +68,6 @@ final class TaskService: NSObject, ObservableObject {
     @Published private(set) var currentUser: User?
     /// Separates the initial empty in-memory array from an account that genuinely has no tasks.
     @Published private(set) var hasReceivedInitialTasksSnapshot = false
-    @Published var taskDeletionBlockedTaskName: String?
 
     var isAnonymous: Bool { currentUser?.isAnonymous ?? true }
     var displayName: String? { currentUser?.displayName?.isEmpty == false ? currentUser?.displayName : nil }
@@ -465,8 +464,10 @@ final class TaskService: NSObject, ObservableObject {
         ])
     }
 
-    /// Only deletes the task once it has no tracked sessions left (past or present),
-    /// so Reports never ends up with orphaned session entries for a task that no longer exists.
+    /// Deletes the task along with every tracked session it has (past or present), so Reports
+    /// never ends up with orphaned session entries for a task that no longer exists. Firestore
+    /// batched writes cap at 500 operations, so session deletes are chunked to stay under that
+    /// even for a task with a long history.
     func deleteTask(_ task: TGTask) {
         guard let uid = currentUser?.uid, let id = task.id else { return }
 
@@ -474,23 +475,32 @@ final class TaskService: NSObject, ObservableObject {
             do {
                 let snapshot = try await sessionsCollection(for: uid)
                     .whereField("taskID", isEqualTo: id)
-                    .limit(to: 1)
                     .getDocuments()
+                let sessionIDs = snapshot.documents.map(\.documentID)
 
-                guard snapshot.documents.isEmpty else {
-                    await MainActor.run {
-                        self.taskDeletionBlockedTaskName = task.name
-                    }
-                    return
-                }
-
-                tasksCollection(for: uid).document(id).delete { error in
-                    if let error {
-                        print("Failed to delete task: \(error.localizedDescription)")
+                await MainActor.run {
+                    self.sessions.removeAll { $0.taskID == id }
+                    self.tasks.removeAll { $0.id == id }
+                    for sessionID in sessionIDs {
+                        CalendarSyncManager.shared.removeSession(sessionID, userID: uid)
                     }
                 }
+
+                let maxOperationsPerBatch = 500
+                var remainingRefs = snapshot.documents.map(\.reference)
+                while !remainingRefs.isEmpty {
+                    let chunk = remainingRefs.prefix(maxOperationsPerBatch)
+                    let batch = db.batch()
+                    for reference in chunk {
+                        batch.deleteDocument(reference)
+                    }
+                    try await batch.commit()
+                    remainingRefs.removeFirst(chunk.count)
+                }
+
+                try await tasksCollection(for: uid).document(id).delete()
             } catch {
-                print("Failed to check sessions before deleting task: \(error.localizedDescription)")
+                DiagnosticsLog.log("tasks", "Failed to delete task \(id) and its sessions: \(error.localizedDescription)")
             }
         }
     }
@@ -746,6 +756,23 @@ final class TaskService: NSObject, ObservableObject {
                 lastUsageAt: mergedEnd
             )
             return
+        }
+
+        // No mergeable session — log why, so a session split shows its cause (gap too long vs.
+        // an explicit stop vs. genuinely the first session of the day) directly in the export,
+        // instead of requiring a manual timestamp diff against `autoTrackingInactivityGraceSeconds`.
+        if let mostRecentEndedAt = sessions
+            .filter({ $0.taskID == taskID && $0.startedAutomatically == true })
+            .compactMap(\.endedAt)
+            .max() {
+            let gap = startedAt.timeIntervalSince(mostRecentEndedAt)
+            let reason = (task.autoTrackStoppedAt.map { mostRecentEndedAt <= $0 } ?? false)
+                ? "previous session ended by an explicit stop"
+                : "gap=\(Int(gap))s exceeds merge window=\(Int(autoTrackingInactivityGraceSeconds))s"
+            DiagnosticsLog.log(
+                "autoTrack",
+                "starting new session for \(task.name) instead of extending previous (ended \(mostRecentEndedAt)): \(reason)"
+            )
         }
 
         let sessionRef = sessionsCollection(for: uid).document()

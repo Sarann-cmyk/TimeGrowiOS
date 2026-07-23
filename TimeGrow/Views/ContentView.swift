@@ -75,17 +75,6 @@ struct ContentView: View {
         .sheet(item: $taskForAutoTracking) { task in
             AutoTrackingPickerView(task: task)
         }
-        .alert(
-            "Can't Delete Task",
-            isPresented: Binding(
-                get: { taskService.taskDeletionBlockedTaskName != nil },
-                set: { if !$0 { taskService.taskDeletionBlockedTaskName = nil } }
-            )
-        ) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("\"\(taskService.taskDeletionBlockedTaskName ?? "")\" still has tracked time. Delete its sessions in Reports first.")
-        }
         .onAppear {
             DiagnosticsLog.log(
                 "language",
