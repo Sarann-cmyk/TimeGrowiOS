@@ -270,17 +270,10 @@ struct ContentView: View {
                         selectedTab = tab
                     }
                 } label: {
-                    VStack(spacing: 6) {
-                        Image(systemName: tab.systemImage)
-                            .font(.system(size: tab == .tasks ? 20 : 23, weight: .bold))
-                            .symbolRenderingMode(.hierarchical)
-
-                        Text(tab.title)
-                            .font(.system(size: 12, weight: .semibold))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.75)
-                    }
-                    .foregroundStyle(selectedTab == tab ? accentColorManager.color : .white)
+                    Image(systemName: tab.systemImage)
+                        .font(.system(size: tab == .tasks ? 20 : 23, weight: .bold))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(selectedTab == tab ? accentColorManager.color : .white)
                     .frame(maxWidth: .infinity, minHeight: 62)
                     .background {
                         if selectedTab == tab {

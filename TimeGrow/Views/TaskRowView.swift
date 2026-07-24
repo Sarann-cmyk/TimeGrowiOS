@@ -20,6 +20,12 @@ struct TaskRow: View {
 
     @State private var isShowingActionMenu = false
     @State private var isShowingDeleteConfirmation = false
+    /// Set the instant a manual-start tap is recognized; cleared once `.onChange(of:
+    /// task.isTimerRunning)` below logs the measured tap-to-render latency. Diagnostic-only —
+    /// added to size the "play doesn't start instantly" delay report end-to-end instead of
+    /// guessing which stage (gesture recognition vs. Firestore round-trip vs. SwiftUI re-render)
+    /// it's actually in.
+    @State private var manualStartTapAt: Date?
 
     var body: some View {
         if isReorderModeActive {
@@ -32,8 +38,19 @@ struct TaskRow: View {
                     if !task.isTimerRunning, isAutoTrackLive(at: Date()) {
                         stopAutoTrackAction()
                     } else {
+                        if !task.isTimerRunning {
+                            let tapAt = Date()
+                            manualStartTapAt = tapAt
+                            DiagnosticsLog.log("timer", "manual start tap task=\(task.name) id=\(task.id ?? "?") at=\(tapAt)")
+                        }
                         onToggleTimer()
                     }
+                }
+                .onChange(of: task.isTimerRunning) { _, isRunning in
+                    guard isRunning, let tapAt = manualStartTapAt else { return }
+                    manualStartTapAt = nil
+                    let latencyMs = Int(Date().timeIntervalSince(tapAt) * 1000)
+                    DiagnosticsLog.log("timer", "manual start rendered task=\(task.name) id=\(task.id ?? "?") latencyMs=\(latencyMs)")
                 }
                 .simultaneousGesture(
                     LongPressGesture(minimumDuration: 0.5).onEnded { _ in
@@ -77,7 +94,7 @@ struct TaskRow: View {
     private var reorderModeRow: some View {
         HStack(spacing: 13) {
             TaskProgressStrip(color: task.color)
-            TaskAvatarCircle(color: task.color, symbol: task.symbol, isPulsing: false)
+            TaskAvatarCircle(color: task.color, isPulsing: false)
 
             Text(task.name)
                 .font(.system(size: 17, weight: .semibold))
@@ -123,7 +140,6 @@ struct TaskRow: View {
 
             TaskAvatarCircle(
                 color: task.color,
-                symbol: task.symbol,
                 isPulsing: isVisuallyActive && !isInterrupted,
                 elapsedSeconds: isVisuallyActive ? Self.elapsedSeconds(startedAt: secondsStart, at: date) : nil
             )
@@ -147,7 +163,7 @@ struct TaskRow: View {
         .frame(height: 68)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(isVisuallyActive ? task.color.opacity(isInterrupted ? 0.05 : 0.09) : Color.white.opacity(0.07))
+                .fill(isVisuallyActive ? task.color.opacity(isInterrupted ? 0.05 : 0.187) : Color.white.opacity(0.07))
         )
         .overlay {
             if isVisuallyActive {
@@ -216,16 +232,14 @@ struct AutoTrackingBadge: View {
 
 struct TaskAvatarCircle: View {
     let color: Color
-    let symbol: String
     let isPulsing: Bool
-    /// Seconds since the running session started. When set, the circle shows the elapsed
-    /// minutes with a ring that fills clockwise over each minute (resetting as seconds roll
-    /// over) instead of the task's letter.
+    /// Seconds since the running session started. When set, the circle shows a ring that fills
+    /// clockwise over each minute (resetting as seconds roll over) with a pause icon in the
+    /// middle; otherwise it shows a plain outlined circle with a play icon.
     var elapsedSeconds: Int? = nil
     var size: CGFloat = 31
 
-    private var letterFontSize: CGFloat { 14 * size / 31 }
-    private var ringFontSize: CGFloat { 11 * size / 31 }
+    private var iconFontSize: CGFloat { 12 * size / 31 }
     private var strokeWidth: CGFloat { 1.2 * size / 31 }
 
     var body: some View {
@@ -243,7 +257,6 @@ struct TaskAvatarCircle: View {
     @ViewBuilder
     private var content: some View {
         if let elapsedSeconds {
-            let minutes = elapsedSeconds / 60
             let secondsFraction = Double(elapsedSeconds % 60) / 60
             ZStack {
                 Circle()
@@ -252,16 +265,14 @@ struct TaskAvatarCircle: View {
                     .trim(from: 0, to: secondsFraction)
                     .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
                     .rotationEffect(.degrees(-90))
-                Text("\(minutes)")
-                    .font(.system(size: ringFontSize, weight: .bold, design: .rounded))
+                Image(systemName: "pause.fill")
+                    .font(.system(size: iconFontSize, weight: .bold))
                     .foregroundStyle(color)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.6)
             }
             .frame(width: size, height: size)
         } else {
-            Text(symbol.isEmpty ? "T" : symbol)
-                .font(.system(size: letterFontSize, weight: .bold))
+            Image(systemName: "play.fill")
+                .font(.system(size: iconFontSize, weight: .bold))
                 .foregroundStyle(color)
                 .frame(width: size, height: size)
                 .background(
@@ -352,7 +363,7 @@ struct TaskDurationLabel: View {
 
             Text(Self.format(seconds))
                 .font(.system(size: 15, weight: .medium, design: .monospaced))
-                .foregroundStyle(ownerStatus.isInterrupted ? .orange : (isRunning ? task.color : Color.white.opacity(0.65)))
+                .foregroundStyle(ownerStatus.isInterrupted ? .orange : (isRunning ? Color.white : Color.white.opacity(0.65)))
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
         }

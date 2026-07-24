@@ -23,6 +23,9 @@ struct TaskTile: View {
 
     @State private var isShowingActionMenu = false
     @State private var isShowingDeleteConfirmation = false
+    /// See `TaskRow.manualStartTapAt` — same diagnostic-only tap-to-render latency measurement,
+    /// mirrored here since Tile View has its own gesture handler rather than reusing `TaskRow`'s.
+    @State private var manualStartTapAt: Date?
 
     var body: some View {
         if isReorderModeActive {
@@ -35,8 +38,19 @@ struct TaskTile: View {
                     if !task.isTimerRunning, isAutoTrackLive(at: Date()) {
                         stopAutoTrackAction()
                     } else {
+                        if !task.isTimerRunning {
+                            let tapAt = Date()
+                            manualStartTapAt = tapAt
+                            DiagnosticsLog.log("timer", "manual start tap task=\(task.name) id=\(task.id ?? "?") at=\(tapAt)")
+                        }
                         onToggleTimer()
                     }
+                }
+                .onChange(of: task.isTimerRunning) { _, isRunning in
+                    guard isRunning, let tapAt = manualStartTapAt else { return }
+                    manualStartTapAt = nil
+                    let latencyMs = Int(Date().timeIntervalSince(tapAt) * 1000)
+                    DiagnosticsLog.log("timer", "manual start rendered task=\(task.name) id=\(task.id ?? "?") latencyMs=\(latencyMs)")
                 }
                 .simultaneousGesture(
                     LongPressGesture(minimumDuration: 0.5).onEnded { _ in
@@ -72,7 +86,7 @@ struct TaskTile: View {
     private var reorderModeTile: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
-                TaskAvatarCircle(color: task.color, symbol: task.symbol, isPulsing: false, size: 40)
+                TaskAvatarCircle(color: task.color, isPulsing: false, size: 40)
 
                 Spacer(minLength: 8)
 
@@ -122,7 +136,6 @@ struct TaskTile: View {
             HStack(alignment: .top) {
                 TaskAvatarCircle(
                     color: task.color,
-                    symbol: task.symbol,
                     isPulsing: isVisuallyActive && !isInterrupted,
                     elapsedSeconds: isVisuallyActive ? TaskRow.elapsedSeconds(startedAt: secondsStart, at: date) : nil,
                     size: 40
@@ -152,7 +165,7 @@ struct TaskTile: View {
         .frame(height: 122)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(isVisuallyActive ? task.color.opacity(isInterrupted ? 0.05 : 0.09) : Color.white.opacity(0.07))
+                .fill(isVisuallyActive ? task.color.opacity(isInterrupted ? 0.05 : 0.187) : Color.white.opacity(0.07))
         )
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
