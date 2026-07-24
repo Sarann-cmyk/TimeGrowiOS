@@ -77,28 +77,36 @@ Apple попереджає не реєструвати забагато DeviceAc
 (`eventIgnored:duplicateThreshold`) — захист від зайвого double-counting при дрібних збоях
 доставки, не основний механізм проти реальних затримок (див. нижче).
 
-## Два незалежні шляхи, куди йде кожна подія
+## Три шляхи, куди йде кожна подія
 
-Кожна прийнята подія (`eventDidReachThreshold`) одночасно йде ДВОМА шляхами — це не резервування
-одне одного, це дві різні системи з різними константами (джерело найважливішої пастки, див.
-"Відомі пастки" нижче):
+Кожна прийнята подія (`eventDidReachThreshold`) одночасно йде ТРЬОМА шляхами:
 
-### 1. Сервер (Cloud Function) — near-real-time, для Live Activity
+### 1. Сервер (Cloud Function) — near-real-time, для Live Activity І для самого блоку сесії
 
 `submitAutoTrackEvent` (`AutoTrackingExtension.swift:110-`) синхронно (з таймаутом 3с) шле
-POST на `recordAutoTrackEvent` (`functions/src/index.ts:138-`) з `deviceID`/`deviceSecret`
+POST на `recordAutoTrackEvent` (`functions/src/index.ts`) з `deviceID`/`deviceSecret`
 (довгоживучий секрет пристрою, не Firebase ID-token — лишається дійсним і після нічного
-закриття застосунку). Ця функція напряму пише в Firestore:
-`autoTrackLastUsageAt` / `autoTrackLiveUntil` / `autoTrackSessionStartedAt` /
-видаляє `autoTrackStoppedAt`. Саме цей запис — єдиний сигнал, який запускає push-to-start
-Dynamic Island (див. `DYNAMIC_ISLAND.md`).
+закриття застосунку). Ця функція в одній транзакції пише в Firestore:
+- `autoTrackLastUsageAt` / `autoTrackLiveUntil` / `autoTrackSessionStartedAt` /
+  видаляє `autoTrackStoppedAt` на задачі. Саме цей запис — єдиний сигнал, який запускає
+  push-to-start Dynamic Island (див. `DYNAMIC_ISLAND.md`).
+- **З 2026-07-24**: сам документ `TaskTimeSession` (блок у Reports/Timeline) — продовжує
+  (`endedAt` update) сесію, на яку вказує `autoTrackActiveSessionID` на задачі, якщо `liveUntil`
+  ще не минув, або створює новий документ. Це означає блок з'являється на таймлайні **в реальному
+  часі, без відкриття жодного застосунку** — раніше він з'являвся лише коли якийсь клієнт
+  (iPhone/Mac) відкривався і вичитував локальну чергу чи `autoTrackEvents` (шляхи 2 і 3 нижче).
+  `autoTrackActiveSessionID` — той самий покажчик на сесію, який пише і клієнт, тож обидва
+  джерела продовжують один документ, а не форкають два.
 
-### 2. Локальна черга (App Group) — основне, найшвидше джерело для реальних сесій
+### 2. Локальна черга (App Group) — офлайн-запасний шлях для клієнта
 
 Подія також дописується в `autoTracking.pendingEvents` (спільний `UserDefaults(suiteName:
-autoTrackingAppGroupID)`). Це основний, найшвидший шлях, звідки беруться справжні записи
-`TaskTimeSession` (блоки в Reports/Timeline) — але, з 2026-07-23, вже не єдиний (див. пункт 3
-нижче). Обробляється тільки коли головний застосунок відкривається/переходить у foreground:
+autoTrackingAppGroupID)`). До 2026-07-24 це було основне джерело `TaskTimeSession`; тепер сервер
+(шлях 1) зазвичай встигає першим, а цей шлях — страховка на випадок, коли мережевий POST до
+`recordAutoTrackEvent` взагалі не пройшов (немає інтернету в момент спрацювання розширення).
+`recordAutoTrackedSession`'s merge-логіка (нижче) ідемпотентна: повторна обробка вже
+відображеної сервером події просто продовжує той самий документ до того самого значення, без
+дублю. Обробляється тільки коли головний застосунок відкривається/переходить у foreground:
 
 - `AutoTrackingStore.drainPendingEvents()` (`AutoTrackingStore.swift:172-213`) — вичитує й чистить
   чергу, дедублікує події ближче ніж `minimumDistinctPendingEventInterval = 55с` одна до одної.

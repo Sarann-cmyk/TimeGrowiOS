@@ -51,14 +51,21 @@ interface TaskDoc {
   autoTrackSessionStartedAt?: Timestamp;
   autoTrackLiveUntil?: Timestamp;
   autoTrackStoppedAt?: Timestamp;
+  autoTrackActiveSessionID?: string;
   liveActivityPushToken?: string;
   /** Server-side claim that a push-to-start was already sent for this timer window. */
   liveActivityStartRequestedAt?: Timestamp;
 }
 
 interface SessionDoc {
+  taskID?: string;
+  taskName?: string;
+  colorHex?: string;
+  startedAt?: Timestamp;
   startedAutomatically?: boolean;
   endedAt?: Timestamp;
+  startedByDeviceID?: string;
+  startedByPlatform?: string;
 }
 
 interface DeviceDoc {
@@ -206,10 +213,45 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
       const sessionStartedAt = canContinuePreviousSession ? previousAutoStart : requestedSessionStart;
       const liveUntil = new Date(Math.max(now.getTime(), occurredAt.getTime()) + AUTO_TRACK_LIVE_GRACE_MS);
 
+      // Materialize the `TaskTimeSession` (Timeline/Reports block) here, in real time, instead of
+      // waiting for some client to open the app and replay `autoTrackEvents` — that could be
+      // minutes to days later. `autoTrackActiveSessionID` on the task doc is the same session
+      // pointer the client writes; reusing it (all Firestore reads must happen before any writes
+      // in a transaction, hence fetching it up front) keeps both writers extending the exact same
+      // document instead of forking two.
+      const previousSessionRef = canContinuePreviousSession && task.autoTrackActiveSessionID
+        ? db.collection("users").doc(uid).collection("sessions").doc(task.autoTrackActiveSessionID)
+        : undefined;
+      const previousSessionSnapshot = previousSessionRef ? await transaction.get(previousSessionRef) : undefined;
+
+      let sessionID: string;
+      if (previousSessionSnapshot?.exists && previousSessionRef) {
+        const previousEndedAt = (previousSessionSnapshot.data() as SessionDoc).endedAt?.toDate();
+        const mergedEndedAt = previousEndedAt && previousEndedAt > occurredAt ? previousEndedAt : occurredAt;
+        transaction.update(previousSessionRef, {
+          endedAt: admin.firestore.Timestamp.fromDate(mergedEndedAt),
+        });
+        sessionID = previousSessionRef.id;
+      } else {
+        const newSessionRef = db.collection("users").doc(uid).collection("sessions").doc();
+        transaction.set(newSessionRef, {
+          taskID,
+          taskName: task.name ?? "",
+          colorHex: task.colorHex ?? "#8CD616",
+          startedAt: admin.firestore.Timestamp.fromDate(sessionStartedAt),
+          endedAt: admin.firestore.Timestamp.fromDate(occurredAt),
+          startedByDeviceID: deviceID,
+          startedByPlatform: "iOS",
+          startedAutomatically: true,
+        });
+        sessionID = newSessionRef.id;
+      }
+
       transaction.update(taskRef, {
         autoTrackLastUsageAt: admin.firestore.Timestamp.fromDate(occurredAt),
         autoTrackLiveUntil: admin.firestore.Timestamp.fromDate(liveUntil),
         autoTrackSessionStartedAt: admin.firestore.Timestamp.fromDate(sessionStartedAt),
+        autoTrackActiveSessionID: sessionID,
         autoTrackStoppedAt: admin.firestore.FieldValue.delete(),
         updatedAt: admin.firestore.Timestamp.fromDate(now),
       });
