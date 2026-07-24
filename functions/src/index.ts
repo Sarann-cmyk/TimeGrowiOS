@@ -45,6 +45,7 @@ interface TaskDoc {
   colorHex?: string;
   timerStartedAt?: Timestamp;
   activeSessionID?: string;
+  timerOwnerDeviceID?: string;
   timerOwnerPlatform?: string;
   timerOwnerLastAliveAt?: Timestamp;
   autoTrackSessionStartedAt?: Timestamp;
@@ -98,7 +99,22 @@ function contentState(startedAt: Date, now: Date = new Date()): Record<string, n
   };
 }
 
-const AUTO_TRACK_LIVE_GRACE_MS = 180_000;
+// Must match `autoTrackingInactivityGraceSeconds` (TimeGrow/AutoTracking/AutoTrackingStore.swift)
+// and `inactivityGraceSeconds` (AutoTrackingExtension/AutoTrackingExtension.swift) — same "still
+// one session" window, but on the server, for `autoTrackLiveUntil` (drives Dynamic Island
+// lifetime). Left at 180s after the client was raised to 300s on 2026-07-21 caused the server to
+// treat a session as ended up to two minutes before the client did, from delivery delays already
+// observed up to 299s — splitting sessions and killing the Live Activity mid-use even though the
+// client-side merge window would have kept tracking it as continuous.
+const AUTO_TRACK_LIVE_GRACE_MS = 300_000;
+/**
+ * How long a raw threshold event survives in `autoTrackEvents` before `pruneAutoTrackEvents`
+ * deletes it. This collection exists purely so a client that missed its local App Group queue
+ * (closed for days, reinstalled, queue lost) can still rebuild the real `TaskTimeSession` records
+ * from the server the next time it opens — 14 days comfortably covers "hasn't opened the app in a
+ * while" without keeping this collection as a permanent, ever-growing duplicate of session history.
+ */
+const AUTO_TRACK_EVENT_RETENTION_MS = 14 * 24 * 60 * 60 * 1_000;
 // Mac writes both the device and owned-timer heartbeat every few seconds. Two minutes tolerates
 // short network stalls, but ensures force-quit/crash cannot leave an automatic session running
 // until somebody later opens TimeGrow on an iPhone.
@@ -156,6 +172,13 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
   const requestedSessionStart = requestDate(body?.sessionStartedAt, occurredAt);
   const deviceRef = db.collection("users").doc(uid).collection("devices").doc(deviceID);
   const taskRef = db.collection("users").doc(uid).collection("tasks").doc(taskID);
+  // Deterministic from the identity of the physical threshold callback (task, device, second it
+  // occurred), not a random ID, so a retried POST for the exact same callback — the extension's
+  // network path has no idea whether an earlier attempt actually landed — writes the same
+  // document instead of a duplicate. `processQueuedAutoTrackEvents` on the client already merges
+  // overlapping windows harmlessly, but there's no reason to make it rely on that here too.
+  const eventID = `${taskID}_${deviceID}_${Math.round(occurredAt.getTime() / 1_000)}`;
+  const eventRef = db.collection("users").doc(uid).collection("autoTrackEvents").doc(eventID);
 
   try {
     const result = await db.runTransaction(async (transaction) => {
@@ -169,6 +192,8 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
       if (!taskSnapshot.exists) {
         throw new Error("task-not-found");
       }
+      const eventSnapshot = await transaction.get(eventRef);
+
       const task = taskSnapshot.data() as TaskDoc;
       const wasRunning = activeTimerStart(task, now) !== null;
       const previousAutoStart = task.autoTrackSessionStartedAt?.toDate();
@@ -188,10 +213,24 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
         autoTrackStoppedAt: admin.firestore.FieldValue.delete(),
         updatedAt: admin.firestore.Timestamp.fromDate(now),
       });
-      return { started: !wasRunning, sessionStartedAt };
+      // `createdAt` is when this server durably learned about the event, not `occurredAt` (when
+      // it happened on-device). The client's recovery reconciliation watermarks on this field
+      // specifically so a callback that occurred earlier but arrives late over a bad connection
+      // still gets picked up by a later reconciliation pass instead of falling behind a
+      // watermark already advanced past its (earlier) `occurredAt`.
+      if (!eventSnapshot.exists) {
+        transaction.set(eventRef, {
+          taskID,
+          deviceID,
+          occurredAt: admin.firestore.Timestamp.fromDate(occurredAt),
+          sessionStartedAt: admin.firestore.Timestamp.fromDate(sessionStartedAt),
+          createdAt: admin.firestore.Timestamp.fromDate(now),
+        });
+      }
+      return { started: !wasRunning, sessionStartedAt, eventAlreadyRecorded: eventSnapshot.exists };
     });
 
-    console.log(`secure auto-track event accepted (task ${taskID}, device ${deviceID}, started=${result.started})`);
+    console.log(`secure auto-track event accepted (task ${taskID}, device ${deviceID}, started=${result.started}, eventAlreadyRecorded=${result.eventAlreadyRecorded})`);
     response.status(200).json({ ok: true, started: result.started });
   } catch (error) {
     const message = String(error instanceof Error ? error.message : error);
@@ -255,7 +294,13 @@ export const onTaskTimerChanged = onDocumentUpdated(
       // still can't call `Activity.request()` there, so background-wake alone can never start
       // one — push-to-start is the one Apple-sanctioned exception, since the *system* creates
       // the activity directly, without running app code at all.
+      // A manual start on `timerOwnerDeviceID` itself already ran `Activity.request()` locally
+      // (the app is necessarily foreground for the user to have tapped Start) before this
+      // function even ran. Push-to-start on top of that creates a second, independent Live
+      // Activity for the same task — two identical entries on that device's lock screen. Only
+      // *other* devices need the push; the originating device already has its own activity.
       const startTokensByDoc = devicesSnap.docs
+        .filter((doc) => doc.id !== after.timerOwnerDeviceID)
         .map((doc) => ({ doc, token: doc.get("activityPushToStartToken") as string | undefined }))
         .filter((entry): entry is { doc: typeof entry.doc; token: string } => !!entry.token);
       if (startTokensByDoc.length > 0) {
@@ -522,5 +567,33 @@ export const closeInterruptedMacAutoTimers = onSchedule(
     if (closed > 0) {
       console.log(`interrupted Mac auto-timer watchdog closed ${closed} task(s)`);
     }
+  }
+);
+
+/**
+ * `autoTrackEvents` (written by `recordAutoTrackEvent`) exists only so a client can rebuild
+ * sessions it never got a chance to build locally. Once an event is old enough that every client
+ * has had ample opportunity to reconcile it, keeping it around forever would just grow the
+ * collection unboundedly with no further purpose.
+ */
+export const pruneAutoTrackEvents = onSchedule(
+  { schedule: "every 24 hours" },
+  async () => {
+    const cutoff = new Date(Date.now() - AUTO_TRACK_EVENT_RETENTION_MS);
+    const staleEvents = await db
+      .collectionGroup("autoTrackEvents")
+      .where("createdAt", "<", admin.firestore.Timestamp.fromDate(cutoff))
+      .get();
+    if (staleEvents.empty) return;
+
+    const batchSize = 400;
+    for (let start = 0; start < staleEvents.docs.length; start += batchSize) {
+      const batch = db.batch();
+      for (const doc of staleEvents.docs.slice(start, start + batchSize)) {
+        batch.delete(doc.ref);
+      }
+      await batch.commit();
+    }
+    console.log(`pruned ${staleEvents.size} stale auto-track event(s) older than ${cutoff.toISOString()}`);
   }
 );

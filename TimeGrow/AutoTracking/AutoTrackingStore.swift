@@ -13,6 +13,10 @@ import Foundation
 // AutoTrackingExtension targets, and the suite name the extension writes to.
 let autoTrackingAppGroupID = "group.WINNER.ltd.TimeGrow"
 let autoTrackingThresholdSeconds: TimeInterval = 60
+/// Must match `accumulatedThresholdStepCount` in AutoTrackingExtension.swift — the number of
+/// 1-minute-apart thresholds armed per `startMonitoring` call, so the extension only has to pay
+/// for a full stop/start restart once every N minutes of continuous usage instead of every one.
+let autoTrackingAccumulatedThresholdStepCount = 15
 /// How long a gap since the last confirmed minute of usage is still treated as the same
 /// session (same Firestore session record, same live Live Activity). DeviceActivityMonitor's
 /// `eventDidReachThreshold` delivery has no documented upper bound on latency — it's best-effort,
@@ -95,12 +99,24 @@ final class AutoTrackingStore: ObservableObject {
             let hasSelection = !currentSelection.applicationTokens.isEmpty || !currentSelection.categoryTokens.isEmpty || !currentSelection.webDomainTokens.isEmpty
 
             guard hasSelection else {
-                stopMonitoring(for: taskID)
+                stopMonitoring(for: taskID, reason: "noSelection")
                 continue
             }
 
             if task.isTimerRunning {
-                stopMonitoring(for: taskID)
+                // This branch stopping unexpectedly for an auto-tracked-only task (no manual
+                // timer ever started) was the entire mystery behind a 2026-07-24 report of
+                // TikTok tracking silently dying for the rest of the day — `isTimerRunning` is
+                // supposed to be the manual-timer flag only, so logging the fields that actually
+                // decide it (plus the auto-track live-window state) turns "why did this fire" from
+                // an hour of log archaeology into one line.
+                stopMonitoring(
+                    for: taskID,
+                    reason: "isTimerRunning timerStartedAt=\(String(describing: task.timerStartedAt)) "
+                        + "autoTrackLiveUntil=\(String(describing: task.autoTrackLiveUntil)) "
+                        + "autoTrackSessionStartedAt=\(String(describing: task.autoTrackSessionStartedAt)) "
+                        + "autoTrackStoppedAt=\(String(describing: task.autoTrackStoppedAt))"
+                )
             } else if monitoredActivitiesByTaskID[taskID] == nil {
                 scheduleMonitoring(selection: currentSelection, taskID: taskID)
             }
@@ -139,7 +155,7 @@ final class AutoTrackingStore: ObservableObject {
         }
     }
 
-    private func stopMonitoring(for taskID: String) {
+    private func stopMonitoring(for taskID: String, reason: String) {
         let inMemoryActivity = monitoredActivitiesByTaskID.removeValue(forKey: taskID)
         let sharedDefaults = UserDefaults(suiteName: autoTrackingAppGroupID)
         let sharedActivity = sharedDefaults
@@ -149,7 +165,7 @@ final class AutoTrackingStore: ObservableObject {
         let uniqueActivities = Array(Set(activities.map { $0.rawValue })).map { DeviceActivityName($0) }
         if !uniqueActivities.isEmpty {
             activityCenter.stopMonitoring(uniqueActivities)
-            DiagnosticsLog.log("autoTrack", "stopped DeviceActivity monitoring for task \(taskID) activities=\(uniqueActivities.map { $0.rawValue })")
+            DiagnosticsLog.log("autoTrack", "stopped DeviceActivity monitoring for task \(taskID) reason=\(reason) activities=\(uniqueActivities.map { $0.rawValue })")
         }
         sharedDefaults?.removeObject(forKey: "\(monitoredActivityKeyPrefix)\(taskID)")
     }
@@ -159,9 +175,8 @@ final class AutoTrackingStore: ObservableObject {
     private func scheduleMonitoring(selection: FamilyActivitySelection, taskID: String) {
         let generation = UUID().uuidString
         let activityName = DeviceActivityName("\(taskID)|\(generation)")
-        let thresholdEventName = DeviceActivityEvent.Name("thresholdReached|\(generation)")
         guard !selection.applicationTokens.isEmpty || !selection.categoryTokens.isEmpty || !selection.webDomainTokens.isEmpty else {
-            stopMonitoring(for: taskID)
+            stopMonitoring(for: taskID, reason: "noSelection")
             return
         }
 
@@ -176,16 +191,10 @@ final class AutoTrackingStore: ObservableObject {
             intervalEnd: DateComponents(hour: 23, minute: 59),
             repeats: true
         )
-        let event = DeviceActivityEvent(
-            applications: selection.applicationTokens,
-            categories: selection.categoryTokens,
-            webDomains: selection.webDomainTokens,
-            threshold: DateComponents(minute: 1),
-            includesPastActivity: false
-        )
+        let events = Self.accumulatedThresholdEvents(for: selection, generation: generation)
 
         do {
-            try activityCenter.startMonitoring(activityName, during: schedule, events: [thresholdEventName: event])
+            try activityCenter.startMonitoring(activityName, during: schedule, events: events)
             monitoredActivitiesByTaskID[taskID] = activityName
             UserDefaults(suiteName: autoTrackingAppGroupID)?.set(
                 activityName.rawValue,
@@ -193,11 +202,35 @@ final class AutoTrackingStore: ObservableObject {
             )
             DiagnosticsLog.log(
                 "autoTrack",
-                "started DeviceActivity monitoring for task \(taskID) activity=\(activityName.rawValue) event=\(thresholdEventName.rawValue) apps=\(selection.applicationTokens.count) categories=\(selection.categoryTokens.count) webDomains=\(selection.webDomainTokens.count) selectionFingerprint=\(selectionDataFingerprint)"
+                "started DeviceActivity monitoring for task \(taskID) activity=\(activityName.rawValue) steps=\(events.count) apps=\(selection.applicationTokens.count) categories=\(selection.categoryTokens.count) webDomains=\(selection.webDomainTokens.count) selectionFingerprint=\(selectionDataFingerprint)"
             )
         } catch {
             DiagnosticsLog.log("autoTrack", "failed to start DeviceActivity monitoring: \(error.localizedDescription)")
         }
+    }
+
+    /// Builds the 1...`autoTrackingAccumulatedThresholdStepCount` minute-apart event dictionary
+    /// for one monitor generation. Must produce event names in the same `thresholdReached|
+    /// generation|step` format the extension's `accumulatedStep(from:)` parses, so the very
+    /// first monitor armed for a task (before the extension ever rearms it) already benefits
+    /// from the accumulated-threshold restart savings instead of falling back to a restart
+    /// every minute.
+    private static func accumulatedThresholdEvents(
+        for selection: FamilyActivitySelection,
+        generation: String
+    ) -> [DeviceActivityEvent.Name: DeviceActivityEvent] {
+        var events: [DeviceActivityEvent.Name: DeviceActivityEvent] = [:]
+        for step in 1...autoTrackingAccumulatedThresholdStepCount {
+            let name = DeviceActivityEvent.Name("thresholdReached|\(generation)|\(step)")
+            events[name] = DeviceActivityEvent(
+                applications: selection.applicationTokens,
+                categories: selection.categoryTokens,
+                webDomains: selection.webDomainTokens,
+                threshold: DateComponents(minute: step),
+                includesPastActivity: false
+            )
+        }
+        return events
     }
 
     /// A short, non-reversible fingerprint of the encoded `FamilyActivitySelection`. Apple's

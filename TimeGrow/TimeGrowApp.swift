@@ -103,6 +103,7 @@ struct TimeGrowApp: App {
                     taskService.start()
                     autoTrackingStore.refreshMonitoring(for: taskService.tasks)
                     processPendingAutoTrackEvents()
+                    Task { await taskService.reconcileServerAutoTrackEvents() }
                     LiveActivityManager.shared.pushTokenHandler = { taskID, token in
                         taskService.updateLiveActivityPushToken(taskID: taskID, token: token)
                     }
@@ -140,6 +141,7 @@ struct TimeGrowApp: App {
                         autoTrackingStore.refreshAuthorizationStatus()
                         autoTrackingStore.refreshMonitoring(for: taskService.tasks)
                         processPendingAutoTrackEvents()
+                        Task { await taskService.reconcileServerAutoTrackEvents() }
                     }
                 }
                 .onChange(of: taskService.tasks) { _, tasks in

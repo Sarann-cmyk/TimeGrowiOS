@@ -21,6 +21,14 @@ private let deviceSecretKey = "autoTracking.deviceSecret"
 private let lastUsageKeyPrefix = "autoTracking.lastUsage."
 private let sessionStartKeyPrefix = "autoTracking.sessionStart."
 private let thresholdSeconds: TimeInterval = 60
+/// Number of 1-minute-apart thresholds armed on a single `startMonitoring` call. Apple fires
+/// `eventDidReachThreshold` once per event in the dictionary as cumulative usage crosses each
+/// one — steps 1...14 need no restart at all, so only the 15th step pays for a fresh
+/// `stopMonitoring`/`startMonitoring` pair. This trades one restart every 15 minutes of
+/// continuous usage for one every minute, which is where the ~seconds-per-minute gap from
+/// restarting mid-callback came from. Apple warns against registering too many DeviceActivity
+/// monitors; 15 is a starting point to validate on-device before pushing higher.
+private let accumulatedThresholdStepCount = 15
 // Must match `autoTrackingInactivityGraceSeconds` in AutoTrackingStore.swift — same
 // "still one session" window, applied here to session-start bookkeeping instead of Firestore
 // session merging. See that file for why 300s (DeviceActivity delivery delays observed up to 299s).
@@ -53,6 +61,7 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
 
         let resolvedTaskID = taskID(from: activity)
         let occurredAt = Date()
+        let isFinalStep = accumulatedStep(from: event) == accumulatedThresholdStepCount
 
         // DeviceActivity may deliver callbacks from a monitor that was already replaced. An old
         // callback must never re-arm over the newer generation.
@@ -68,7 +77,13 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         if let previousQueuedTimestamp,
            occurredAt.timeIntervalSince(Date(timeIntervalSince1970: previousQueuedTimestamp)) < minimumDistinctThresholdInterval {
             appendDebugEvent("eventIgnored:duplicateThreshold", activity: activity)
-            rearmMonitoring(after: activity)
+            // Steps below the last one are still queued inside this same monitor generation —
+            // no restart needed. A duplicate delivery of the final step still means the
+            // generation's event dictionary is spent and must be replaced, just without
+            // double-crediting usage for it.
+            if isFinalStep {
+                rearmMonitoring(after: activity)
+            }
             return
         }
 
@@ -88,8 +103,15 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         sharedDefaults.set(occurredAt.timeIntervalSince1970, forKey: lastQueuedKey)
 
         let sessionStartedAt = resolveSessionStartedAt(taskID: resolvedTaskID, occurredAt: occurredAt, sharedDefaults: sharedDefaults)
+        // Steps below the last one are still queued inside this same monitor generation — iOS
+        // keeps counting toward them without any restart. Only the final step exhausts the
+        // generation's event dictionary and needs a fresh one armed. The pending App Group event
+        // is already durable at this point, so when a restart is needed it happens before the
+        // network round-trip so the next minute of usage isn't left uncounted behind it.
+        if isFinalStep {
+            rearmMonitoring(after: activity)
+        }
         syncAutoTrackLiveState(taskID: resolvedTaskID, occurredAt: occurredAt, sessionStartedAt: sessionStartedAt, sharedDefaults: sharedDefaults)
-        rearmMonitoring(after: activity)
     }
 
     private static let dayFormatter: DateFormatter = {
@@ -240,23 +262,16 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         // monitor re-arm itself. Use an unambiguously new generation instead.
         let generation = UUID().uuidString
         let nextActivity = DeviceActivityName("\(taskID)|\(generation)")
-        let nextEventName = DeviceActivityEvent.Name("thresholdReached|\(generation)")
         let schedule = DeviceActivitySchedule(
             intervalStart: DateComponents(hour: 0, minute: 0),
             intervalEnd: DateComponents(hour: 23, minute: 59),
             repeats: true
         )
-        let event = DeviceActivityEvent(
-            applications: selection.applicationTokens,
-            categories: selection.categoryTokens,
-            webDomains: selection.webDomainTokens,
-            threshold: DateComponents(minute: 1),
-            includesPastActivity: false
-        )
+        let events = accumulatedThresholdEvents(for: selection, generation: generation)
 
         do {
             DeviceActivityCenter().stopMonitoring([activity])
-            try DeviceActivityCenter().startMonitoring(nextActivity, during: schedule, events: [nextEventName: event])
+            try DeviceActivityCenter().startMonitoring(nextActivity, during: schedule, events: events)
             sharedDefaults.set(nextActivity.rawValue, forKey: "\(monitoredActivityKeyPrefix)\(taskID)")
             // Apple's tokens are opaque — this can never say *which* apps are armed — but the
             // counts and a fingerprint of the raw selection let a later cross-task comparison
@@ -264,12 +279,46 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
             // together again, instead of only being able to guess.
             let fingerprint = fingerprint(for: selectionData)
             appendDebugEvent(
-                "rearmed:\(nextActivity.rawValue) apps=\(selection.applicationTokens.count) categories=\(selection.categoryTokens.count) webDomains=\(selection.webDomainTokens.count) selectionFingerprint=\(fingerprint)",
+                "rearmed:\(nextActivity.rawValue) steps=\(events.count) apps=\(selection.applicationTokens.count) categories=\(selection.categoryTokens.count) webDomains=\(selection.webDomainTokens.count) selectionFingerprint=\(fingerprint)",
                 activity: activity
             )
         } catch {
             appendDebugEvent("rearmFailed:\(error.localizedDescription)", activity: activity)
         }
+    }
+
+    /// Builds the 1...`accumulatedThresholdStepCount` minute-apart event dictionary for one
+    /// monitor generation — cumulative thresholds against that generation's own usage counter,
+    /// each with a distinct name so `accumulatedStep(from:)` can tell which one fired.
+    private func accumulatedThresholdEvents(
+        for selection: FamilyActivitySelection,
+        generation: String
+    ) -> [DeviceActivityEvent.Name: DeviceActivityEvent] {
+        var events: [DeviceActivityEvent.Name: DeviceActivityEvent] = [:]
+        for step in 1...accumulatedThresholdStepCount {
+            events[accumulatedEventName(generation: generation, step: step)] = DeviceActivityEvent(
+                applications: selection.applicationTokens,
+                categories: selection.categoryTokens,
+                webDomains: selection.webDomainTokens,
+                threshold: DateComponents(minute: step),
+                includesPastActivity: false
+            )
+        }
+        return events
+    }
+
+    private func accumulatedEventName(generation: String, step: Int) -> DeviceActivityEvent.Name {
+        DeviceActivityEvent.Name("thresholdReached|\(generation)|\(step)")
+    }
+
+    /// Parses the step number out of an event name built by `accumulatedEventName`. An event
+    /// from before this format existed (or any other unrecognized shape) is treated as the final
+    /// step — that falls back to the old always-restart behavior rather than silently never
+    /// restarting a monitor this code doesn't understand.
+    private func accumulatedStep(from event: DeviceActivityEvent.Name) -> Int {
+        let parts = event.rawValue.split(separator: "|")
+        guard parts.count == 3, let step = Int(parts[2]) else { return accumulatedThresholdStepCount }
+        return step
     }
 
     private func fingerprint(for data: Data) -> String {

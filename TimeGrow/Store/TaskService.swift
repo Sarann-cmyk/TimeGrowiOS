@@ -68,6 +68,14 @@ final class TaskService: NSObject, ObservableObject {
     @Published private(set) var currentUser: User?
     /// Separates the initial empty in-memory array from an account that genuinely has no tasks.
     @Published private(set) var hasReceivedInitialTasksSnapshot = false
+    /// Same distinction for `sessions` — `processQueuedAutoTrackEvents` merges a new threshold
+    /// event into an existing session by scanning this array, and an empty array is
+    /// indistinguishable from "no session for this task exists yet" unless this flag says
+    /// whether the listener has actually reported in. Without it, a threshold event processed
+    /// while `sessions` just hasn't loaded yet (tasks often resolve first, from cache) creates a
+    /// brand-new, overlapping session instead of extending the real one that simply isn't in
+    /// memory yet — confirmed 2026-07-24 as a duplicate/overlapping Timeline entry.
+    @Published private(set) var hasReceivedInitialSessionsSnapshot = false
 
     var isAnonymous: Bool { currentUser?.isAnonymous ?? true }
     var displayName: String? { currentUser?.displayName?.isEmpty == false ? currentUser?.displayName : nil }
@@ -103,6 +111,7 @@ final class TaskService: NSObject, ObservableObject {
     private let autoTrackingDeviceIDKey = "autoTracking.deviceID"
     private let autoTrackingDeviceSecretKey = "autoTracking.deviceSecret"
     private let autoTrackingDeviceSecretHashField = "autoTrackingSecretHash"
+    private let autoTrackEventsWatermarkKeyPrefix = "autoTracking.serverEventsWatermark"
 
     private struct OptimisticTimerStart {
         let sessionID: String?
@@ -116,6 +125,15 @@ final class TaskService: NSObject, ObservableObject {
 
     private func sessionsCollection(for uid: String) -> CollectionReference {
         db.collection("users").document(uid).collection("sessions")
+    }
+
+    /// Server-durable mirror of every threshold callback `recordAutoTrackEvent` accepted
+    /// (`functions/src/index.ts`), keyed idempotently by task+device+second so retried POSTs
+    /// can't duplicate an entry. Exists purely as recovery input for
+    /// `reconcileServerAutoTrackEvents()` — the local App Group queue drained in
+    /// `processPendingAutoTrackEvents` remains the primary, faster path.
+    private func autoTrackEventsCollection(for uid: String) -> CollectionReference {
+        db.collection("users").document(uid).collection("autoTrackEvents")
     }
 
     private func devicesCollection(for uid: String) -> CollectionReference {
@@ -151,6 +169,7 @@ final class TaskService: NSObject, ObservableObject {
                     self.tasksListenerGeneration &+= 1
                     self.observedTasksUID = nil
                     self.hasReceivedInitialTasksSnapshot = false
+                    self.hasReceivedInitialSessionsSnapshot = false
                     self.listener?.remove()
                     self.sessionsListener?.remove()
                     self.devicesListener?.remove()
@@ -321,6 +340,7 @@ final class TaskService: NSObject, ObservableObject {
 
     private func observeSessions(uid: String) {
         sessionsListener?.remove()
+        hasReceivedInitialSessionsSnapshot = false
         let cutoff = Calendar.current.date(byAdding: .day, value: -30, to: Date()) ?? .distantPast
         sessionsListener = sessionsCollection(for: uid)
             .whereField("startedAt", isGreaterThan: Timestamp(date: cutoff))
@@ -335,7 +355,13 @@ final class TaskService: NSObject, ObservableObject {
                 let decoded = documents.compactMap { try? $0.data(as: TaskTimeSession.self) }
                 Task { @MainActor in
                     self.sessions = decoded
+                    self.hasReceivedInitialSessionsSnapshot = true
                     self.closeRunningAutoTrackedTimers()
+                    // Threshold events that arrived (local queue or server reconciliation) before
+                    // this first snapshot landed were deliberately left queued rather than
+                    // processed against a not-yet-loaded `sessions` array; flush them now that
+                    // there's something real to merge against.
+                    self.processQueuedAutoTrackEvents()
                 }
             }
     }
@@ -678,8 +704,65 @@ final class TaskService: NSObject, ObservableObject {
         processQueuedAutoTrackEvents()
     }
 
+    /// Recovers threshold events the App Group queue never delivered locally — the extension's
+    /// local write and its `recordAutoTrackEvent` POST are two independent paths (see
+    /// `AUTO_TRACKING.md`), and only the server one survives a closed app, a lost/cleared App
+    /// Group container, or a queue that simply never got drained for days. Feeds recovered events
+    /// through the same `processPendingAutoTrackEvents` pipeline as the local queue, so it's
+    /// covered by the same window-merging logic — reprocessing an event the local queue already
+    /// turned into a session just idempotently extends that session's `endedAt` to the same
+    /// value, so double-reconciliation is harmless, not just rare.
+    ///
+    /// Watermarked on the server's `createdAt` (when the event was durably received), not the
+    /// client-reported `occurredAt` (when it happened on-device) — a callback that occurred
+    /// earlier but arrives late over a bad connection still gets a recent `createdAt`, so it's
+    /// still picked up by a later reconciliation pass instead of falling behind a watermark
+    /// already advanced past its `occurredAt`.
+    func reconcileServerAutoTrackEvents() async {
+        guard let uid = currentUser?.uid else { return }
+        let watermarkKey = "\(autoTrackEventsWatermarkKeyPrefix).\(uid)"
+        let watermarkSeconds = UserDefaults.standard.object(forKey: watermarkKey) as? Double ?? 0
+        let watermark = Date(timeIntervalSince1970: watermarkSeconds)
+
+        do {
+            let snapshot = try await autoTrackEventsCollection(for: uid)
+                .whereField("createdAt", isGreaterThan: Timestamp(date: watermark))
+                .order(by: "createdAt")
+                .limit(to: 500)
+                .getDocuments()
+            guard !snapshot.documents.isEmpty else { return }
+
+            var events: [PendingAutoTrackEvent] = []
+            var latestCreatedAt = watermark
+            for document in snapshot.documents {
+                guard let taskID = document.get("taskID") as? String,
+                      let occurredAt = (document.get("occurredAt") as? Timestamp)?.dateValue(),
+                      let createdAt = (document.get("createdAt") as? Timestamp)?.dateValue() else { continue }
+                events.append(PendingAutoTrackEvent(taskID: taskID, occurredAt: occurredAt))
+                latestCreatedAt = max(latestCreatedAt, createdAt)
+            }
+
+            UserDefaults.standard.set(latestCreatedAt.timeIntervalSince1970, forKey: watermarkKey)
+            DiagnosticsLog.log("autoTrack", "reconciled \(events.count) server-recovered event(s), watermark now \(latestCreatedAt)")
+            processPendingAutoTrackEvents(events)
+        } catch {
+            DiagnosticsLog.log("autoTrack", "failed to reconcile server auto-track events: \(error.localizedDescription)")
+        }
+    }
+
     private func processQueuedAutoTrackEvents() {
         guard !queuedAutoTrackEvents.isEmpty else { return }
+        // `recordAutoTrackedSession` decides "merge into an existing session" vs. "create a new
+        // one" purely by scanning the current `sessions` array. On a cold launch, the tasks
+        // snapshot regularly resolves (from cache) before the sessions snapshot does, and both
+        // the local App Group drain and `reconcileServerAutoTrackEvents` can already have events
+        // queued by then. Processing against a `sessions` array that just hasn't loaded yet is
+        // indistinguishable from "no matching session exists" and creates a duplicate, overlapping
+        // session instead of extending the real one — wait for the real snapshot instead.
+        guard hasReceivedInitialSessionsSnapshot else {
+            DiagnosticsLog.log("autoTrack", "sessions not loaded yet, deferring \(queuedAutoTrackEvents.count) queued event(s)")
+            return
+        }
 
         var remainingEvents: [PendingAutoTrackEvent] = []
         let eventsByTaskID = Dictionary(grouping: queuedAutoTrackEvents, by: \.taskID)
