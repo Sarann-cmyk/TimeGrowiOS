@@ -53,7 +53,11 @@ interface TaskDoc {
   autoTrackStoppedAt?: Timestamp;
   autoTrackActiveSessionID?: string;
   liveActivityPushToken?: string;
-  /** Server-side claim that a push-to-start was already sent for this timer window. */
+  /** Per-device ActivityKit update/end tokens. Legacy singular field remains for older clients. */
+  liveActivityPushTokens?: Record<string, string>;
+  /** Identity of the timer window for which a push-to-start was already sent. */
+  liveActivityStartRequestedFor?: string;
+  /** Timestamp retained for diagnostics alongside `liveActivityStartRequestedFor`. */
   liveActivityStartRequestedAt?: Timestamp;
 }
 
@@ -70,6 +74,11 @@ interface SessionDoc {
 
 interface DeviceDoc {
   activityPushToStartToken?: string;
+  /** Regular APNs token for a best-effort silent reconciliation wake. */
+  apnsDeviceToken?: string;
+  /** Timer-window identity already started on this particular physical app installation. */
+  liveActivityStartRequestedFor?: string;
+  liveActivityStartRequestedAt?: Timestamp;
   /** SHA-256 only; the raw per-device secret never reaches Firestore. */
   autoTrackingSecretHash?: string;
 }
@@ -89,6 +98,19 @@ function activeTimerStart(task: TaskDoc, now: Date): Date | null {
     }
   }
   return null;
+}
+
+/**
+ * A timestamp alone is not a stable identity for an auto-track live window: after a delayed
+ * stale write makes the server briefly regard it as stopped, the extension can legitimately
+ * resume with its original session-start timestamp. The active session document ID changes for
+ * that new server-side window, which lets us request a fresh Live Activity exactly once.
+ */
+function liveActivityStartKey(task: TaskDoc, startedAt: Date): string {
+  if (task.timerStartedAt) {
+    return `manual:${task.activeSessionID ?? startedAt.getTime()}`;
+  }
+  return `auto:${task.autoTrackActiveSessionID ?? startedAt.getTime()}`;
 }
 
 /**
@@ -122,6 +144,10 @@ const AUTO_TRACK_LIVE_GRACE_MS = 300_000;
  * while" without keeping this collection as a permanent, ever-growing duplicate of session history.
  */
 const AUTO_TRACK_EVENT_RETENTION_MS = 14 * 24 * 60 * 60 * 1_000;
+// Raw server-side diagnostics are deliberately retained for the same bounded period as the
+// recovery events. They contain no APNs tokens or device secret — only safe token suffixes and
+// APNs correlation IDs — and survive the extension's short App Group debug buffer.
+const LIVE_ACTIVITY_DIAGNOSTIC_RETENTION_MS = 14 * 24 * 60 * 60 * 1_000;
 // Mac writes both the device and owned-timer heartbeat every few seconds. Two minutes tolerates
 // short network stalls, but ensures force-quit/crash cannot leave an automatic session running
 // until somebody later opens TimeGrow on an iPhone.
@@ -151,6 +177,23 @@ function secureHashEquals(expected: string, receivedSecret: string): boolean {
 }
 
 /**
+ * Persists a small, user-scoped trace of the Screen Time → server → APNs chain. Cloud Logging is
+ * useful while developing, but it is noisy and finite; these entries can be imported into the
+ * in-app diagnostic export on the next foreground launch.
+ */
+function writeLiveActivityDiagnostic(
+  uid: string,
+  kind: string,
+  details: Record<string, unknown>,
+) {
+  return db.collection("users").doc(uid).collection("liveActivityDiagnostics").add({
+    kind,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    ...details,
+  });
+}
+
+/**
  * Receives Screen Time threshold events even when TimeGrow itself has been inactive for hours.
  * Firebase ID tokens expire in about one hour and cannot be refreshed reliably by a
  * DeviceActivityMonitor extension, so this endpoint instead authenticates a randomly generated,
@@ -169,6 +212,8 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
   const deviceID = typeof body?.deviceID === "string" ? body.deviceID : "";
   const deviceSecret = typeof body?.deviceSecret === "string" ? body.deviceSecret : "";
   const taskID = typeof body?.taskID === "string" ? body.taskID : "";
+  const thresholdStep = typeof body?.thresholdStep === "number" ? body.thresholdStep : null;
+  const monitorActivity = typeof body?.monitorActivity === "string" ? body.monitorActivity : null;
   if (!uid || !deviceID || !deviceSecret || !taskID) {
     response.status(400).json({ error: "invalid-request" });
     return;
@@ -269,18 +314,137 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
           createdAt: admin.firestore.Timestamp.fromDate(now),
         });
       }
-      return { started: !wasRunning, sessionStartedAt, eventAlreadyRecorded: eventSnapshot.exists };
+      return {
+        started: !wasRunning,
+        sessionStartedAt,
+        sessionID,
+        eventAlreadyRecorded: eventSnapshot.exists,
+      };
     });
 
     console.log(`secure auto-track event accepted (task ${taskID}, device ${deviceID}, started=${result.started}, eventAlreadyRecorded=${result.eventAlreadyRecorded})`);
+    await writeLiveActivityDiagnostic(uid, "thresholdAccepted", {
+      taskID,
+      deviceID,
+      thresholdStep,
+      monitorActivity,
+      occurredAt: admin.firestore.Timestamp.fromDate(occurredAt),
+      requestedSessionStart: admin.firestore.Timestamp.fromDate(requestedSessionStart),
+      sessionStartedAt: admin.firestore.Timestamp.fromDate(result.sessionStartedAt),
+      sessionID: result.sessionID,
+      startedLiveWindow: result.started,
+      eventAlreadyRecorded: result.eventAlreadyRecorded,
+    });
     response.status(200).json({ ok: true, started: result.started });
   } catch (error) {
     const message = String(error instanceof Error ? error.message : error);
     const status = message === "unauthorized-device" ? 401 : message === "task-not-found" ? 404 : 500;
     if (status === 500) console.error("secure auto-track event failed", error);
+    if (uid && taskID) {
+      await writeLiveActivityDiagnostic(uid, "thresholdRejected", {
+        taskID,
+        deviceID,
+        thresholdStep,
+        monitorActivity,
+        status,
+        reason: status === 500 ? "internal-error" : message,
+      }).catch((diagnosticError) => console.error("failed to persist threshold rejection diagnostic", diagnosticError));
+    }
     response.status(status).json({ error: status === 500 ? "internal-error" : message });
   }
 });
+
+/**
+ * Push-to-start wakes iOS just long enough to issue the new Activity's update/end token. Upload
+ * it over a small HTTPS request instead of depending on a Firestore listener reconnecting in
+ * that narrow background window. If the Mac has already stopped the task by the time this token
+ * arrives, end the Activity immediately — no foreground app launch is required.
+ */
+export const registerLiveActivityPushToken = onRequest(
+  { secrets: [APNS_AUTH_KEY, APNS_KEY_ID, APNS_TEAM_ID] },
+  async (request, response) => {
+    if (request.method !== "POST") {
+      response.status(405).json({ error: "method-not-allowed" });
+      return;
+    }
+
+    const body = request.body as Record<string, unknown> | undefined;
+    const uid = typeof body?.uid === "string" ? body.uid : "";
+    const deviceID = typeof body?.deviceID === "string" ? body.deviceID : "";
+    const deviceSecret = typeof body?.deviceSecret === "string" ? body.deviceSecret : "";
+    const taskID = typeof body?.taskID === "string" ? body.taskID : "";
+    const activityPushToken = typeof body?.activityPushToken === "string" ? body.activityPushToken : "";
+    if (!uid || !deviceID || !deviceSecret || !taskID || !activityPushToken) {
+      response.status(400).json({ error: "invalid-request" });
+      return;
+    }
+
+    const now = new Date();
+    const userRef = db.collection("users").doc(uid);
+    const deviceRef = userRef.collection("devices").doc(deviceID);
+    const taskRef = userRef.collection("tasks").doc(taskID);
+
+    try {
+      const runningStart = await db.runTransaction(async (transaction): Promise<Date | null> => {
+        const deviceSnapshot = await transaction.get(deviceRef);
+        const expectedHash = deviceSnapshot.get("autoTrackingSecretHash");
+        if (typeof expectedHash !== "string" || !secureHashEquals(expectedHash, deviceSecret)) {
+          throw new Error("unauthorized-device");
+        }
+
+        const taskSnapshot = await transaction.get(taskRef);
+        const task = taskSnapshot.data() as TaskDoc | undefined;
+        if (!task) throw new Error("task-not-found");
+
+        const start = activeTimerStart(task, now);
+        if (!start) return null;
+
+        transaction.update(taskRef, {
+          liveActivityPushToken: activityPushToken,
+          liveActivityPushTokens: {
+            ...(task.liveActivityPushTokens ?? {}),
+            [deviceID]: activityPushToken,
+          },
+        });
+        return start;
+      });
+
+      if (runningStart) {
+        await sendLiveActivityUpdate(credentials(), activityPushToken, contentState(runningStart));
+        await writeLiveActivityDiagnostic(uid, "activityTokenRegistered", {
+          taskID,
+          deviceID,
+          token: tokenHint(activityPushToken),
+          running: true,
+        });
+        response.status(200).json({ ok: true, running: true });
+      } else {
+        await sendLiveActivityEnd(credentials(), activityPushToken, contentState(now));
+        await writeLiveActivityDiagnostic(uid, "activityTokenRegisteredAfterStop", {
+          taskID,
+          deviceID,
+          token: tokenHint(activityPushToken),
+          running: false,
+        });
+        response.status(200).json({ ok: true, running: false, ended: true });
+      }
+    } catch (error) {
+      const message = String(error instanceof Error ? error.message : error);
+      const status = message === "unauthorized-device" ? 401 : message === "task-not-found" ? 404 : 500;
+      if (status === 500) console.error("activity push-token registration failed", error);
+      if (uid && taskID) {
+        await writeLiveActivityDiagnostic(uid, "activityTokenRegistrationFailed", {
+          taskID,
+          deviceID,
+          token: tokenHint(activityPushToken),
+          status,
+          reason: status === 500 ? "internal-error" : message,
+        }).catch((diagnosticError) => console.error("failed to persist activity-token diagnostic", diagnosticError));
+      }
+      response.status(status).json({ error: status === 500 ? "internal-error" : message });
+    }
+  }
+);
 
 /**
  * Reacts to every task write: starts a Live Activity via push-to-start on every device that has
@@ -304,26 +468,37 @@ export const onTaskTimerChanged = onDocumentUpdated(
       // Function invocations can overlap and Firestore listeners can briefly replay an older
       // before/after pair after a poor connection. Claim this exact timer window transactionally
       // before asking APNs to create a Live Activity, otherwise each replay causes a visible
-      // push-to-start alert even though tracking never stopped.
+      // push-to-start alert even though tracking never stopped. The claim uses the actual
+      // session/window identity, not the function's current time or merely `startedAt`: a
+      // delayed stale write can stop the server's auto window while the extension retains the
+      // same original session-start timestamp for the next threshold.
       const taskRef = db.collection("users").doc(uid).collection("tasks").doc(taskID);
-      const didClaimStart = await db.runTransaction(async (transaction) => {
+      const claimedStart = await db.runTransaction(async (transaction): Promise<Date | null> => {
         const currentSnapshot = await transaction.get(taskRef);
         const currentTask = currentSnapshot.data() as TaskDoc | undefined;
         const currentStart = currentTask ? activeTimerStart(currentTask, now) : null;
-        if (!currentTask || !currentStart) return false;
+        if (!currentTask || !currentStart) return null;
 
-        const previousClaim = currentTask.liveActivityStartRequestedAt?.toDate();
-        if (previousClaim && previousClaim >= currentStart) return false;
+        const currentStartKey = liveActivityStartKey(currentTask, currentStart);
+        if (currentTask.liveActivityStartRequestedFor === currentStartKey) return null;
 
         transaction.update(taskRef, {
+          liveActivityStartRequestedFor: currentStartKey,
           liveActivityStartRequestedAt: admin.firestore.Timestamp.fromDate(now),
         });
-        return true;
+        return currentStart;
       });
-      if (!didClaimStart) {
+      if (!claimedStart) {
         console.log(`Live Activity start already claimed or task no longer active (task ${taskID})`);
         return;
       }
+
+      const startKey = liveActivityStartKey(after, claimedStart);
+      await writeLiveActivityDiagnostic(uid, "liveActivityStartClaimed", {
+        taskID,
+        startKey,
+        startedAt: admin.firestore.Timestamp.fromDate(claimedStart),
+      });
 
       const devicesSnap = await db.collection("users").doc(uid).collection("devices").get();
       const creds = credentials();
@@ -341,12 +516,27 @@ export const onTaskTimerChanged = onDocumentUpdated(
       // function even ran. Push-to-start on top of that creates a second, independent Live
       // Activity for the same task — two identical entries on that device's lock screen. Only
       // *other* devices need the push; the originating device already has its own activity.
+      // Historical device documents can retain that same token after an iOS reinstall; excluding
+      // only the owner *document* would still bounce a start right back to the originating phone.
+      const ownerDevice = after.timerOwnerDeviceID
+        ? devicesSnap.docs.find((doc) => doc.id === after.timerOwnerDeviceID)
+        : undefined;
+      const ownerStartToken = ownerDevice?.get("activityPushToStartToken") as string | undefined;
+      const ownerWakeToken = ownerDevice?.get("apnsDeviceToken") as string | undefined;
+      // Device records survive reinstalls. Several historical records can still contain the
+      // same currently valid token, and APNs treats every `start` sent to it as a new Activity.
+      // Deduplicate by token (not document ID) before fan-out.
+      const seenStartTokens = new Set<string>();
       const startTokensByDoc = devicesSnap.docs
         .filter((doc) => doc.id !== after.timerOwnerDeviceID)
         .map((doc) => ({ doc, token: doc.get("activityPushToStartToken") as string | undefined }))
-        .filter((entry): entry is { doc: typeof entry.doc; token: string } => !!entry.token);
+        .filter((entry): entry is { doc: typeof entry.doc; token: string } => {
+          if (!entry.token || entry.token === ownerStartToken || seenStartTokens.has(entry.token)) return false;
+          seenStartTokens.add(entry.token);
+          return true;
+        });
       if (startTokensByDoc.length > 0) {
-        const state = contentState(runningStart);
+        const state = contentState(claimedStart);
         const attributes = {
           taskID,
           taskName: after.name ?? "",
@@ -355,9 +545,26 @@ export const onTaskTimerChanged = onDocumentUpdated(
         await Promise.all(
           startTokensByDoc.map(({ doc, token }) =>
             sendLiveActivityStart(creds, token, ATTRIBUTES_TYPE, attributes, state)
-              .then((response) => console.log(`push-to-start accepted by APNs (task ${taskID}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
+              .then(async (response) => {
+                console.log(`push-to-start accepted by APNs (task ${taskID}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`);
+                await writeLiveActivityDiagnostic(uid, "pushToStartAccepted", {
+                  taskID,
+                  startKey,
+                  deviceID: doc.id,
+                  token: tokenHint(token),
+                  status: response.status,
+                  apnsID: response.apnsID ?? null,
+                });
+              })
               .catch(async (error) => {
                 console.error(`push-to-start failed (task ${taskID}, token ${tokenHint(token)})`, error);
+                await writeLiveActivityDiagnostic(uid, "pushToStartFailed", {
+                  taskID,
+                  startKey,
+                  deviceID: doc.id,
+                  token: tokenHint(token),
+                  reason: String(error?.message ?? error),
+                });
                 // Apple returns 410 "Unregistered" for a token that no longer resolves to any
                 // installed app instance (e.g. a stale token left over from a previous install).
                 // Clearing it here keeps future writes from repeatedly retrying dead tokens.
@@ -367,15 +574,24 @@ export const onTaskTimerChanged = onDocumentUpdated(
               })
           )
         );
+      } else {
+        await writeLiveActivityDiagnostic(uid, "pushToStartSkipped", {
+          taskID,
+          startKey,
+          reason: "no-addressable-device-token",
+        });
       }
 
       // Secondary: silently wake the app so it can run `LiveActivityManager.reconcile()` for
       // everything push-to-start *doesn't* need foreground for — syncing the per-activity push
       // token, ending activities for tasks that stopped, etc. Also gives the app a chance to
       // pick up state if it happens to already be foreground when this arrives.
-      const wakeTokens = devicesSnap.docs
+      const wakeTokens = [...new Set(devicesSnap.docs
         .map((doc) => doc.get("apnsDeviceToken") as string | undefined)
-        .filter((token): token is string => !!token);
+        // The foreground device that just performed a manual Start already reconciled locally.
+        // Waking it again starts an unnecessary fetch/reconcile burst exactly under the user's
+        // finger; filtering by token also covers stale device documents from old installs.
+        .filter((token): token is string => !!token && token !== ownerWakeToken))];
       await Promise.all(
         wakeTokens.map((token) =>
           sendBackgroundWake(creds, token)
@@ -404,18 +620,24 @@ export const onTaskTimerChanged = onDocumentUpdated(
 
     if (wasRunning && !runningStart) {
       const beforeStart = activeTimerStart(before, now) ?? now;
-      const token = before.liveActivityPushToken;
-      console.log(`timer stop transition observed (task ${taskID}, hadLiveActivityToken=${Boolean(token)}, previousStart=${beforeStart.toISOString()})`);
-      if (!token) {
+      const activityTokens = [...new Set([
+        before.liveActivityPushToken,
+        ...Object.values(before.liveActivityPushTokens ?? {}),
+      ].filter((token): token is string => !!token))];
+      console.log(`timer stop transition observed (task ${taskID}, activityTokenCount=${activityTokens.length}, previousStart=${beforeStart.toISOString()})`);
+      if (activityTokens.length === 0) {
         // A push-to-start activity can be visible before iOS gives the app time to upload its
         // per-activity token. Without that token APNs cannot receive an ActivityKit `end` push,
         // but a normal background push lets the app fetch the stopped task and end the activity
         // locally. This remains a best-effort fallback because iOS may defer silent pushes.
         console.warn(`Live Activity end token missing; sending background reconciliation wake (task ${taskID})`);
         const devicesSnap = await db.collection("users").doc(uid).collection("devices").get();
-        const wakeTokens = devicesSnap.docs
+        const ownerWakeToken = before.timerOwnerDeviceID
+          ? devicesSnap.docs.find((doc) => doc.id === before.timerOwnerDeviceID)?.get("apnsDeviceToken") as string | undefined
+          : undefined;
+        const wakeTokens = [...new Set(devicesSnap.docs
           .map((doc) => doc.get("apnsDeviceToken") as string | undefined)
-          .filter((deviceToken): deviceToken is string => !!deviceToken);
+          .filter((deviceToken): deviceToken is string => !!deviceToken && deviceToken !== ownerWakeToken))];
         if (wakeTokens.length === 0) {
           console.warn(`Live Activity fallback wake skipped: no APNs device tokens (task ${taskID})`);
           return;
@@ -430,9 +652,13 @@ export const onTaskTimerChanged = onDocumentUpdated(
         return;
       }
 
-      await sendLiveActivityEnd(credentials(), token, contentState(beforeStart))
-        .then((response) => console.log(`Live Activity end accepted by APNs (task ${taskID}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
-        .catch((error) => console.error(`Live Activity end push failed (task ${taskID}, token ${tokenHint(token)})`, error));
+      await Promise.all(
+        activityTokens.map((token) =>
+          sendLiveActivityEnd(credentials(), token, contentState(beforeStart))
+            .then((response) => console.log(`Live Activity end accepted by APNs (task ${taskID}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
+            .catch((error) => console.error(`Live Activity end push failed (task ${taskID}, token ${tokenHint(token)})`, error))
+        )
+      );
     }
   }
 );
@@ -467,12 +693,43 @@ export const onDevicePushToStartTokenChanged = onDocumentWritten(
     const active = activeTasks[0];
     if (!active) return;
 
+    // iOS can rotate `pushToStartToken` while a Live Activity is already visible. This callback
+    // used to treat every rotation as a fresh install and send another `start`; ActivityKit does
+    // not deduplicate starts by attributes, so the Lock Screen accumulated identical cards. Claim
+    // the exact timer window on this device document before sending. A genuine reinstall creates
+    // a new device document and is still eligible for one catch-up start.
+    const deviceRef = event.data!.after.ref;
+    const taskRef = db.collection("users").doc(uid).collection("tasks").doc(active.taskID);
+    const claimedStart = await db.runTransaction(async (transaction): Promise<{ task: TaskDoc; startedAt: Date } | null> => {
+      const deviceSnapshot = await transaction.get(deviceRef);
+      if (deviceSnapshot.get("activityPushToStartToken") !== token) return null;
+
+      const taskSnapshot = await transaction.get(taskRef);
+      const currentTask = taskSnapshot.data() as TaskDoc | undefined;
+      const currentStartedAt = currentTask ? activeTimerStart(currentTask, now) : null;
+      if (!currentTask || !currentStartedAt) return null;
+
+      const startKey = liveActivityStartKey(currentTask, currentStartedAt);
+      if (deviceSnapshot.get("liveActivityStartRequestedFor") === startKey) return null;
+
+      transaction.update(deviceRef, {
+        liveActivityStartRequestedFor: startKey,
+        liveActivityStartRequestedAt: admin.firestore.Timestamp.fromDate(now),
+      });
+      return { task: currentTask, startedAt: currentStartedAt };
+    });
+
+    if (!claimedStart) {
+      console.log(`catch-up start skipped; current timer window already claimed or changed (device ${deviceID})`);
+      return;
+    }
+
     const attributes = {
       taskID: active.taskID,
-      taskName: active.task.name ?? "",
-      colorHex: active.task.colorHex ?? "#8CD616",
+      taskName: claimedStart.task.name ?? "",
+      colorHex: claimedStart.task.colorHex ?? "#8CD616",
     };
-    await sendLiveActivityStart(credentials(), token, ATTRIBUTES_TYPE, attributes, contentState(active.startedAt))
+    await sendLiveActivityStart(credentials(), token, ATTRIBUTES_TYPE, attributes, contentState(claimedStart.startedAt))
       .then(() => console.log(`catch-up push-to-start sent OK (task ${active.taskID}, device ${deviceID})`))
       .catch(async (error) => {
         console.error(`catch-up push-to-start failed (device ${deviceID})`, error);
@@ -508,20 +765,30 @@ export const refreshLiveActivities = onSchedule(
     await Promise.all(
       snap.docs.map(async (doc) => {
         const task = doc.data() as TaskDoc;
-        const token = task.liveActivityPushToken;
-        if (!token) return;
-        const runningStart = activeTimerStart(task, now);
-        if (runningStart) {
-          await sendLiveActivityUpdate(creds, token, contentState(runningStart, now)).catch((error) =>
-            console.error(`minute-window update failed (${doc.ref.path})`, error)
-          );
+    const activityTokens = [...new Set([
+      task.liveActivityPushToken,
+      ...Object.values(task.liveActivityPushTokens ?? {}),
+    ].filter((token): token is string => !!token))];
+    if (activityTokens.length === 0) return;
+    const runningStart = activeTimerStart(task, now);
+    if (runningStart) {
+          await Promise.all(activityTokens.map((token) =>
+            sendLiveActivityUpdate(creds, token, contentState(runningStart, now)).catch((error) =>
+              console.error(`minute-window update failed (${doc.ref.path})`, error)
+            )
+          ));
           return;
         }
 
-        await sendLiveActivityEnd(creds, token, contentState(now))
-          .then((response) => console.log(`scheduled Live Activity end accepted by APNs (task ${doc.ref.path}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
-          .catch((error) => console.error(`scheduled Live Activity end push failed (task ${doc.ref.path}, token ${tokenHint(token)})`, error));
-        await doc.ref.update({ liveActivityPushToken: admin.firestore.FieldValue.delete() });
+        await Promise.all(activityTokens.map((token) =>
+          sendLiveActivityEnd(creds, token, contentState(now))
+            .then((response) => console.log(`scheduled Live Activity end accepted by APNs (task ${doc.ref.path}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
+            .catch((error) => console.error(`scheduled Live Activity end push failed (task ${doc.ref.path}, token ${tokenHint(token)})`, error))
+        ));
+        await doc.ref.update({
+          liveActivityPushToken: admin.firestore.FieldValue.delete(),
+          liveActivityPushTokens: admin.firestore.FieldValue.delete(),
+        });
       })
     );
   }
@@ -637,5 +904,29 @@ export const pruneAutoTrackEvents = onSchedule(
       await batch.commit();
     }
     console.log(`pruned ${staleEvents.size} stale auto-track event(s) older than ${cutoff.toISOString()}`);
+  }
+);
+
+/** Server traces are diagnostic data, not product history; retain them only long enough to export
+ * an intermittent incident and then remove them automatically. */
+export const pruneLiveActivityDiagnostics = onSchedule(
+  { schedule: "every 24 hours" },
+  async () => {
+    const cutoff = new Date(Date.now() - LIVE_ACTIVITY_DIAGNOSTIC_RETENTION_MS);
+    const staleDiagnostics = await db
+      .collectionGroup("liveActivityDiagnostics")
+      .where("createdAt", "<", admin.firestore.Timestamp.fromDate(cutoff))
+      .get();
+    if (staleDiagnostics.empty) return;
+
+    const batchSize = 400;
+    for (let start = 0; start < staleDiagnostics.docs.length; start += batchSize) {
+      const batch = db.batch();
+      for (const doc of staleDiagnostics.docs.slice(start, start + batchSize)) {
+        batch.delete(doc.ref);
+      }
+      await batch.commit();
+    }
+    console.log(`pruned ${staleDiagnostics.size} stale Live Activity diagnostic(s) older than ${cutoff.toISOString()}`);
   }
 );

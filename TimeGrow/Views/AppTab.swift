@@ -31,7 +31,7 @@ enum AppTab: String, CaseIterable, Identifiable {
         case .tasks:
             "checklist"
         case .timeline:
-            "clock.fill"
+            "list.bullet"
         case .reports:
             "chart.bar.fill"
         case .settings:

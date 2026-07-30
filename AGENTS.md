@@ -398,6 +398,11 @@ Heartbeat / stale handling:
 
 ## Auto tracking architecture
 
+Detailed maps: `AUTO_TRACKING.md` covers the Screen Time pipeline; read
+`AUTO_TRACKING_RELIABILITY.md` before changing threshold delivery, deduplication, monitor rearm,
+or the time-credit model. The latter documents the intentional undercount-vs-double-count tradeoff
+and the permanent server diagnostics added on 2026-07-30.
+
 Files:
 
 - `TimeGrow/AutoTracking/AutoTrackingStore.swift`

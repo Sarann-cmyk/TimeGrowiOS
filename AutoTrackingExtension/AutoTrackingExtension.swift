@@ -111,7 +111,14 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         if isFinalStep {
             rearmMonitoring(after: activity)
         }
-        syncAutoTrackLiveState(taskID: resolvedTaskID, occurredAt: occurredAt, sessionStartedAt: sessionStartedAt, sharedDefaults: sharedDefaults)
+        syncAutoTrackLiveState(
+            taskID: resolvedTaskID,
+            occurredAt: occurredAt,
+            sessionStartedAt: sessionStartedAt,
+            thresholdStep: accumulatedStep(from: event),
+            monitorActivity: activity.rawValue,
+            sharedDefaults: sharedDefaults
+        )
     }
 
     private static let dayFormatter: DateFormatter = {
@@ -184,11 +191,20 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     /// Firebase ID-token snapshot used before, this remains valid after the main app has been
     /// closed overnight; the function writes Firestore and the existing push-to-start trigger
     /// creates the Live Activity.
-    private func syncAutoTrackLiveState(taskID: String, occurredAt: Date, sessionStartedAt: Date, sharedDefaults: UserDefaults) {
+    private func syncAutoTrackLiveState(
+        taskID: String,
+        occurredAt: Date,
+        sessionStartedAt: Date,
+        thresholdStep: Int,
+        monitorActivity: String,
+        sharedDefaults: UserDefaults
+    ) {
         submitAutoTrackEvent(
             taskID: taskID,
             occurredAt: occurredAt,
             sessionStartedAt: sessionStartedAt,
+            thresholdStep: thresholdStep,
+            monitorActivity: monitorActivity,
             sharedDefaults: sharedDefaults
         )
     }
@@ -197,6 +213,8 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         taskID: String,
         occurredAt: Date,
         sessionStartedAt: Date,
+        thresholdStep: Int,
+        monitorActivity: String,
         sharedDefaults: UserDefaults
     ) {
         guard let uid = sharedDefaults.string(forKey: authUIDKey),
@@ -225,6 +243,8 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
             "taskID": taskID,
             "occurredAt": occurredAt.timeIntervalSince1970,
             "sessionStartedAt": sessionStartedAt.timeIntervalSince1970,
+            "thresholdStep": thresholdStep,
+            "monitorActivity": monitorActivity,
         ])
 
         let semaphore = DispatchSemaphore(value: 0)

@@ -44,6 +44,7 @@ struct TaskTile: View {
                             DiagnosticsLog.log("timer", "manual start tap task=\(task.name) id=\(task.id ?? "?") at=\(tapAt)")
                         }
                         onToggleTimer()
+                        DiagnosticsLog.log("timer", "manual start onToggleTimer returned task=\(task.name) id=\(task.id ?? "?")")
                     }
                 }
                 .onChange(of: task.isTimerRunning) { _, isRunning in
@@ -165,7 +166,7 @@ struct TaskTile: View {
         .frame(height: 122)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(isVisuallyActive ? task.color.opacity(isInterrupted ? 0.05 : 0.187) : Color.white.opacity(0.07))
+                .fill(isVisuallyActive ? task.color.opacity(isInterrupted ? 0.05 : 0.341) : Color.white.opacity(0.07))
         )
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {

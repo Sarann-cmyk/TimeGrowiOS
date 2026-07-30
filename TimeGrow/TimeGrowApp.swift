@@ -17,6 +17,12 @@ import UserNotifications
 /// local `LiveActivityManager.reconcile()` path instead.
 class AppDelegate: NSObject, UIApplicationDelegate {
     private var latestRemoteNotificationToken: String?
+    /// A single timer write can legitimately produce several APNs wake packets (for example an
+    /// old packet arriving alongside the current task update). Fetching Firestore and reconciling
+    /// ActivityKit once per packet puts that work on the main actor in a burst and visibly stalls
+    /// the Tasks tab. Keep every system completion handler, but coalesce the actual work.
+    private var pendingBackgroundFetchCompletions: [(UIBackgroundFetchResult) -> Void] = []
+    private var isHandlingBackgroundNotification = false
     var remoteNotificationTokenHandler: ((String) -> Void)? {
         didSet {
             if let latestRemoteNotificationToken {
@@ -63,7 +69,37 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             completionHandler(.noData)
             return
         }
-        handler { completionHandler(.newData) }
+        pendingBackgroundFetchCompletions.append(completionHandler)
+        guard !isHandlingBackgroundNotification else {
+            DiagnosticsLog.log("push", "Coalesced duplicate background reconciliation wake")
+            return
+        }
+
+        isHandlingBackgroundNotification = true
+        var didFinish = false
+        let finish: () -> Void = { [weak self] in
+            DispatchQueue.main.async {
+                guard !didFinish else { return }
+                didFinish = true
+                guard let self else {
+                    completionHandler(.newData)
+                    return
+                }
+                let completions = self.pendingBackgroundFetchCompletions
+                self.pendingBackgroundFetchCompletions.removeAll()
+                self.isHandlingBackgroundNotification = false
+                completions.forEach { $0(.newData) }
+            }
+        }
+        handler(finish)
+
+        // A server fetch can be suspended by iOS when the background execution lease expires.
+        // Never let one such fetch permanently swallow all later stop-wake notifications.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+            guard !didFinish else { return }
+            DiagnosticsLog.log("push", "Background reconciliation timed out; releasing queued wakes")
+            finish()
+        }
     }
 }
 
@@ -103,7 +139,10 @@ struct TimeGrowApp: App {
                     taskService.start()
                     autoTrackingStore.refreshMonitoring(for: taskService.tasks)
                     processPendingAutoTrackEvents()
-                    Task { await taskService.reconcileServerAutoTrackEvents() }
+                    Task {
+                        await taskService.reconcileServerAutoTrackEvents()
+                        await taskService.reconcileServerLiveActivityDiagnostics()
+                    }
                     LiveActivityManager.shared.pushTokenHandler = { taskID, token in
                         taskService.updateLiveActivityPushToken(taskID: taskID, token: token)
                     }
@@ -128,6 +167,9 @@ struct TimeGrowApp: App {
                             done()
                         }
                     }
+                    taskService.fetchTasksOnce { tasks in
+                        LiveActivityManager.shared.reconcile(tasks: tasks ?? taskService.tasks)
+                    }
                 }
                 .onChange(of: languageManager.current) { oldLanguage, newLanguage in
                     DiagnosticsLog.log(
@@ -141,7 +183,19 @@ struct TimeGrowApp: App {
                         autoTrackingStore.refreshAuthorizationStatus()
                         autoTrackingStore.refreshMonitoring(for: taskService.tasks)
                         processPendingAutoTrackEvents()
-                        Task { await taskService.reconcileServerAutoTrackEvents() }
+                        Task {
+                            await taskService.reconcileServerAutoTrackEvents()
+                            await taskService.reconcileServerLiveActivityDiagnostics()
+                        }
+                        // A remotely push-started Live Activity can exist even when the app did
+                        // not receive enough background time to upload its per-activity token.
+                        // In that case the server cannot send an addressable ActivityKit `end`.
+                        // When the user returns to the app, fetch authoritative task state and
+                        // end any such orphan immediately instead of waiting for a listener
+                        // callback that may contain no visible task change.
+                        taskService.fetchTasksOnce { tasks in
+                            LiveActivityManager.shared.reconcile(tasks: tasks ?? taskService.tasks)
+                        }
                     }
                 }
                 .onChange(of: taskService.tasks) { _, tasks in
@@ -180,4 +234,3 @@ struct TimeGrowApp: App {
         }
     }
 }
-

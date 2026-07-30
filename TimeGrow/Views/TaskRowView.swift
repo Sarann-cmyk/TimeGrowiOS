@@ -44,6 +44,7 @@ struct TaskRow: View {
                             DiagnosticsLog.log("timer", "manual start tap task=\(task.name) id=\(task.id ?? "?") at=\(tapAt)")
                         }
                         onToggleTimer()
+                        DiagnosticsLog.log("timer", "manual start onToggleTimer returned task=\(task.name) id=\(task.id ?? "?")")
                     }
                 }
                 .onChange(of: task.isTimerRunning) { _, isRunning in
@@ -163,7 +164,7 @@ struct TaskRow: View {
         .frame(height: 68)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(isVisuallyActive ? task.color.opacity(isInterrupted ? 0.05 : 0.187) : Color.white.opacity(0.07))
+                .fill(isVisuallyActive ? task.color.opacity(isInterrupted ? 0.05 : 0.341) : Color.white.opacity(0.07))
         )
         .overlay {
             if isVisuallyActive {
@@ -241,6 +242,7 @@ struct TaskAvatarCircle: View {
 
     private var iconFontSize: CGFloat { 12 * size / 31 }
     private var strokeWidth: CGFloat { 1.2 * size / 31 }
+    private var activeRingStrokeWidth: CGFloat { 3 * size / 31 }
 
     var body: some View {
         if isPulsing {
@@ -260,14 +262,17 @@ struct TaskAvatarCircle: View {
             let secondsFraction = Double(elapsedSeconds % 60) / 60
             ZStack {
                 Circle()
-                    .stroke(color.opacity(0.25), lineWidth: 2)
+                    .stroke(Color.white.opacity(0.25), style: StrokeStyle(lineWidth: activeRingStrokeWidth))
                 Circle()
                     .trim(from: 0, to: secondsFraction)
-                    .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                    .stroke(
+                        Color.white,
+                        style: StrokeStyle(lineWidth: activeRingStrokeWidth, lineCap: .round)
+                    )
                     .rotationEffect(.degrees(-90))
                 Image(systemName: "pause.fill")
                     .font(.system(size: iconFontSize, weight: .bold))
-                    .foregroundStyle(color)
+                    .foregroundStyle(Color.white)
             }
             .frame(width: size, height: size)
         } else {

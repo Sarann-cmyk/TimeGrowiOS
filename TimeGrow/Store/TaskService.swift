@@ -54,13 +54,20 @@ enum TimerOwnerStatus: Equatable, CustomStringConvertible {
 @MainActor
 final class TaskService: NSObject, ObservableObject {
     @Published private(set) var tasks: [TGTask] = [] {
-        didSet { LiveActivityManager.shared.reconcile(tasks: tasks) }
+        didSet {
+            scheduleLiveActivityReconciliationIfNeeded(previousTasks: oldValue)
+        }
     }
     @Published private(set) var sessions: [TaskTimeSession] = [] {
         didSet {
+            sessionsByTaskID = Dictionary(grouping: sessions, by: \.taskID)
             CalendarSyncManager.shared.observeSessions(sessions, userID: currentUser?.uid, taskService: self)
         }
     }
+    /// The Tasks tab renders this data for every row. Keep the grouping beside the published
+    /// source instead of making each row scan the complete 30-day session cache on every
+    /// timer tick or optimistic start.
+    private(set) var sessionsByTaskID: [String: [TaskTimeSession]] = [:]
     @Published private(set) var devices: [String: UserDeviceHeartbeat] = [:]
     @Published private(set) var trackingSettings: TrackingSettings = .defaults
     @Published private(set) var pendingStops: [String: AutoTrackPendingStop] = [:]
@@ -78,6 +85,11 @@ final class TaskService: NSObject, ObservableObject {
     @Published private(set) var hasReceivedInitialSessionsSnapshot = false
 
     var isAnonymous: Bool { currentUser?.isAnonymous ?? true }
+
+    func sessions(forTaskID taskID: String?) -> [TaskTimeSession] {
+        guard let taskID else { return [] }
+        return sessionsByTaskID[taskID] ?? []
+    }
     var displayName: String? { currentUser?.displayName?.isEmpty == false ? currentUser?.displayName : nil }
     var email: String? { currentUser?.email }
 
@@ -98,6 +110,12 @@ final class TaskService: NSObject, ObservableObject {
     private var autoClosingTaskIDs: Set<String> = []
     private var queuedAutoTrackEvents: [PendingAutoTrackEvent] = []
     private var optimisticTimerStarts: [String: OptimisticTimerStart] = [:]
+    /// ActivityKit emits its current token and then often repeats the same value through the
+    /// update stream. Persisting every copy creates a task-write → Cloud Function → silent-push
+    /// feedback loop while the user is tapping Start/Stop.
+    private var lastPersistedPushToStartToken: (uid: String, token: String)?
+    private var lastPersistedAPNsDeviceToken: (uid: String, token: String)?
+    private var lastPersistedLiveActivityPushTokenByTaskID: [String: (uid: String, token: String?)] = [:]
     private let staleCheckInterval: TimeInterval = 5
     private let heartbeatInterval: TimeInterval = 15
     /// This protects only an auto-tracked timer owned by a *different Mac*. It must never be
@@ -112,11 +130,118 @@ final class TaskService: NSObject, ObservableObject {
     private let autoTrackingDeviceSecretKey = "autoTracking.deviceSecret"
     private let autoTrackingDeviceSecretHashField = "autoTrackingSecretHash"
     private let autoTrackEventsWatermarkKeyPrefix = "autoTracking.serverEventsWatermark"
+    private let liveActivityDiagnosticsWatermarkKeyPrefix = "liveActivity.serverDiagnosticsWatermark"
 
     private struct OptimisticTimerStart {
         let sessionID: String?
         let startedAt: Date
         let updatedAt: Date
+    }
+
+    /// The only task values that can start or stop a Live Activity. Firestore also emits
+    /// snapshots for unrelated fields such as a push token, heartbeat, or `updatedAt`; running
+    /// a full ActivityKit reconciliation for each of those snapshots created a main-thread
+    /// storm exactly when a manual timer was being started.
+    private struct LiveActivityLifecycleState: Equatable {
+        let taskID: String
+        let startedAt: Date?
+        let taskName: String
+        let colorHex: String
+    }
+
+    /// Fields that affect application UI, tracking, or recovery. `updatedAt` and the two
+    /// ActivityKit transport fields are intentionally omitted: they can change many times for
+    /// one unchanged timer, and publishing those snapshots re-runs SwiftUI and Screen Time
+    /// monitoring for no user-visible reason.
+    private struct TaskPresentationState: Equatable {
+        let id: String
+        let name: String
+        let colorHex: String
+        let createdAt: Date
+        let timerStartedAt: Date?
+        let activeSessionID: String?
+        let timerOwnerDeviceID: String?
+        let timerOwnerPlatform: String?
+        let timerOwnerDeviceName: String?
+        let timerOwnerLastAliveAt: Date?
+        let timerOwnerIsActive: Bool?
+        let autoTrackLastUsageAt: Date?
+        let autoTrackLiveUntil: Date?
+        let autoTrackActiveSessionID: String?
+        let autoTrackSessionStartedAt: Date?
+        let autoTrackStoppedAt: Date?
+        let sortOrder: Double?
+    }
+
+    private var scheduledLiveActivityReconciliation: Task<Void, Never>?
+
+    private func scheduleLiveActivityReconciliationIfNeeded(previousTasks: [TGTask]) {
+        let previousState = liveActivityLifecycleState(for: previousTasks)
+        let currentState = liveActivityLifecycleState(for: tasks)
+        guard currentState != previousState else { return }
+
+        // Activity.request performs synchronous IPC inside ActivityKit. Always yield a frame
+        // after the task-list mutation, then coalesce any immediately following Firestore
+        // snapshots into the newest state. This makes the play button and elapsed label render
+        // before the Dynamic Island work begins.
+        scheduledLiveActivityReconciliation?.cancel()
+        let snapshot = tasks
+        scheduledLiveActivityReconciliation = Task { @MainActor [weak self] in
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard !Task.isCancelled else { return }
+            LiveActivityManager.shared.reconcile(tasks: snapshot)
+            self?.scheduledLiveActivityReconciliation = nil
+        }
+    }
+
+    private func liveActivityLifecycleState(for tasks: [TGTask]) -> [LiveActivityLifecycleState] {
+        tasks.compactMap { task in
+            guard let taskID = task.id else { return nil }
+            let startedAt: Date?
+            if let manualStartedAt = task.timerStartedAt {
+                startedAt = manualStartedAt
+            } else if let autoStartedAt = task.autoTrackSessionStartedAt,
+                      let liveUntil = task.autoTrackLiveUntil,
+                      liveUntil > Date(),
+                      !(task.autoTrackStoppedAt.map { $0 >= autoStartedAt } ?? false) {
+                startedAt = autoStartedAt
+            } else {
+                startedAt = nil
+            }
+            return LiveActivityLifecycleState(
+                taskID: taskID,
+                startedAt: startedAt,
+                taskName: startedAt == nil ? "" : task.name,
+                colorHex: startedAt == nil ? "" : task.colorHex
+            )
+        }
+        .sorted { $0.taskID < $1.taskID }
+    }
+
+    private func taskPresentationState(for tasks: [TGTask]) -> [TaskPresentationState] {
+        tasks.compactMap { task in
+            guard let id = task.id else { return nil }
+            return TaskPresentationState(
+                id: id,
+                name: task.name,
+                colorHex: task.colorHex,
+                createdAt: task.createdAt,
+                timerStartedAt: task.timerStartedAt,
+                activeSessionID: task.activeSessionID,
+                timerOwnerDeviceID: task.timerOwnerDeviceID,
+                timerOwnerPlatform: task.timerOwnerPlatform,
+                timerOwnerDeviceName: task.timerOwnerDeviceName,
+                timerOwnerLastAliveAt: task.timerOwnerLastAliveAt,
+                timerOwnerIsActive: task.timerOwnerIsActive,
+                autoTrackLastUsageAt: task.autoTrackLastUsageAt,
+                autoTrackLiveUntil: task.autoTrackLiveUntil,
+                autoTrackActiveSessionID: task.autoTrackActiveSessionID,
+                autoTrackSessionStartedAt: task.autoTrackSessionStartedAt,
+                autoTrackStoppedAt: task.autoTrackStoppedAt,
+                sortOrder: task.sortOrder
+            )
+        }
     }
 
     private func tasksCollection(for uid: String) -> CollectionReference {
@@ -134,6 +259,13 @@ final class TaskService: NSObject, ObservableObject {
     /// `processPendingAutoTrackEvents` remains the primary, faster path.
     private func autoTrackEventsCollection(for uid: String) -> CollectionReference {
         db.collection("users").document(uid).collection("autoTrackEvents")
+    }
+
+    /// A bounded server-side trace of threshold delivery and ActivityKit/APNs hand-off. Unlike
+    /// the App Group extension buffer, these records remain available after its 300-entry cap is
+    /// reached; importing them here makes the normal diagnostics export self-contained.
+    private func liveActivityDiagnosticsCollection(for uid: String) -> CollectionReference {
+        db.collection("users").document(uid).collection("liveActivityDiagnostics")
     }
 
     private func devicesCollection(for uid: String) -> CollectionReference {
@@ -321,8 +453,23 @@ final class TaskService: NSObject, ObservableObject {
                     let runningAfter = merged.filter(\.isTimerRunning)
                     let runningAfterIDs = Set(runningAfter.compactMap(\.id))
                     let stoppedSinceLastSnapshot = self.tasks.filter { runningBeforeIDs.contains($0.id ?? "") && !runningAfterIDs.contains($0.id ?? "") }
-                    self.tasks = Self.sortedByPosition(merged)
+                    let sortedMerged = Self.sortedByPosition(merged)
+                    let presentationChanged = self.taskPresentationState(for: self.tasks) != self.taskPresentationState(for: sortedMerged)
                     self.hasReceivedInitialTasksSnapshot = true
+
+                    // ActivityKit transport writes update the Firestore document but do not
+                    // change a task the user can see. Do not republish them: doing so invokes
+                    // the Tasks tab's Screen Time monitor refresh and every row's SwiftUI body
+                    // several times in quick succession after a Start/Stop tap.
+                    guard presentationChanged else {
+                        DiagnosticsLog.log(
+                            "sync",
+                            "ignored transport-only tasks snapshot documents=\(documents.count) source=\(isFromCache ? "cache" : "server")"
+                        )
+                        return
+                    }
+
+                    self.tasks = sortedMerged
                     DiagnosticsLog.log(
                         "sync",
                         "tasks snapshot documents=\(documents.count) decoded=\(decoded.count) applied=\(merged.count) source=\(isFromCache ? "cache" : "server") running=\(runningAfter.map(\.name))"
@@ -537,14 +684,16 @@ final class TaskService: NSObject, ObservableObject {
         sessions.removeAll { $0.id == sessionID }
         CalendarSyncManager.shared.removeSession(sessionID, userID: uid)
         if let taskIndex = tasks.firstIndex(where: { $0.activeSessionID == sessionID }) {
-            tasks[taskIndex].timerStartedAt = nil
-            tasks[taskIndex].activeSessionID = nil
-            tasks[taskIndex].timerOwnerDeviceID = nil
-            tasks[taskIndex].timerOwnerPlatform = nil
-            tasks[taskIndex].timerOwnerDeviceName = nil
-            tasks[taskIndex].timerOwnerLastAliveAt = nil
-            tasks[taskIndex].timerOwnerIsActive = nil
-            tasks[taskIndex].updatedAt = Date()
+            var updatedTask = tasks[taskIndex]
+            updatedTask.timerStartedAt = nil
+            updatedTask.activeSessionID = nil
+            updatedTask.timerOwnerDeviceID = nil
+            updatedTask.timerOwnerPlatform = nil
+            updatedTask.timerOwnerDeviceName = nil
+            updatedTask.timerOwnerLastAliveAt = nil
+            updatedTask.timerOwnerIsActive = nil
+            updatedTask.updatedAt = Date()
+            tasks[taskIndex] = updatedTask
         }
 
         let taskRef = tasksCollection(for: uid).document(session.taskID)
@@ -621,33 +770,82 @@ final class TaskService: NSObject, ObservableObject {
         session.id = sessionRef.documentID
 
         applyOptimisticTimerStart(for: task, session: session, startedAt: startDate, updatedAt: now)
+        DiagnosticsLog.log("timer", "startTimer optimistic apply done task=\(task.name) id=\(id)")
 
-        do {
-            try sessionRef.setData(from: session) { error in
+        let taskRef = tasksCollection(for: uid).document(id)
+        let taskUpdate: [String: Any] = [
+            "timerStartedAt": Timestamp(date: startDate),
+            "activeSessionID": sessionRef.documentID,
+            "timerOwnerDeviceID": Self.currentDeviceID,
+            "timerOwnerPlatform": Self.currentPlatform,
+            "timerOwnerDeviceName": Self.currentDeviceName,
+            "timerOwnerLastAliveAt": Timestamp(date: now),
+            "timerOwnerIsActive": true,
+            "updatedAt": Timestamp(date: now),
+        ]
+
+        // The optimistic guards above only see this device's local state — another device (or
+        // another trigger on this one racing a snapshot round-trip) can still have started the
+        // same task moments ago. The transaction re-checks `timerStartedAt` on the server
+        // atomically with the writes, so whichever start commits first wins and the loser backs
+        // out instead of opening a second, identical session. (This mirrors the Mac app's
+        // `TaskService.startTimer` fix for duplicate timeline blocks, 2026-07-25.)
+        db.runTransaction({ transaction, errorPointer -> Any? in
+            let snapshot: DocumentSnapshot
+            do {
+                snapshot = try transaction.getDocument(taskRef)
+            } catch let error as NSError {
+                errorPointer?.pointee = error
+                return nil
+            }
+
+            guard snapshot.data()?["timerStartedAt"] == nil else {
+                return false
+            }
+
+            do {
+                try transaction.setData(from: session, forDocument: sessionRef)
+            } catch let error as NSError {
+                errorPointer?.pointee = error
+                return nil
+            }
+
+            transaction.updateData(taskUpdate, forDocument: taskRef)
+            return true
+        }) { result, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
                 if let error {
-                    print("Failed to write session \(sessionRef.documentID): \(error.localizedDescription)")
+                    // Transactions need the server; offline (or transiently failing) starts fall
+                    // back to the old fire-and-forget writes so the timer still starts — the
+                    // cross-device duplicate guard only applies when we can reach Firestore.
+                    DiagnosticsLog.log("timer", "startTimer transaction failed task=\(id), falling back to direct writes: \(error.localizedDescription)")
+                    do {
+                        try self.sessionsCollection(for: uid).document(sessionRef.documentID).setData(from: session)
+                    } catch {
+                        DiagnosticsLog.log("timer", "startTimer fallback session write failed task=\(id): \(error.localizedDescription)")
+                    }
+                    taskRef.updateData(taskUpdate)
+                    return
+                }
+
+                if result as? Bool == true {
+                    DiagnosticsLog.log("timer", "startTimer committed task=\(id) session=\(sessionRef.documentID)")
                 } else {
-                    print("Wrote session \(sessionRef.documentID) for task \(id)")
+                    DiagnosticsLog.log("timer", "startTimer refused task=\(id) — timer already started elsewhere, rolling back optimistic session \(sessionRef.documentID)")
+                    self.rollbackOptimisticTimerStart(taskID: id, sessionID: sessionRef.documentID)
                 }
             }
-
-            tasksCollection(for: uid).document(id).updateData([
-                "timerStartedAt": Timestamp(date: startDate),
-                "activeSessionID": sessionRef.documentID,
-                "timerOwnerDeviceID": Self.currentDeviceID,
-                "timerOwnerPlatform": Self.currentPlatform,
-                "timerOwnerDeviceName": Self.currentDeviceName,
-                "timerOwnerLastAliveAt": Timestamp(date: now),
-                "timerOwnerIsActive": true,
-                "updatedAt": Timestamp(date: now),
-            ]) { error in
-                if let error {
-                    DiagnosticsLog.log("timer", "Failed to mark task \(id) running: \(error.localizedDescription)")
-                }
-            }
-        } catch {
-            DiagnosticsLog.log("timer", "Failed to start session for task \(id): \(error.localizedDescription)")
         }
+        DiagnosticsLog.log("timer", "startTimer returning task=\(task.name) id=\(id)")
+    }
+
+    /// Undoes `applyOptimisticTimerStart` after the start transaction was refused because
+    /// another device already owns the timer. Only the locally invented state is removed; the
+    /// true owner's `timerStartedAt`/session arrive through the snapshot listener on their own.
+    private func rollbackOptimisticTimerStart(taskID: String, sessionID: String) {
+        optimisticTimerStarts.removeValue(forKey: taskID)
+        sessions.removeAll { $0.id == sessionID }
     }
 
     private func applyOptimisticTimerStart(for task: TGTask, session: TaskTimeSession, startedAt: Date, updatedAt: Date) {
@@ -658,19 +856,49 @@ final class TaskService: NSObject, ObservableObject {
             updatedAt: updatedAt
         )
 
+        // A single assignment to `tasks[taskIndex]` instead of seven sequential field writes —
+        // `tasks` is `@Published`, and each subscript write is its own full-array mutation, so
+        // seven writes fired `didSet` (which schedules a `LiveActivityManager.reconcile` `Task`)
+        // seven times in a row for one logical update. That Task-creation overhead, repeated
+        // seven times back to back, measured as most of the ~700-800ms "tap to timer start"
+        // latency reported and diagnosed via logging on 2026-07-24 — collapsing to one write
+        // collapses `didSet` to one firing too.
         if let taskIndex = tasks.firstIndex(where: { $0.id == taskID }) {
-            tasks[taskIndex].timerStartedAt = startedAt
-            tasks[taskIndex].activeSessionID = session.id
-            tasks[taskIndex].timerOwnerDeviceID = Self.currentDeviceID
-            tasks[taskIndex].timerOwnerPlatform = Self.currentPlatform
-            tasks[taskIndex].timerOwnerDeviceName = Self.currentDeviceName
-            tasks[taskIndex].timerOwnerLastAliveAt = updatedAt
-            tasks[taskIndex].timerOwnerIsActive = true
-            tasks[taskIndex].updatedAt = updatedAt
+            var updatedTask = tasks[taskIndex]
+            updatedTask.timerStartedAt = startedAt
+            updatedTask.activeSessionID = session.id
+            updatedTask.timerOwnerDeviceID = Self.currentDeviceID
+            updatedTask.timerOwnerPlatform = Self.currentPlatform
+            updatedTask.timerOwnerDeviceName = Self.currentDeviceName
+            updatedTask.timerOwnerLastAliveAt = updatedAt
+            updatedTask.timerOwnerIsActive = true
+            updatedTask.updatedAt = updatedAt
+            tasks[taskIndex] = updatedTask
         }
 
-        if let sessionID = session.id, !sessions.contains(where: { $0.id == sessionID }) {
-            sessions.insert(session, at: 0)
+        // Updating `sessions` also rebuilds the per-task cache used by the Tasks tab. With a
+        // long 30-day history that full local rebuild can take hundreds of milliseconds, and it
+        // used to run synchronously inside the tap handler after the task had already been made
+        // running. The duration label already accounts for a running task whose session has not
+        // arrived yet, so insert this purely optimistic session after SwiftUI has drawn the new
+        // active state. The Firestore listener remains the durable source of truth.
+        scheduleOptimisticSessionInsertion(session, forTaskID: taskID)
+    }
+
+    private func scheduleOptimisticSessionInsertion(_ session: TaskTimeSession, forTaskID taskID: String) {
+        guard let sessionID = session.id else { return }
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard !Task.isCancelled,
+                  let self,
+                  self.tasks.contains(where: {
+                      $0.id == taskID && $0.activeSessionID == sessionID && $0.timerStartedAt != nil
+                  }),
+                  !self.sessions.contains(where: { $0.id == sessionID }) else {
+                return
+            }
+            self.sessions.insert(session, at: 0)
         }
     }
 
@@ -750,6 +978,48 @@ final class TaskService: NSObject, ObservableObject {
         }
     }
 
+    func reconcileServerLiveActivityDiagnostics() async {
+        guard let uid = currentUser?.uid else { return }
+        let watermarkKey = "\(liveActivityDiagnosticsWatermarkKeyPrefix).\(uid)"
+        // Do not flood a fresh install with the full retention period, but keep enough history
+        // for a user to export a log after noticing an issue later the same day.
+        let initialWatermark = Date().addingTimeInterval(-48 * 60 * 60)
+        let watermarkSeconds = UserDefaults.standard.object(forKey: watermarkKey) as? Double
+        let watermark = watermarkSeconds.map(Date.init(timeIntervalSince1970:)) ?? initialWatermark
+
+        do {
+            let snapshot = try await liveActivityDiagnosticsCollection(for: uid)
+                .whereField("createdAt", isGreaterThan: Timestamp(date: watermark))
+                .order(by: "createdAt")
+                .limit(to: 300)
+                .getDocuments()
+            guard !snapshot.documents.isEmpty else { return }
+
+            var latestCreatedAt = watermark
+            for document in snapshot.documents {
+                guard let kind = document.get("kind") as? String,
+                      let createdAt = (document.get("createdAt") as? Timestamp)?.dateValue() else { continue }
+                latestCreatedAt = max(latestCreatedAt, createdAt)
+
+                let taskID = document.get("taskID") as? String ?? "?"
+                let values = [
+                    "thresholdStep", "sessionID", "startKey", "status", "apnsID", "reason",
+                    "running", "startedLiveWindow", "eventAlreadyRecorded", "token",
+                ].compactMap { key -> String? in
+                    guard let value = document.get(key) else { return nil }
+                    return "\(key)=\(value)"
+                }
+                DiagnosticsLog.log(
+                    "serverDiag",
+                    "kind=\(kind) task=\(taskID) at=\(createdAt) \(values.joined(separator: " "))"
+                )
+            }
+            UserDefaults.standard.set(latestCreatedAt.timeIntervalSince1970, forKey: watermarkKey)
+        } catch {
+            DiagnosticsLog.log("serverDiag", "failed to import server diagnostics: \(error.localizedDescription)")
+        }
+    }
+
     private func processQueuedAutoTrackEvents() {
         guard !queuedAutoTrackEvents.isEmpty else { return }
         // `recordAutoTrackedSession` decides "merge into an existing session" vs. "create a new
@@ -816,12 +1086,18 @@ final class TaskService: NSObject, ObservableObject {
             if let sessionIndex = sessions.firstIndex(where: { $0.id == existingSessionID }) {
                 sessions[sessionIndex].endedAt = mergedEnd
             }
-            applyOptimisticAutoTrackLiveState(
+            let shouldPublishLiveState = shouldPublishAutoTrackLiveState(
                 taskID: taskID,
-                sessionID: existingSessionID,
-                sessionStartedAt: existingSession.startedAt,
                 lastUsageAt: mergedEnd
             )
+            if shouldPublishLiveState {
+                applyOptimisticAutoTrackLiveState(
+                    taskID: taskID,
+                    sessionID: existingSessionID,
+                    sessionStartedAt: existingSession.startedAt,
+                    lastUsageAt: mergedEnd
+                )
+            }
             sessionsCollection(for: uid).document(existingSessionID).updateData([
                 "endedAt": Timestamp(date: mergedEnd),
             ]) { error in
@@ -831,13 +1107,15 @@ final class TaskService: NSObject, ObservableObject {
                     DiagnosticsLog.log("autoTrack", "extended session \(existingSessionID) for \(task.name) to=\(mergedEnd)")
                 }
             }
-            updateAutoTrackLiveState(
-                uid: uid,
-                taskID: taskID,
-                sessionID: existingSessionID,
-                sessionStartedAt: existingSession.startedAt,
-                lastUsageAt: mergedEnd
-            )
+            if shouldPublishLiveState {
+                updateAutoTrackLiveState(
+                    uid: uid,
+                    taskID: taskID,
+                    sessionID: existingSessionID,
+                    sessionStartedAt: existingSession.startedAt,
+                    lastUsageAt: mergedEnd
+                )
+            }
             return
         }
 
@@ -876,12 +1154,18 @@ final class TaskService: NSObject, ObservableObject {
         if !sessions.contains(where: { $0.id == sessionRef.documentID }) {
             sessions.insert(session, at: 0)
         }
-        applyOptimisticAutoTrackLiveState(
+        let shouldPublishLiveState = shouldPublishAutoTrackLiveState(
             taskID: taskID,
-            sessionID: sessionRef.documentID,
-            sessionStartedAt: startedAt,
             lastUsageAt: endedAt
         )
+        if shouldPublishLiveState {
+            applyOptimisticAutoTrackLiveState(
+                taskID: taskID,
+                sessionID: sessionRef.documentID,
+                sessionStartedAt: startedAt,
+                lastUsageAt: endedAt
+            )
+        }
 
         do {
             try sessionRef.setData(from: session) { error in
@@ -891,13 +1175,15 @@ final class TaskService: NSObject, ObservableObject {
                     DiagnosticsLog.log("autoTrack", "wrote new session \(sessionRef.documentID) for \(task.name) startedAt=\(startedAt) endedAt=\(endedAt)")
                 }
             }
-            updateAutoTrackLiveState(
-                uid: uid,
-                taskID: taskID,
-                sessionID: sessionRef.documentID,
-                sessionStartedAt: startedAt,
-                lastUsageAt: endedAt
-            )
+            if shouldPublishLiveState {
+                updateAutoTrackLiveState(
+                    uid: uid,
+                    taskID: taskID,
+                    sessionID: sessionRef.documentID,
+                    sessionStartedAt: startedAt,
+                    lastUsageAt: endedAt
+                )
+            }
         } catch {
             DiagnosticsLog.log("autoTrack", "failed to record session for \(task.name): \(error.localizedDescription)")
         }
@@ -918,15 +1204,83 @@ final class TaskService: NSObject, ObservableObject {
         tasks[taskIndex] = updatedTask
     }
 
+    /// Historical pending events are still valuable for rebuilding Timeline/Reports, but they
+    /// must never revive or stop the *current* live window. In particular, a Firestore write
+    /// queued while the app was suspended can otherwise arrive hours later and overwrite the
+    /// newer state written by `recordAutoTrackEvent` in the DeviceActivity extension.
+    private func shouldPublishAutoTrackLiveState(taskID: String, lastUsageAt: Date) -> Bool {
+        let liveUntil = lastUsageAt.addingTimeInterval(autoTrackingInactivityGraceSeconds)
+        guard liveUntil > Date() else {
+            DiagnosticsLog.log(
+                "autoTrack",
+                "not publishing expired replay as live state task=\(taskID) lastUsage=\(lastUsageAt) liveUntil=\(liveUntil)"
+            )
+            return false
+        }
+
+        guard let task = tasks.first(where: { $0.id == taskID }) else { return true }
+        if let currentLastUsage = task.autoTrackLastUsageAt, currentLastUsage >= lastUsageAt {
+            DiagnosticsLog.log(
+                "autoTrack",
+                "not publishing stale replay as live state task=\(taskID) replayUsage=\(lastUsageAt) currentUsage=\(currentLastUsage)"
+            )
+            return false
+        }
+        if let stoppedAt = task.autoTrackStoppedAt, stoppedAt >= lastUsageAt {
+            DiagnosticsLog.log(
+                "autoTrack",
+                "not publishing replay before explicit stop task=\(taskID) replayUsage=\(lastUsageAt) stoppedAt=\(stoppedAt)"
+            )
+            return false
+        }
+        return true
+    }
+
     private func updateAutoTrackLiveState(uid: String, taskID: String, sessionID: String, sessionStartedAt: Date, lastUsageAt: Date) {
-        tasksCollection(for: uid).document(taskID).updateData([
-            "autoTrackLastUsageAt": Timestamp(date: lastUsageAt),
-            "autoTrackLiveUntil": Timestamp(date: lastUsageAt.addingTimeInterval(autoTrackingInactivityGraceSeconds)),
-            "autoTrackActiveSessionID": sessionID,
-            "autoTrackSessionStartedAt": Timestamp(date: sessionStartedAt),
-            "autoTrackStoppedAt": FieldValue.delete(),
-            "updatedAt": Timestamp(date: Date()),
-        ])
+        let taskRef = tasksCollection(for: uid).document(taskID)
+        db.runTransaction({ transaction, errorPointer -> Any? in
+            do {
+                let snapshot = try transaction.getDocument(taskRef)
+                guard let currentTask = try? snapshot.data(as: TGTask.self) else { return false }
+
+                // The server-side extension endpoint is the primary owner of this state. Never
+                // let a delayed client replay replace an equally new or newer server event, nor
+                // clear a Stop that happened after the replayed usage.
+                if let currentLastUsage = currentTask.autoTrackLastUsageAt,
+                   currentLastUsage >= lastUsageAt {
+                    return false
+                }
+                if let stoppedAt = currentTask.autoTrackStoppedAt,
+                   stoppedAt >= lastUsageAt {
+                    return false
+                }
+
+                transaction.updateData([
+                    "autoTrackLastUsageAt": Timestamp(date: lastUsageAt),
+                    "autoTrackLiveUntil": Timestamp(date: lastUsageAt.addingTimeInterval(autoTrackingInactivityGraceSeconds)),
+                    "autoTrackActiveSessionID": sessionID,
+                    "autoTrackSessionStartedAt": Timestamp(date: sessionStartedAt),
+                    "autoTrackStoppedAt": FieldValue.delete(),
+                    "updatedAt": Timestamp(date: Date()),
+                ], forDocument: taskRef)
+                return true
+            } catch {
+                errorPointer?.pointee = error as NSError
+                return nil
+            }
+        }) { result, error in
+            if let error {
+                DiagnosticsLog.log(
+                    "autoTrack",
+                    "failed conditional live-state update task=\(taskID): \(error.localizedDescription)"
+                )
+            } else if (result as? Bool) == false {
+                DiagnosticsLog.log(
+                    "autoTrack",
+                    "skipped stale live-state Firestore write task=\(taskID) replayUsage=\(lastUsageAt)"
+                )
+            }
+        }
     }
 
     private func latestMergeableAutoTrackedSession(
@@ -992,11 +1346,13 @@ final class TaskService: NSObject, ObservableObject {
         guard let uid = currentUser?.uid, let id = task.id else { return }
         let stoppedAt = Date()
         if let taskIndex = tasks.firstIndex(where: { $0.id == id }) {
-            tasks[taskIndex].autoTrackStoppedAt = stoppedAt
+            var updatedTask = tasks[taskIndex]
+            updatedTask.autoTrackStoppedAt = stoppedAt
             // `autoTrackLiveUntil` is the original cross-device live-state field. Updating it
             // to the stop time makes older clients that have not yet adopted
             // `autoTrackStoppedAt` stop immediately too.
-            tasks[taskIndex].autoTrackLiveUntil = stoppedAt
+            updatedTask.autoTrackLiveUntil = stoppedAt
+            tasks[taskIndex] = updatedTask
         }
         tasksCollection(for: uid).document(id).updateData([
             "autoTrackStoppedAt": Timestamp(date: stoppedAt),
@@ -1038,14 +1394,16 @@ final class TaskService: NSObject, ObservableObject {
         guard let taskID = task.id else { return }
 
         if let taskIndex = tasks.firstIndex(where: { $0.id == taskID }) {
-            tasks[taskIndex].timerStartedAt = nil
-            tasks[taskIndex].activeSessionID = nil
-            tasks[taskIndex].timerOwnerDeviceID = nil
-            tasks[taskIndex].timerOwnerPlatform = nil
-            tasks[taskIndex].timerOwnerDeviceName = nil
-            tasks[taskIndex].timerOwnerLastAliveAt = nil
-            tasks[taskIndex].timerOwnerIsActive = nil
-            tasks[taskIndex].updatedAt = Date()
+            var updatedTask = tasks[taskIndex]
+            updatedTask.timerStartedAt = nil
+            updatedTask.activeSessionID = nil
+            updatedTask.timerOwnerDeviceID = nil
+            updatedTask.timerOwnerPlatform = nil
+            updatedTask.timerOwnerDeviceName = nil
+            updatedTask.timerOwnerLastAliveAt = nil
+            updatedTask.timerOwnerIsActive = nil
+            updatedTask.updatedAt = Date()
+            tasks[taskIndex] = updatedTask
         }
 
         if let activeSessionID = task.activeSessionID,
@@ -1166,8 +1524,18 @@ final class TaskService: NSObject, ObservableObject {
     /// Live Activity remotely via APNs even while the app isn't running.
     func updateActivityPushToStartToken(_ token: String) {
         guard let uid = currentUser?.uid else { return }
+        if let lastPersistedPushToStartToken,
+           lastPersistedPushToStartToken.uid == uid,
+           lastPersistedPushToStartToken.token == token {
+            return
+        }
+        lastPersistedPushToStartToken = (uid, token)
         currentDeviceDocument(for: uid).setData(["activityPushToStartToken": token], merge: true) { error in
             if let error {
+                if self.lastPersistedPushToStartToken?.uid == uid,
+                   self.lastPersistedPushToStartToken?.token == token {
+                    self.lastPersistedPushToStartToken = nil
+                }
                 DiagnosticsLog.log("liveActivity", "Failed to write push-to-start token: \(error.localizedDescription)")
             } else {
                 DiagnosticsLog.log("liveActivity", "Wrote push-to-start token=\(token)")
@@ -1178,8 +1546,18 @@ final class TaskService: NSObject, ObservableObject {
     /// Persists this device's regular APNs device token, used for silent background-wake pushes.
     func updateAPNsDeviceToken(_ token: String) {
         guard let uid = currentUser?.uid else { return }
+        if let lastPersistedAPNsDeviceToken,
+           lastPersistedAPNsDeviceToken.uid == uid,
+           lastPersistedAPNsDeviceToken.token == token {
+            return
+        }
+        lastPersistedAPNsDeviceToken = (uid, token)
         currentDeviceDocument(for: uid).setData(["apnsDeviceToken": token], merge: true) { error in
             if let error {
+                if self.lastPersistedAPNsDeviceToken?.uid == uid,
+                   self.lastPersistedAPNsDeviceToken?.token == token {
+                    self.lastPersistedAPNsDeviceToken = nil
+                }
                 DiagnosticsLog.log("push", "Failed to write APNs device token: \(error.localizedDescription)")
             } else {
                 DiagnosticsLog.log("push", "Wrote APNs device token=\(token)")
@@ -1211,10 +1589,21 @@ final class TaskService: NSObject, ObservableObject {
     /// so a Cloud Function can push `update`/`end` events via APNs.
     func updateLiveActivityPushToken(taskID: String, token: String?) {
         guard let uid = currentUser?.uid else { return }
+        if let previous = lastPersistedLiveActivityPushTokenByTaskID[taskID],
+           previous.uid == uid,
+           previous.token == token {
+            return
+        }
+        lastPersistedLiveActivityPushTokenByTaskID[taskID] = (uid, token)
         tasksCollection(for: uid).document(taskID).updateData([
             "liveActivityPushToken": token ?? FieldValue.delete(),
         ]) { error in
             if let error {
+                if let previous = self.lastPersistedLiveActivityPushTokenByTaskID[taskID],
+                   previous.uid == uid,
+                   previous.token == token {
+                    self.lastPersistedLiveActivityPushTokenByTaskID.removeValue(forKey: taskID)
+                }
                 DiagnosticsLog.log("liveActivity", "Failed to write activity push token for \(taskID): \(error.localizedDescription)")
             } else {
                 DiagnosticsLog.log("liveActivity", "Wrote per-activity push token task=\(taskID) present=\(token != nil)")

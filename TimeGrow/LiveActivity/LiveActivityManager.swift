@@ -59,6 +59,11 @@ final class LiveActivityManager {
     private var remoteStartGraceUntilByActivityID: [String: Date] = [:]
 
     private let remoteStartReconciliationGrace: TimeInterval = 30
+    private let appGroupID = "group.WINNER.ltd.TimeGrow"
+    private let deviceCredentialUIDKey = "autoTracking.firebase.uid"
+    private let deviceCredentialProjectIDKey = "autoTracking.firebase.projectID"
+    private let deviceCredentialIDKey = "autoTracking.deviceID"
+    private let deviceCredentialSecretKey = "autoTracking.deviceSecret"
 
     /// Called whenever a task's per-activity push token becomes known (activity just started) or
     /// should be cleared (activity ending). Set once from `TimeGrowApp` to persist it via
@@ -261,6 +266,7 @@ final class LiveActivityManager {
 
     private func start(for task: TGTask, startedAt: Date) {
         guard let taskID = task.id else { return }
+        let requestStartedAt = Date()
         let attributes = TimeGrowLiveActivityAttributes(taskID: taskID, taskName: task.name, colorHex: task.colorHex)
         let contentState = TimeGrowLiveActivityAttributes.ContentState(
             startedAt: startedAt,
@@ -280,10 +286,10 @@ final class LiveActivityManager {
             observePushToken(of: activity, taskID: taskID)
             DiagnosticsLog.log(
                 "liveActivity",
-                "Started Live Activity for \(task.name) id=\(activity.id) state=\(activity.activityState)"
+                "Started Live Activity for \(task.name) id=\(activity.id) state=\(activity.activityState) requestMs=\(Int(Date().timeIntervalSince(requestStartedAt) * 1_000))"
             )
         } catch {
-            DiagnosticsLog.log("liveActivity", "Failed to start Live Activity for \(task.name): \(error.localizedDescription)")
+            DiagnosticsLog.log("liveActivity", "Failed to start Live Activity for \(task.name) requestMs=\(Int(Date().timeIntervalSince(requestStartedAt) * 1_000)): \(error.localizedDescription)")
         }
         updateTimerScheduling()
     }
@@ -298,15 +304,60 @@ final class LiveActivityManager {
             if let data = activity.pushToken {
                 let hexToken = data.map { String(format: "%02x", $0) }.joined()
                 self?.pushTokenHandler?(taskID, hexToken)
+                self?.registerActivityPushTokenWithServer(taskID: taskID, token: hexToken)
                 DiagnosticsLog.log("liveActivity", "Stored current per-activity push token task=\(taskID)")
             }
             for await data in activity.pushTokenUpdates {
                 let hexToken = data.map { String(format: "%02x", $0) }.joined()
                 self?.pushTokenHandler?(taskID, hexToken)
+                self?.registerActivityPushTokenWithServer(taskID: taskID, token: hexToken)
                 DiagnosticsLog.log("liveActivity", "Received per-activity push token task=\(taskID)")
             }
         }
         observeActivityState(of: activity, taskID: taskID)
+    }
+
+    /// Push-to-start gives iOS a short background runtime specifically to hand us this token.
+    /// Firestore's long-lived listener can be suspended during that window, which previously
+    /// left the server unable to address an `end` push when a Mac stopped the task. Upload it
+    /// through the same per-device-secret pattern as the Screen Time extension: the endpoint
+    /// either records the token for a running task or immediately ends this just-created but
+    /// already-stopped Activity.
+    private func registerActivityPushTokenWithServer(taskID: String, token: String) {
+        guard let shared = UserDefaults(suiteName: appGroupID),
+              let uid = shared.string(forKey: deviceCredentialUIDKey),
+              let projectID = shared.string(forKey: deviceCredentialProjectIDKey),
+              let deviceID = shared.string(forKey: deviceCredentialIDKey),
+              let deviceSecret = shared.string(forKey: deviceCredentialSecretKey),
+              !uid.isEmpty,
+              !projectID.isEmpty,
+              !deviceID.isEmpty,
+              !deviceSecret.isEmpty,
+              let url = URL(string: "https://us-central1-\(projectID).cloudfunctions.net/registerLiveActivityPushToken") else {
+            DiagnosticsLog.log("liveActivity", "Direct activity-token registration skipped: missing device credential")
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 8
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "uid": uid,
+            "deviceID": deviceID,
+            "deviceSecret": deviceSecret,
+            "taskID": taskID,
+            "activityPushToken": token,
+        ])
+
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if let error {
+                DiagnosticsLog.log("liveActivity", "Direct activity-token registration failed task=\(taskID): \(error.localizedDescription)")
+                return
+            }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            DiagnosticsLog.log("liveActivity", "Direct activity-token registration task=\(taskID) status=\(status)")
+        }.resume()
     }
 
     /// Surfaces ActivityKit's own lifecycle for this activity (`active`/`stale`/`ended`/

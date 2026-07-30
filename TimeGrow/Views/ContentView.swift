@@ -201,7 +201,7 @@ struct ContentView: View {
                             ForEach(displayedTasks) { task in
                                 TaskRow(
                                     task: task,
-                                    sessions: taskService.sessions.filter { $0.taskID == task.id },
+                                    sessions: taskService.sessions(forTaskID: task.id),
                                     timerOwnerStatus: { taskService.timerOwnerStatus(for: task, at: $0) },
                                     onToggleTimer: { toggleTimer(task) },
                                     stopAutoTrackAction: { taskService.stopAutoTracking(for: task) },
@@ -221,7 +221,7 @@ struct ContentView: View {
                             ForEach(displayedTasks) { task in
                                 TaskTile(
                                     task: task,
-                                    sessions: taskService.sessions.filter { $0.taskID == task.id },
+                                    sessions: taskService.sessions(forTaskID: task.id),
                                     timerOwnerStatus: { taskService.timerOwnerStatus(for: task, at: $0) },
                                     onToggleTimer: { toggleTimer(task) },
                                     stopAutoTrackAction: { taskService.stopAutoTracking(for: task) },
@@ -270,37 +270,58 @@ struct ContentView: View {
                         selectedTab = tab
                     }
                 } label: {
-                    Image(systemName: tab.systemImage)
-                        .font(.system(size: tab == .tasks ? 20 : 23, weight: .bold))
-                        .symbolRenderingMode(.hierarchical)
-                        .foregroundStyle(selectedTab == tab ? accentColorManager.color : .white)
-                    .frame(maxWidth: .infinity, minHeight: 62)
-                    .background {
-                        if selectedTab == tab {
-                            Capsule()
-                                .fill(Color.selectedTabBackground)
-                                .padding(.vertical, 4)
-                                .padding(.horizontal, 4)
+                    let iconColor = selectedTab == tab
+                        ? accentColorManager.color
+                        : Color(red: 0.62, green: 0.58, blue: 0.70)
+                    Group {
+                        if tab == .timeline {
+                            TimelineTabIcon(color: iconColor)
+                        } else {
+                            Image(systemName: tab.systemImage)
+                                .font(.system(size: 27, weight: .semibold))
+                                .symbolRenderingMode(.hierarchical)
+                                .foregroundStyle(iconColor)
                         }
                     }
+                    .frame(maxWidth: .infinity, minHeight: 68)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(tab.title)
             }
         }
-        .padding(4)
-        .frame(height: 70)
+        .padding(.horizontal, 11)
+        .frame(height: 76)
         .background {
             Capsule()
-                .fill(Color.tabBarBackground)
-                .overlay {
-                    Capsule()
-                        .stroke(Color.white.opacity(0.11), lineWidth: 1)
-                }
+                .fill(Color(red: 0.07, green: 0.07, blue: 0.10))
         }
-        .padding(.horizontal, 22)
+        .padding(.horizontal, 23)
         .padding(.bottom, 0)
         .offset(y: 10)
+    }
+}
+
+/// Custom timeline/list mark: SF Symbols' `list.bullet` keeps all rows equal, while the visual
+/// language of the tab bar uses a short / long / shorter rhythm.
+private struct TimelineTabIcon: View {
+    let color: Color
+
+    private let lineWidths: [CGFloat] = [16, 26, 11]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(Array(lineWidths.enumerated()), id: \.offset) { _, width in
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(color)
+                        .frame(width: 5, height: 5)
+                    Capsule()
+                        .fill(color)
+                        .frame(width: width, height: 4)
+                }
+            }
+        }
+        .frame(width: 40, height: 26, alignment: .leading)
     }
 }
 

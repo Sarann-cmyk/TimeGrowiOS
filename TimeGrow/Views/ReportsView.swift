@@ -48,7 +48,7 @@ private struct ReportChartScale {
         guard peak > 0 else {
             return ReportChartScale(maxSeconds: 3600, tickSeconds: [3600, 0])
         }
-        let maxSeconds = niceUpperBound(peak * 1.12)
+        let maxSeconds = niceUpperBound(peak * 1.05)
         let step = niceTickStep(minStep: maxSeconds / Double(max(1, tickCount - 1)))
         var ticks: [TimeInterval] = []
         var value = ceil(maxSeconds / step) * step
@@ -77,9 +77,15 @@ private struct ReportChartScale {
         return (candidates.first { $0 >= hours } ?? ceil(hours)) * 3600
     }
 
+    /// Finer-grained below 4h than `niceTickStep`'s candidates — a half-hour jump keeps the
+    /// tallest bar close to the plot's top edge for the common case (well under a couple hours
+    /// tracked); the old whole-hour-only list could round a 1.05h peak all the way up to a 2h
+    /// axis, leaving the bar barely past half height.
     private static func niceUpperBound(_ seconds: TimeInterval) -> TimeInterval {
         let hours = seconds / 3600
-        let candidates: [Double] = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 18, 20, 24, 28, 32, 36, 48, 72, 96]
+        let candidates: [Double] = [
+            0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 8, 10, 12, 16, 18, 20, 24, 28, 32, 36, 48, 72, 96,
+        ]
         return (candidates.first { $0 >= hours } ?? ceil(hours)) * 3600
     }
 }
@@ -1047,7 +1053,7 @@ private struct ReportsStackedBarChart: View {
     let locale: Locale
     let calendar: Calendar
 
-    private let chartHeight: CGFloat = 180
+    private let chartHeight: CGFloat = 234
     private var plotAreaHeight: CGFloat { chartHeight - 20 }
     private var xAxisLabelsRowHeight: CGFloat { period == .week ? 36 : 18 }
     private var plotToLabelsGap: CGFloat { 10 }
