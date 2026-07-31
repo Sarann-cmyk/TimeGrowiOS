@@ -32,11 +32,22 @@ private let pendingEventsKey = "autoTracking.pendingEvents"
 private let debugEventsKey = "autoTracking.debugEvents"
 private let selectionDataKeyPrefix = "autoTracking.selectionData."
 private let monitoredActivityKeyPrefix = "autoTracking.monitoredActivity."
-private let minimumDistinctPendingEventInterval: TimeInterval = 55
+/// Distinct threshold steps delivered by iOS in one short burst are separate confirmed minutes.
+/// This window is used only to reconstruct their conservative local session placement; it is
+/// never used to discard current-format events.
+let autoTrackingBatchedThresholdWindowSeconds: TimeInterval = 10
 
 struct PendingAutoTrackEvent {
     let taskID: String
     let occurredAt: Date
+    let monitorActivity: String?
+    let thresholdStep: Int?
+    let usageDay: String?
+
+    var identity: String? {
+        guard let monitorActivity, let thresholdStep, let usageDay else { return nil }
+        return "\(taskID)|\(usageDay)|\(monitorActivity)|\(thresholdStep)"
+    }
 }
 
 @MainActor
@@ -274,15 +285,32 @@ final class AutoTrackingStore: ObservableObject {
         for entry in raw {
             guard let taskID = entry["taskID"] as? String,
                   let occurredAt = entry["occurredAt"] as? Double else { continue }
-            events.append(PendingAutoTrackEvent(taskID: taskID, occurredAt: Date(timeIntervalSince1970: occurredAt)))
+            events.append(
+                PendingAutoTrackEvent(
+                    taskID: taskID,
+                    occurredAt: Date(timeIntervalSince1970: occurredAt),
+                    monitorActivity: entry["monitorActivity"] as? String,
+                    thresholdStep: entry["thresholdStep"] as? Int,
+                    usageDay: entry["usageDay"] as? String
+                )
+            )
         }
 
         var accepted: [PendingAutoTrackEvent] = []
         var lastAcceptedByTaskID: [String: Date] = [:]
+        var acceptedIdentities: Set<String> = []
         var discardedDuplicates = 0
         for event in events.sorted(by: { $0.occurredAt < $1.occurredAt }) {
+            if let identity = event.identity {
+                if acceptedIdentities.insert(identity).inserted {
+                    accepted.append(event)
+                } else {
+                    discardedDuplicates += 1
+                }
+                continue
+            }
             if let previous = lastAcceptedByTaskID[event.taskID],
-               event.occurredAt.timeIntervalSince(previous) < minimumDistinctPendingEventInterval {
+               event.occurredAt.timeIntervalSince(previous) < autoTrackingBatchedThresholdWindowSeconds {
                 discardedDuplicates += 1
                 continue
             }

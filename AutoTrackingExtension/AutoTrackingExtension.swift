@@ -14,6 +14,7 @@ private let debugEventsKey = "autoTracking.debugEvents"
 private let selectionDataKeyPrefix = "autoTracking.selectionData."
 private let monitoredActivityKeyPrefix = "autoTracking.monitoredActivity."
 private let lastQueuedThresholdKeyPrefix = "autoTracking.lastQueuedThreshold."
+private let acceptedThresholdIdentityKeyPrefix = "autoTracking.acceptedThresholdIdentity."
 private let authUIDKey = "autoTracking.firebase.uid"
 private let projectIDKey = "autoTracking.firebase.projectID"
 private let deviceIDKey = "autoTracking.deviceID"
@@ -33,7 +34,6 @@ private let accumulatedThresholdStepCount = 15
 // "still one session" window, applied here to session-start bookkeeping instead of Firestore
 // session merging. See that file for why 300s (DeviceActivity delivery delays observed up to 299s).
 private let inactivityGraceSeconds: TimeInterval = 300
-private let minimumDistinctThresholdInterval: TimeInterval = 55
 /// A threshold that takes noticeably longer than ~60s to fire means that stretch of wall-clock
 /// time produced no credited usage — either the app genuinely wasn't used, or iOS delayed/dropped
 /// the callback. 90s gives normal delivery jitter room without hiding real gaps.
@@ -72,20 +72,19 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
             return
         }
 
-        let lastQueuedKey = "\(lastQueuedThresholdKeyPrefix)\(resolvedTaskID)"
-        let previousQueuedTimestamp = sharedDefaults.object(forKey: lastQueuedKey) as? Double
-        if let previousQueuedTimestamp,
-           occurredAt.timeIntervalSince(Date(timeIntervalSince1970: previousQueuedTimestamp)) < minimumDistinctThresholdInterval {
-            appendDebugEvent("eventIgnored:duplicateThreshold", activity: activity)
-            // Steps below the last one are still queued inside this same monitor generation —
-            // no restart needed. A duplicate delivery of the final step still means the
-            // generation's event dictionary is spent and must be replaced, just without
-            // double-crediting usage for it.
-            if isFinalStep {
-                rearmMonitoring(after: activity)
-            }
+        let thresholdStep = accumulatedStep(from: event)
+        let usageDay = Self.dayFormatter.string(from: occurredAt)
+        // DeviceActivity can batch several distinct cumulative thresholds. Their delivery time
+        // is not their identity: only a repeat of the same generation + step on the same day is
+        // a duplicate. Dropping all callbacks within 55 seconds loses confirmed minutes.
+        let identityKey = "\(acceptedThresholdIdentityKeyPrefix)\(resolvedTaskID).\(usageDay).\(activity.rawValue).\(thresholdStep)"
+        if sharedDefaults.object(forKey: identityKey) != nil {
+            appendDebugEvent("eventIgnored:duplicateIdentity step=\(thresholdStep)", activity: activity)
             return
         }
+
+        let lastQueuedKey = "\(lastQueuedThresholdKeyPrefix)\(resolvedTaskID)"
+        let previousQueuedTimestamp = sharedDefaults.object(forKey: lastQueuedKey) as? Double
 
         recordThresholdAccounting(
             taskID: resolvedTaskID,
@@ -98,9 +97,13 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         pendingEvents.append([
             "taskID": resolvedTaskID,
             "occurredAt": occurredAt.timeIntervalSince1970,
+            "monitorActivity": activity.rawValue,
+            "thresholdStep": thresholdStep,
+            "usageDay": usageDay,
         ])
         sharedDefaults.set(pendingEvents, forKey: pendingEventsKey)
         sharedDefaults.set(occurredAt.timeIntervalSince1970, forKey: lastQueuedKey)
+        sharedDefaults.set(occurredAt.timeIntervalSince1970, forKey: identityKey)
 
         let sessionStartedAt = resolveSessionStartedAt(taskID: resolvedTaskID, occurredAt: occurredAt, sharedDefaults: sharedDefaults)
         // Steps below the last one are still queued inside this same monitor generation — iOS
@@ -115,8 +118,9 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
             taskID: resolvedTaskID,
             occurredAt: occurredAt,
             sessionStartedAt: sessionStartedAt,
-            thresholdStep: accumulatedStep(from: event),
+            thresholdStep: thresholdStep,
             monitorActivity: activity.rawValue,
+            usageDay: usageDay,
             sharedDefaults: sharedDefaults
         )
     }
@@ -197,6 +201,7 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         sessionStartedAt: Date,
         thresholdStep: Int,
         monitorActivity: String,
+        usageDay: String,
         sharedDefaults: UserDefaults
     ) {
         submitAutoTrackEvent(
@@ -205,6 +210,7 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
             sessionStartedAt: sessionStartedAt,
             thresholdStep: thresholdStep,
             monitorActivity: monitorActivity,
+            usageDay: usageDay,
             sharedDefaults: sharedDefaults
         )
     }
@@ -215,6 +221,7 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         sessionStartedAt: Date,
         thresholdStep: Int,
         monitorActivity: String,
+        usageDay: String,
         sharedDefaults: UserDefaults
     ) {
         guard let uid = sharedDefaults.string(forKey: authUIDKey),
@@ -245,6 +252,7 @@ final class DeviceActivityMonitorExtension: DeviceActivityMonitor {
             "sessionStartedAt": sessionStartedAt.timeIntervalSince1970,
             "thresholdStep": thresholdStep,
             "monitorActivity": monitorActivity,
+            "usageDay": usageDay,
         ])
 
         let semaphore = DispatchSemaphore(value: 0)

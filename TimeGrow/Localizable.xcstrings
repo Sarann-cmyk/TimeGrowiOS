@@ -754,6 +754,23 @@
         }
       }
     },
+    "Estimated auto-track credit" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Estimated auto-track credit"
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Зарахований автотрекінг"
+          }
+        }
+      }
+    },
     "Export Logs" : {
       "comment" : "A settings row that exports diagnostic logs.",
       "extractionState" : "stale",
@@ -1739,6 +1756,23 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Вигляд плитками"
+          }
+        }
+      }
+    },
+    "Time placement is approximate" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Time placement is approximate"
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Час показано приблизно"
           }
         }
       }

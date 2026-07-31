@@ -17,8 +17,10 @@
 - зарахувати все автоматично і ризикувати завищити час через відомі дублікати iOS;
 - відкинути швидкі події і ризикувати втратити реальні хвилини.
 
-Поточна реалізація обережна: вона радше недорахує неоднозначну пачку, ніж запише фальшивий час.
-Це не остаточне рішення; перед зміною правила потрібні зібрані server-side докази.
+Поточна реалізація розрізняє точний duplicate і distinct step. Кожен distinct step є
+підтвердженим 60-секундним кредитом; коли iOS віддає їх пачкою, ми не вигадуємо точні timestamps,
+а консервативно розміщуємо кредити прямо перед доставкою. Server-side traces лишаються потрібні,
+щоб перевірити цей баланс на реальному використанні.
 
 ## Контракт даних: чого ми знаємо, а чого ні
 
@@ -48,8 +50,31 @@ TikTok frontmost usage
 ```
 
 Статистика не залежить від того, чи Dynamic Island стала видимою: сервер створює/продовжує
-`TaskTimeSession` після прийняття threshold. Але і статистика, і Dynamic Island залежать від
-того, чи сам callback узагалі був доставлений і чи HTTP-запит дійшов до сервера.
+`TaskTimeSession` після прийняття threshold. Якщо HTTP-запит не дійшов, callback уже лежить у
+локальній App Group черзі й буде перетворений на сесію при наступному відкритті/переході app у
+foreground. Невідновлюваною є лише подія, для якої iOS взагалі не викликала extension.
+
+## Offline-first: локальна подія перед мережею
+
+`recordAutoTrackEvent` потрібний для near-real-time Timeline, cross-device sync і Dynamic Island,
+але **не є єдиним сховищем часу**. Порядок у `eventDidReachThreshold` навмисно незмінний:
+
+1. Extension дедублікує identity і синхронно додає запис до App Group
+   `autoTracking.pendingEvents`.
+2. Лише після успішного локального запису extension запускає HTTPS POST на
+   `recordAutoTrackEvent` (таймаут 3 с).
+3. Якщо POST успішний, сервер одразу матеріалізує `TaskTimeSession`; локальний replay пізніше
+   ідемпотентно зіллється з тією самою сесією.
+4. Якщо мережі або server credential немає, pending event лишається в App Group.
+   `TimeGrowApp.processPendingAutoTrackEvents()` викликає
+   `AutoTrackingStore.drainPendingEvents()` на launch і при `.active`, а `TaskService` створює
+   або продовжує сесію локально; Firestore SDK доставить цей запис, коли мережа стане доступною.
+5. `autoTrackEvents` — ще один, серверний запасний шлях: він допомагає відновити вже прийняту
+   сервером подію, якщо локальна черга не була дочитана або App Group контейнер втрачено.
+
+Отже, повернення мережі саме по собі не гарантує запуск main app: черга дрениться при його
+наступному launch/foreground. Це усвідомлений offline-first компроміс, а не привід відкидати
+подію в extension.
 
 ## Монітор, накопичувальні кроки та rearm
 
@@ -61,45 +86,56 @@ TikTok frontmost usage
 Після `step == 15` extension викликає `rearmMonitoring(after:)`, створює нову generation і новий
 лічильник. `includesPastActivity: false` означає, що новий monitor не відновлює прогрес старого.
 Тому безпричинний rearm, скидання монітора під час запуску або зміна selection можуть реально
-втратити неповну хвилину. `AutoTrackingStore.adoptExistingMonitoring` існує саме щоб не робити
-такого на кожному холодному запуску.
+втратити неповну хвилину. На першому `refreshMonitoring` кожного process run
+`AutoTrackingStore.adoptExistingMonitoring` звіряє `activityCenter.activities` зі збереженим
+`autoTracking.monitoredActivity.{taskID}` і підхоплює чинний monitor у пам'ять. Після цього
+`refreshMonitoring` створює monitor лише для задачі без adopted/current monitor; не робить
+`stopMonitoring`/`startMonitoring` «про всяк випадок». Зупиняються тільки orphaned generation,
+задачі без selection або задача з ручним таймером.
+
+Фінальний `step=15` все одно потребує rearm. Якщо iOS затримала саме цей callback, час між
+фактичним 15-м порогом і новим monitor може не потрапити в наступну generation через
+`includesPastActivity: false`. Це обмеження Screen Time API; не повертати щохвилинний rearm як
+уявне виправлення — він систематично збільшує ризик таких втрат.
 
 ## Поточна дедуплікація і її небезпечна межа
 
-### Як працює зараз
+### Як працює зараз (після рефакторингу 2026-07-30)
 
-1. Extension тримає `autoTracking.lastQueuedThreshold.{taskID}`. Якщо наступний callback для
-   тієї ж задачі прийшов менше ніж через 55 секунд, він логує
-   `eventIgnored:duplicateThreshold` і не створює локальну/серверну подію.
-2. При відкритті app `AutoTrackingStore.drainPendingEvents()` ще раз зливає pending events тієї
-   ж задачі, які ближчі за 55 секунд.
-3. `recordAutoTrackEvent` на сервері має ідемпотентний ID
-   `{taskID}_{deviceID}_{occurredAtSecond}`, тому повтор того самого callback-а в ту саму секунду
-   не створює новий raw event.
+1. Extension тримає identity `usageDay + monitorActivity + step` у App Group. Повтор саме цього
+   identity ігнорується як `eventIgnored:duplicateIdentity`; різні steps не залежать від того,
+   скільки секунд між їх delivery timestamps.
+2. `AutoTrackingStore.drainPendingEvents()` дедублікує current-format записи за тим самим
+   identity. Лише legacy записи без metadata мають короткий timestamp fallback.
+3. `recordAutoTrackEvent` на сервері створює детермінований hash ID з
+   `taskID + deviceID + usageDay + monitorActivity + step`. Тому різні кроки з однієї секунди
+   стають різними raw events, а retry того самого кроку лишається ідемпотентним.
 
-Це добре захищає від одного event, який iOS викликала двічі. Але правило не враховує event name.
-Різні `step` однієї generation теж можуть бути відкинуті лише через близькі timestamps.
+Це добре захищає від одного event, який iOS викликала двічі, не втрачаючи різні cumulative steps.
+Для пачки distinct steps `TaskService` і server session writer додають по 60 секунд на step,
+розміщуючи технічні межі перед доставкою пакета. Сесія отримує `hasEstimatedTiming = true`:
+Reports включають підтверджену тривалість, а diagnostics містить `credited packet`, але Timeline
+не показує ні окремого credit-блока, ні вигаданого історичного інтервалу. `autoTrackLastUsageAt`/
+Dynamic Island при цьому лишаються на реальному delivery time — live UI не стрибає у майбутнє.
 
 ### Підтверджений приклад, 2026-07-30
 
 Для TikTok extension отримав `step=7` о 17:03:04 (Kyiv), а потім `step=8, 9, 10, 11, 12, 13`
-практично одночасно о 17:03:07. Усі швидкі кроки отримали `eventIgnored:duplicateThreshold`.
-Пізніше прийшли `step=15`, rearm, а з нової generation — рівні кроки 1…5.
+практично одночасно о 17:03:07. До рефакторингу швидкі кроки були відкинуті як
+`eventIgnored:duplicateThreshold`. Тепер вони мають різні identity і обробляються. Пізніше
+прийшли `step=15`, rearm, а з нової generation — рівні кроки 1…5.
 
-Це доводить пакетну доставку різних порогів. Але **не доводить**, що треба зарахувати кожен з
-них як нову безперервну хвилину: кроки накопичуються протягом усього життя generation, а не лише
-поточної сесії. Саме тому потрібна телеметрія до зміни алгоритму.
+Це доводить пакетну доставку різних порогів. Кожен окремий step є окремим досягнутим порогом,
+тому він зараховується як 60 секунд; це не означає, що його точний момент у Timeline відомий.
+Саме тому placement залишається консервативним, а server traces потрібні для перевірки результату.
 
 ### Що вважати успіхом / помилкою
 
 - Якщо той самий `monitorActivity + step` повторився — це реальний duplicate, не зараховувати.
-- Якщо різні кроки прийшли пачкою, але їхній серверний trace показує новий, послідовний live
-  window та немає попередніх прийнятих кроків — це кандидат на обережне додаткове зарахування.
-- Якщо різні кроки приходять одразу після rearm або після довгої паузи, не можна припускати, що
-  вони описують одну безперервну сесію.
-- Ніколи не синтезувати «точний» початок usage тільки з номера кроку. У кращому разі можна
-  додати консервативно позначений кредит; для Timeline це все одно потребує окремого продуктового
-  рішення щодо його розміщення в часі.
+- Якщо різні кроки приходять пачкою, зарахувати один 60-секундний кредит на кожен distinct step.
+- Не трактувати пакет як доказ того, що usage було безперервним від першого до останнього номера
+  кроку; обидва writers ставлять цей кредит перед delivery time пакета.
+- Ніколи не називати такий placement «точним початком usage».
 
 ## Серверна діагностика (додано 2026-07-30)
 
@@ -123,6 +159,9 @@ token або device secret; token записується лише як коро�
 | `activityTokenRegistered` | `registerLiveActivityPushToken` | iPhone вже побачив Activity й передав її update/end token серверу. |
 | `activityTokenRegisteredAfterStop` | `registerLiveActivityPushToken` | Activity створилась пізно, після stop; сервер одразу відправив їй `end`. |
 | `activityTokenRegistrationFailed` | `registerLiveActivityPushToken` | Реєстрація токена не завершилась. |
+| `liveActivityEndAccepted` / `liveActivityEndFailed` | `onTaskTimerChanged`, `refreshLiveActivities`, `registerLiveActivityPushToken` | APNs прийняв / не прийняв саме ActivityKit `end`; `source` показує `taskStop`, `scheduledCleanup` або `registeredAfterStop`. Це підтверджує транспорт, але iOS не повертає окремий ACK фактичного зникнення Island. |
+| `liveActivityEndFallbackWake` | `onTaskTimerChanged` | Немає per-activity token, тому сервер надіслав silent wake для локального reconcile; `outcome` показує прийняття чи помилку APNs. |
+| `liveActivityEndSkippedNoToken` | `onTaskTimerChanged` | Немає ні per-activity token для `end`, ні адресного APNs token для fallback wake. |
 
 `TaskService.reconcileServerLiveActivityDiagnostics()` читає нові записи під час запуску та
 переходу app у `.active`, кладе їх у `DiagnosticsLog` як `[serverDiag]`, тому наступний
@@ -141,32 +180,38 @@ export містить повний trace. Водяний знак:
    перевіряти server transition і token пристрою.
 5. Якщо `pushToStartAccepted` є, але `activityTokenRegistered` немає — APNs прийняв запит, але
    iOS не дала app достатньо runtime для реєстрації токена або не матеріалізувала Activity.
-6. Для розбіжності статистики порахувати distinct `thresholdAccepted` та порівняти з
-   `eventIgnored:duplicateThreshold`: велика кількість різних step, що були відкинуті пачкою,
-   є конкретним кандидатом на втрату часу.
+6. Для розбіжності статистики порахувати distinct `thresholdAccepted` та локальні
+   `eventIgnored:duplicateIdentity`. Різні step однієї generation більше не мають відкидатися
+   через близькі delivery timestamps; якщо це знову видно, identity-contract був зламаний.
+7. Якщо є extension callback, але немає server trace, перевірити наступний launch/foreground:
+   `drained N pending event(s)` і `recording usage window` підтверджують offline-first recovery.
+8. Якщо replay з минулого створює новий блок замість extension існуючого, шукати
+   `out-of-order replay refused`: це захист від злиття старого вікна з пізнішою сесією через
+   ніч. Такий replay має залишитися окремою історичною сесією.
 
 ## План безпечного розвитку
 
-1. **Спершу зібрати дані.** Не міняти дедуплікацію лише за одним днем: обидва типи багів
-   (справжні дублікати та реальні пакетні пороги) існують.
-2. **Виділити identity події.** Майбутня дедуплікація має розрізняти щонайменше
-   `taskID + monitorActivity(generation) + step`, а не тільки task + timestamp. Для цього треба
-   узгоджено змінити extension, App Group pending model, `autoTrackEvents` ID і серверний endpoint.
-3. **Окремо вибрати модель кредиту.** Зарахувати всі distinct steps — не те саме, що правильно
-   розташувати їх у Timeline. Якщо iOS віддала пороги пізно, ми не знаємо точний розподіл usage.
-4. **Порівняти з Screen Time на серії днів.** Мета — зменшити великі недорахунки без системного
+1. **Збирати дані.** Перевірити, що server traces показують один `thresholdAccepted` на кожен
+   distinct step і один на retry точної identity.
+2. **Перевірити placement.** Зарахувати всі distinct steps — не те саме, що знати їх точний час
+   у Timeline. Для пакетів має бути `hasEstimatedTiming = true` і `credited packet` у diagnostics;
+   вони не мають створювати жодного окремого UI-блока в Timeline.
+3. **Порівняти з Screen Time на серії днів.** Мета — зменшити великі недорахунки без системного
    завищення в дні з помилковими callback-ами.
-5. **Перевірити повторний rearm.** Будь-яка зміна не має знову перетворити monitoring на
+4. **Перевірити повторний rearm.** Будь-яка зміна не має знову перетворити monitoring на
    щохвилинний `stopMonitoring`/`startMonitoring` цикл.
+5. **Зберегти порядок replay.** `latestMergeableAutoTrackedSession` може зливати лише
+   інтервали, що перетинаються, або короткий розрив у напрямку часу вперед. Ніколи не вважати
+   великий від'ємний розрив «меншим за grace window».
 
 ## Задіяні файли
 
 | Файл | Відповідальність |
 |---|---|
 | `AUTO_TRACKING.md` | Базова архітектурна карта автотрекінгу. |
-| `AutoTrackingExtension/AutoTrackingExtension.swift` | Отримує DeviceActivity threshold, local pending queue, поточний 55с dedup, rearm, HTTPS POST. |
-| `TimeGrow/AutoTracking/AutoTrackingStore.swift` | Selection, arm/adopt monitor, App Group drain і другий 55с dedup. |
-| `TimeGrow/Store/TaskService.swift` | Server-event recovery, session merge, import server traces в export. |
+| `AutoTrackingExtension/AutoTrackingExtension.swift` | Отримує DeviceActivity threshold, identity-дедуп за generation + step, **спочатку** пише local pending queue, виконує final-step rearm і HTTPS POST. |
+| `TimeGrow/AutoTracking/AutoTrackingStore.swift` | Selection, arm/adopt monitor без cold-start reset, App Group drain, identity-дедуп і консервативне відновлення пакетів. |
+| `TimeGrow/Store/TaskService.swift` | Local/server-event recovery, session merge, `hasEstimatedTiming` та import server traces в export. |
 | `TimeGrow/TimeGrowApp.swift` | Викликає recovery і import diagnostics на launch/active. |
 | `functions/src/index.ts` | `recordAutoTrackEvent`, server session materialization, push-to-start trace, trace retention. |
 | `functions/src/apns.ts` | HTTP/2 APNs calls та APNs response id. |

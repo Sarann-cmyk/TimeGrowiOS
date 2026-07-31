@@ -110,6 +110,13 @@ final class TaskService: NSObject, ObservableObject {
     private var autoClosingTaskIDs: Set<String> = []
     private var queuedAutoTrackEvents: [PendingAutoTrackEvent] = []
     private var optimisticTimerStarts: [String: OptimisticTimerStart] = [:]
+    /// Session IDs whose `startTimer` transaction has not resolved yet. `db.runTransaction`
+    /// round-trips to the server and does not queue against the local cache the way a plain
+    /// write does — a stop that fires while a session's creation is still in this set must defer
+    /// its Firestore write via `pendingSessionStopActions` instead of hitting `updateData` on a
+    /// document that does not exist yet (silent no-op failure, session left running forever).
+    private var sessionCreationInFlight: Set<String> = []
+    private var pendingSessionStopActions: [String: [() -> Void]] = [:]
     /// ActivityKit emits its current token and then often repeats the same value through the
     /// update stream. Persisting every copy creates a task-write → Cloud Function → silent-push
     /// feedback loop while the user is tapping Start/Stop.
@@ -122,6 +129,10 @@ final class TaskService: NSObject, ObservableObject {
     /// tied to the user's auto-track stop delay: that setting controls normal local inactivity,
     /// while a remote close is an irreversible recovery action and needs a much safer window.
     private let interruptedMacHeartbeatGrace: TimeInterval = 180
+    /// How long a manual session may sit unreferenced by any task's `activeSessionID` before
+    /// `reconcileOrphanedManualSessions` treats it as abandoned rather than merely mid-flight
+    /// (normal `startTimer`/`stopTimer` round-trips resolve in well under a minute).
+    private let orphanedSessionGraceSeconds: TimeInterval = 300
     private let autoTrackingFirebaseProjectID = "timegrowmac"
     private let autoTrackingAuthUIDKey = "autoTracking.firebase.uid"
     private let autoTrackingAuthIDTokenKey = "autoTracking.firebase.idToken"
@@ -509,6 +520,7 @@ final class TaskService: NSObject, ObservableObject {
                     // processed against a not-yet-loaded `sessions` array; flush them now that
                     // there's something real to merge against.
                     self.processQueuedAutoTrackEvents()
+                    self.reconcileOrphanedManualSessions()
                 }
             }
     }
@@ -772,6 +784,12 @@ final class TaskService: NSObject, ObservableObject {
         applyOptimisticTimerStart(for: task, session: session, startedAt: startDate, updatedAt: now)
         DiagnosticsLog.log("timer", "startTimer optimistic apply done task=\(task.name) id=\(id)")
 
+        // `db.runTransaction` below round-trips to the server before this session document
+        // exists anywhere — unlike a plain `setData`/`updateData`, a transaction does not queue
+        // against the local cache. A stop that lands while this is still in flight must not hit
+        // `updateData` on that not-yet-created document (see `finishSessionStop`).
+        sessionCreationInFlight.insert(sessionRef.documentID)
+
         let taskRef = tasksCollection(for: uid).document(id)
         let taskUpdate: [String: Any] = [
             "timerStartedAt": Timestamp(date: startDate),
@@ -826,14 +844,20 @@ final class TaskService: NSObject, ObservableObject {
                         DiagnosticsLog.log("timer", "startTimer fallback session write failed task=\(id): \(error.localizedDescription)")
                     }
                     taskRef.updateData(taskUpdate)
+                    // `setData` above queues against the local cache immediately (unlike the
+                    // transaction attempt that just failed), so a stop racing in right now is
+                    // safe against it — resolve as created.
+                    self.resolveSessionCreation(sessionID: sessionRef.documentID, created: true)
                     return
                 }
 
                 if result as? Bool == true {
                     DiagnosticsLog.log("timer", "startTimer committed task=\(id) session=\(sessionRef.documentID)")
+                    self.resolveSessionCreation(sessionID: sessionRef.documentID, created: true)
                 } else {
                     DiagnosticsLog.log("timer", "startTimer refused task=\(id) — timer already started elsewhere, rolling back optimistic session \(sessionRef.documentID)")
                     self.rollbackOptimisticTimerStart(taskID: id, sessionID: sessionRef.documentID)
+                    self.resolveSessionCreation(sessionID: sessionRef.documentID, created: false)
                 }
             }
         }
@@ -966,7 +990,15 @@ final class TaskService: NSObject, ObservableObject {
                 guard let taskID = document.get("taskID") as? String,
                       let occurredAt = (document.get("occurredAt") as? Timestamp)?.dateValue(),
                       let createdAt = (document.get("createdAt") as? Timestamp)?.dateValue() else { continue }
-                events.append(PendingAutoTrackEvent(taskID: taskID, occurredAt: occurredAt))
+                events.append(
+                    PendingAutoTrackEvent(
+                        taskID: taskID,
+                        occurredAt: occurredAt,
+                        monitorActivity: document.get("monitorActivity") as? String,
+                        thresholdStep: document.get("thresholdStep") as? Int,
+                        usageDay: document.get("usageDay") as? String
+                    )
+                )
                 latestCreatedAt = max(latestCreatedAt, createdAt)
             }
 
@@ -1004,7 +1036,7 @@ final class TaskService: NSObject, ObservableObject {
                 let taskID = document.get("taskID") as? String ?? "?"
                 let values = [
                     "thresholdStep", "sessionID", "startKey", "status", "apnsID", "reason",
-                    "running", "startedLiveWindow", "eventAlreadyRecorded", "token",
+                    "running", "startedLiveWindow", "eventAlreadyRecorded", "token", "source", "outcome",
                 ].compactMap { key -> String? in
                     guard let value = document.get(key) else { return nil }
                     return "\(key)=\(value)"
@@ -1048,30 +1080,74 @@ final class TaskService: NSObject, ObservableObject {
                 continue
             }
 
-            // Replay adjacent offline threshold events as one usage window. This is equivalent
-            // to the existing 180-second session merge rule, but avoids dozens of UI publishes,
-            // Live Activity reconciliations, and Firestore writes when the app is reopened.
-            var windows: [(startedAt: Date, endedAt: Date)] = []
-            for event in taskEvents.sorted(by: { $0.occurredAt < $1.occurredAt }) {
-                let startedAt = event.occurredAt.addingTimeInterval(-autoTrackingThresholdSeconds)
+            // Replay adjacent offline threshold events as one usage window. A burst of *distinct*
+            // threshold steps from the same monitor generation carries one confirmed minute per
+            // step even though iOS delivered them with nearly identical timestamps. We cannot
+            // recover the exact historical seconds, so place that confirmed credit immediately
+            // before the burst. Identical generation+step events have already been removed by
+            // `drainPendingEvents` / the server event identity.
+            var windows: [(startedAt: Date, endedAt: Date, hasEstimatedTiming: Bool)] = []
+            let sortedEvents = taskEvents.sorted(by: { $0.occurredAt < $1.occurredAt })
+            var index = 0
+            while index < sortedEvents.count {
+                let firstEvent = sortedEvents[index]
+                var packet = [firstEvent]
+                var nextIndex = index + 1
+                while nextIndex < sortedEvents.count {
+                    let candidate = sortedEvents[nextIndex]
+                    guard let monitorActivity = firstEvent.monitorActivity,
+                          candidate.monitorActivity == monitorActivity,
+                          candidate.usageDay == firstEvent.usageDay,
+                          let firstStep = firstEvent.thresholdStep,
+                          let candidateStep = candidate.thresholdStep,
+                          candidateStep != firstStep,
+                          candidate.occurredAt.timeIntervalSince(packet.last!.occurredAt) <= autoTrackingBatchedThresholdWindowSeconds else {
+                        break
+                    }
+                    packet.append(candidate)
+                    nextIndex += 1
+                }
+
+                let endedAt = packet.last!.occurredAt
+                let startedAt = endedAt.addingTimeInterval(-autoTrackingThresholdSeconds * Double(packet.count))
+                let hasEstimatedTiming = packet.count > 1
+                if packet.count > 1 {
+                    DiagnosticsLog.log(
+                        "autoTrack",
+                        "credited packet task=\(taskID) generation=\(firstEvent.monitorActivity ?? "?") steps=\(packet.compactMap(\.thresholdStep)) credits=\(packet.count)m from=\(startedAt) to=\(endedAt)"
+                    )
+                }
                 if let last = windows.indices.last,
                    startedAt.timeIntervalSince(windows[last].endedAt) <= autoTrackingInactivityGraceSeconds {
                     var mergedWindow = windows[last]
-                    mergedWindow.endedAt = max(mergedWindow.endedAt, event.occurredAt)
+                    mergedWindow.startedAt = min(mergedWindow.startedAt, startedAt)
+                    mergedWindow.endedAt = max(mergedWindow.endedAt, endedAt)
+                    mergedWindow.hasEstimatedTiming = mergedWindow.hasEstimatedTiming || hasEstimatedTiming
                     windows[last] = mergedWindow
                 } else {
-                    windows.append((startedAt: startedAt, endedAt: event.occurredAt))
+                    windows.append((startedAt: startedAt, endedAt: endedAt, hasEstimatedTiming: hasEstimatedTiming))
                 }
+                index = nextIndex
             }
             for window in windows {
                 DiagnosticsLog.log("autoTrack", "recording usage window for \(task.name) from=\(window.startedAt) to=\(window.endedAt) events=\(taskEvents.count)")
-                recordAutoTrackedSession(for: task, startedAt: window.startedAt, endedAt: window.endedAt)
+                recordAutoTrackedSession(
+                    for: task,
+                    startedAt: window.startedAt,
+                    endedAt: window.endedAt,
+                    hasEstimatedTiming: window.hasEstimatedTiming
+                )
             }
         }
         queuedAutoTrackEvents = remainingEvents
     }
 
-    private func recordAutoTrackedSession(for task: TGTask, startedAt: Date, endedAt: Date) {
+    private func recordAutoTrackedSession(
+        for task: TGTask,
+        startedAt: Date,
+        endedAt: Date,
+        hasEstimatedTiming: Bool
+    ) {
         guard let uid = currentUser?.uid,
               let taskID = task.id,
               endedAt > startedAt else { return }
@@ -1079,12 +1155,17 @@ final class TaskService: NSObject, ObservableObject {
         if let existingSession = latestMergeableAutoTrackedSession(
             for: taskID,
             nextStartedAt: startedAt,
+            nextEndedAt: endedAt,
             afterExplicitStopAt: task.autoTrackStoppedAt
         ),
            let existingSessionID = existingSession.id {
+            let mergedStart = min(existingSession.startedAt, startedAt)
             let mergedEnd = max(existingSession.endedAt ?? existingSession.startedAt, endedAt)
+            let mergedEstimatedTiming = existingSession.isTimingEstimated || hasEstimatedTiming
             if let sessionIndex = sessions.firstIndex(where: { $0.id == existingSessionID }) {
+                sessions[sessionIndex].startedAt = mergedStart
                 sessions[sessionIndex].endedAt = mergedEnd
+                sessions[sessionIndex].hasEstimatedTiming = mergedEstimatedTiming
             }
             let shouldPublishLiveState = shouldPublishAutoTrackLiveState(
                 taskID: taskID,
@@ -1094,12 +1175,14 @@ final class TaskService: NSObject, ObservableObject {
                 applyOptimisticAutoTrackLiveState(
                     taskID: taskID,
                     sessionID: existingSessionID,
-                    sessionStartedAt: existingSession.startedAt,
+                    sessionStartedAt: mergedStart,
                     lastUsageAt: mergedEnd
                 )
             }
             sessionsCollection(for: uid).document(existingSessionID).updateData([
+                "startedAt": Timestamp(date: mergedStart),
                 "endedAt": Timestamp(date: mergedEnd),
+                "hasEstimatedTiming": mergedEstimatedTiming,
             ]) { error in
                 if let error {
                     DiagnosticsLog.log("autoTrack", "failed to extend session \(existingSessionID) for \(task.name): \(error.localizedDescription)")
@@ -1112,7 +1195,7 @@ final class TaskService: NSObject, ObservableObject {
                     uid: uid,
                     taskID: taskID,
                     sessionID: existingSessionID,
-                    sessionStartedAt: existingSession.startedAt,
+                    sessionStartedAt: mergedStart,
                     lastUsageAt: mergedEnd
                 )
             }
@@ -1126,10 +1209,15 @@ final class TaskService: NSObject, ObservableObject {
             .filter({ $0.taskID == taskID && $0.startedAutomatically == true })
             .compactMap(\.endedAt)
             .max() {
-            let gap = startedAt.timeIntervalSince(mostRecentEndedAt)
-            let reason = (task.autoTrackStoppedAt.map { mostRecentEndedAt <= $0 } ?? false)
-                ? "previous session ended by an explicit stop"
-                : "gap=\(Int(gap))s exceeds merge window=\(Int(autoTrackingInactivityGraceSeconds))s"
+            let reason: String
+            if endedAt < mostRecentEndedAt {
+                reason = "out-of-order replay refused: incoming window \(startedAt)…\(endedAt) precedes newest known end \(mostRecentEndedAt)"
+            } else if task.autoTrackStoppedAt.map({ mostRecentEndedAt <= $0 }) ?? false {
+                reason = "previous session ended by an explicit stop"
+            } else {
+                let gap = startedAt.timeIntervalSince(mostRecentEndedAt)
+                reason = "forward gap=\(Int(gap))s exceeds merge window=\(Int(autoTrackingInactivityGraceSeconds))s"
+            }
             DiagnosticsLog.log(
                 "autoTrack",
                 "starting new session for \(task.name) instead of extending previous (ended \(mostRecentEndedAt)): \(reason)"
@@ -1147,7 +1235,8 @@ final class TaskService: NSObject, ObservableObject {
             startedByDeviceID: Self.currentDeviceID,
             startedByPlatform: Self.currentPlatform,
             startedByDeviceName: Self.currentDeviceName,
-            startedAutomatically: true
+            startedAutomatically: true,
+            hasEstimatedTiming: hasEstimatedTiming
         )
         session.id = sessionRef.documentID
 
@@ -1286,6 +1375,7 @@ final class TaskService: NSObject, ObservableObject {
     private func latestMergeableAutoTrackedSession(
         for taskID: String,
         nextStartedAt: Date,
+        nextEndedAt: Date,
         afterExplicitStopAt stoppedAt: Date?
     ) -> TaskTimeSession? {
         sessions
@@ -1298,7 +1388,19 @@ final class TaskService: NSObject, ObservableObject {
                 // `autoTrackSessionStartedAt` remains before the stop and remote clients rightly
                 // continue to regard it as stopped.
                 if let stoppedAt, endedAt <= stoppedAt { return false }
-                return nextStartedAt.timeIntervalSince(endedAt) <= autoTrackingInactivityGraceSeconds
+
+                // Pending/server recovery can replay a genuinely old window after a newer
+                // server-materialized session is already in memory. The old condition only
+                // checked `nextStartedAt - endedAt <= grace`; a ten-hour *negative* gap also
+                // satisfies that inequality, so it stretched one session over the entire night.
+                // A merge is valid only when the two real intervals overlap (idempotent replay
+                // or packet reconstruction) or the incoming window begins shortly *after* this
+                // session ends. A disjoint historical window must create/merge with its own
+                // historical session, never with a future one.
+                let intervalsOverlap = nextStartedAt <= endedAt && nextEndedAt >= session.startedAt
+                let forwardGap = nextStartedAt.timeIntervalSince(endedAt)
+                return intervalsOverlap
+                    || (forwardGap >= 0 && forwardGap <= autoTrackingInactivityGraceSeconds)
             }
             .max { first, second in
                 (first.endedAt ?? first.startedAt) < (second.endedAt ?? second.startedAt)
@@ -1366,8 +1468,14 @@ final class TaskService: NSObject, ObservableObject {
         DiagnosticsLog.log("timer", "stopTimer task=\(task.name) id=\(id) reason=\(reason) endedAt=\(endedAt) ownerPlatform=\(task.timerOwnerPlatform ?? "?") ownerDevice=\(task.timerOwnerDeviceName ?? "?")")
         pendingStops.removeValue(forKey: id)
         optimisticTimerStarts.removeValue(forKey: id)
-        applyOptimisticTimerStop(for: task, endedAt: endedAt)
-        tasksCollection(for: uid).document(id).updateData([
+        // Auto-tracked sessions closed by the watchdog/heartbeat paths (as opposed to an explicit
+        // `stopAutoTracking` tap) never used to set `autoTrackStoppedAt`, so the Timeline/Task
+        // row "still live" grace-window check (which only looks at that field) kept rendering the
+        // task as active for up to `autoTrackingInactivityGraceSeconds` after it had genuinely
+        // stopped — long after the Live Activity itself had already ended.
+        let wasAutoTracked = activeSession(for: task)?.startedAutomatically == true
+        applyOptimisticTimerStop(for: task, endedAt: endedAt, wasAutoTracked: wasAutoTracked)
+        var updateData: [String: Any] = [
             "timerStartedAt": FieldValue.delete(),
             "activeSessionID": FieldValue.delete(),
             "timerOwnerDeviceID": FieldValue.delete(),
@@ -1376,21 +1484,56 @@ final class TaskService: NSObject, ObservableObject {
             "timerOwnerLastAliveAt": FieldValue.delete(),
             "timerOwnerIsActive": FieldValue.delete(),
             "updatedAt": Timestamp(date: Date()),
-        ])
+        ]
+        if wasAutoTracked {
+            updateData["autoTrackStoppedAt"] = Timestamp(date: endedAt)
+            updateData["autoTrackLiveUntil"] = Timestamp(date: endedAt)
+        }
+        tasksCollection(for: uid).document(id).updateData(updateData)
 
         if let sessionID = task.activeSessionID {
-            if endedAt.timeIntervalSince(startedAt) < minimumTrackedSessionDuration {
-                sessions.removeAll { $0.id == sessionID }
-                sessionsCollection(for: uid).document(sessionID).delete()
-            } else {
-                sessionsCollection(for: uid).document(sessionID).updateData([
-                    "endedAt": Timestamp(date: endedAt),
-                ])
-            }
+            let isShortSession = endedAt.timeIntervalSince(startedAt) < minimumTrackedSessionDuration
+            finishSessionStop(uid: uid, sessionID: sessionID, endedAt: endedAt, isShortSession: isShortSession)
         }
     }
 
-    private func applyOptimisticTimerStop(for task: TGTask, endedAt: Date) {
+    /// Guards against writing `endedAt` (or deleting) a session document before its own
+    /// `startTimer` transaction has actually created it — see `sessionCreationInFlight`'s
+    /// declaration for why that race is possible. Confirmed via diagnostics timestamps
+    /// (2026-07-31): a stop logged ~1s before its own start's "committed" log, after which the
+    /// session existed on the server but never received `endedAt` — it stayed "running" forever.
+    private func finishSessionStop(uid: String, sessionID: String, endedAt: Date, isShortSession: Bool) {
+        guard sessionCreationInFlight.contains(sessionID) else {
+            applySessionStopWrite(uid: uid, sessionID: sessionID, endedAt: endedAt, isShortSession: isShortSession)
+            return
+        }
+        pendingSessionStopActions[sessionID, default: []].append { [weak self] in
+            self?.applySessionStopWrite(uid: uid, sessionID: sessionID, endedAt: endedAt, isShortSession: isShortSession)
+        }
+    }
+
+    private func applySessionStopWrite(uid: String, sessionID: String, endedAt: Date, isShortSession: Bool) {
+        if isShortSession {
+            sessionsCollection(for: uid).document(sessionID).delete()
+        } else {
+            sessionsCollection(for: uid).document(sessionID).updateData([
+                "endedAt": Timestamp(date: endedAt),
+            ])
+        }
+    }
+
+    /// Runs once a session's `startTimer` transaction resolves (success, refused, or fell back to
+    /// a direct write). Any stop that raced ahead and got deferred in `pendingSessionStopActions`
+    /// fires now; a refused/rolled-back start has no document to end, so its queued stop is
+    /// simply dropped.
+    private func resolveSessionCreation(sessionID: String, created: Bool) {
+        sessionCreationInFlight.remove(sessionID)
+        guard let actions = pendingSessionStopActions.removeValue(forKey: sessionID) else { return }
+        guard created else { return }
+        actions.forEach { $0() }
+    }
+
+    private func applyOptimisticTimerStop(for task: TGTask, endedAt: Date, wasAutoTracked: Bool = false) {
         guard let taskID = task.id else { return }
 
         if let taskIndex = tasks.firstIndex(where: { $0.id == taskID }) {
@@ -1402,15 +1545,53 @@ final class TaskService: NSObject, ObservableObject {
             updatedTask.timerOwnerDeviceName = nil
             updatedTask.timerOwnerLastAliveAt = nil
             updatedTask.timerOwnerIsActive = nil
+            if wasAutoTracked {
+                updatedTask.autoTrackStoppedAt = endedAt
+                updatedTask.autoTrackLiveUntil = endedAt
+            }
             updatedTask.updatedAt = Date()
             tasks[taskIndex] = updatedTask
         }
 
-        if let activeSessionID = task.activeSessionID,
-           let sessionIndex = sessions.firstIndex(where: { $0.id == activeSessionID }) {
-            sessions[sessionIndex].endedAt = endedAt
-        } else if let sessionIndex = sessions.firstIndex(where: { $0.taskID == taskID && $0.endedAt == nil }) {
-            sessions[sessionIndex].endedAt = endedAt
+        let isShortSession = task.timerStartedAt.map { endedAt.timeIntervalSince($0) < minimumTrackedSessionDuration } ?? false
+        scheduleOptimisticSessionEnd(
+            taskID: taskID,
+            activeSessionID: task.activeSessionID,
+            endedAt: endedAt,
+            removeInstead: isShortSession
+        )
+    }
+
+    /// Mirrors `scheduleOptimisticSessionInsertion`'s deferral, for the same reason: mutating
+    /// `sessions` rebuilds `sessionsByTaskID` and synchronously runs
+    /// `CalendarSyncManager.observeSessions` (which, with Calendar sync enabled, walks the whole
+    /// 30-day cache and commits one EventKit save per session) — on the tap's own call stack,
+    /// that held the row's "stopped" redraw hostage for 1-2+ seconds even though
+    /// `task.isTimerRunning` had already flipped synchronously above (confirmed via diagnostics
+    /// timestamps, 2026-07-31: `[timer] stopTimer ...` to the tap handler's next log line was
+    /// consistently 1-2.2s apart, vs. sub-30ms for the equivalent start path, which already had
+    /// this same deferral). Firestore writes for the session stay synchronous/fire-and-forget in
+    /// `stopTimer` above; only this local array mutation — the expensive one — is deferred.
+    private func scheduleOptimisticSessionEnd(
+        taskID: String,
+        activeSessionID: String?,
+        endedAt: Date,
+        removeInstead: Bool
+    ) {
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard let self else { return }
+
+            let sessionIndex = activeSessionID.flatMap { id in self.sessions.firstIndex(where: { $0.id == id }) }
+                ?? self.sessions.firstIndex(where: { $0.taskID == taskID && $0.endedAt == nil })
+            guard let sessionIndex else { return }
+
+            if removeInstead {
+                self.sessions.remove(at: sessionIndex)
+            } else {
+                self.sessions[sessionIndex].endedAt = endedAt
+            }
         }
     }
 
@@ -1716,6 +1897,41 @@ final class TaskService: NSObject, ObservableObject {
         }
     }
 
+    /// Safety net for sessions left permanently "running" by a race between `stopTimer` and its
+    /// own `startTimer` transaction (see `sessionCreationInFlight`/`pendingSessionStopActions`
+    /// above) — historically possible before that fix, and still possible if the app is killed
+    /// between a deferred stop action being queued and it actually firing (the queue lives only
+    /// in memory). A manual session this old that no task currently points to via
+    /// `activeSessionID` is not legitimately in progress; there is no reliable signal for how
+    /// long it actually ran, so — like any other too-short-to-matter session
+    /// (`minimumTrackedSessionDuration`) — it is removed rather than given a guessed `endedAt`.
+    /// Scoped to `startedAutomatically != true`: auto-tracked sessions are written directly
+    /// (`recordAutoTrackedSession`), never behind a transaction, so they cannot end up here.
+    private func reconcileOrphanedManualSessions() {
+        guard let uid = currentUser?.uid,
+              hasReceivedInitialTasksSnapshot, hasReceivedInitialSessionsSnapshot else { return }
+
+        let referencedSessionIDs = Set(tasks.compactMap(\.activeSessionID))
+        let cutoff = Date().addingTimeInterval(-orphanedSessionGraceSeconds)
+        let orphans = sessions.filter { session in
+            session.endedAt == nil
+                && session.startedAutomatically != true
+                && session.startedAt < cutoff
+                && !(session.id.map(referencedSessionIDs.contains) ?? false)
+        }
+        guard !orphans.isEmpty else { return }
+
+        for orphan in orphans {
+            guard let sessionID = orphan.id else { continue }
+            DiagnosticsLog.log(
+                "timer",
+                "reconciling orphaned session task=\(orphan.taskName) id=\(sessionID) startedAt=\(orphan.startedAt) — unreferenced by any task and older than \(Int(orphanedSessionGraceSeconds))s, removing"
+            )
+            sessions.removeAll { $0.id == sessionID }
+            sessionsCollection(for: uid).document(sessionID).delete()
+        }
+    }
+
     private func activeSession(for task: TGTask) -> TaskTimeSession? {
         if let activeSessionID = task.activeSessionID,
            let session = sessions.first(where: { $0.id == activeSessionID }) {
@@ -1853,6 +2069,10 @@ final class TaskService: NSObject, ObservableObject {
                 }
 
                 let endedAt = max(startedAt, freshestHeartbeat)
+                // `session.startedAutomatically == true` was just confirmed above, so this timer
+                // is always auto-tracked — set `autoTrackStoppedAt` so the Timeline/Task row
+                // grace-window check drops the "still live" state immediately instead of keeping
+                // it visually active for up to `autoTrackingInactivityGraceSeconds` more.
                 transaction.updateData([
                     "timerStartedAt": FieldValue.delete(),
                     "activeSessionID": FieldValue.delete(),
@@ -1861,6 +2081,8 @@ final class TaskService: NSObject, ObservableObject {
                     "timerOwnerDeviceName": FieldValue.delete(),
                     "timerOwnerLastAliveAt": FieldValue.delete(),
                     "timerOwnerIsActive": FieldValue.delete(),
+                    "autoTrackStoppedAt": Timestamp(date: endedAt),
+                    "autoTrackLiveUntil": Timestamp(date: endedAt),
                     "updatedAt": Timestamp(date: Date()),
                 ], forDocument: taskRef)
 

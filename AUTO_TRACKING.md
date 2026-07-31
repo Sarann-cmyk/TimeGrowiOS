@@ -77,16 +77,17 @@ Apple попереджає не реєструвати забагато DeviceAc
 
 ### Дедуплікація на рівні розширення
 
-`minimumDistinctThresholdInterval = 55с` (`AutoTrackingExtension.swift:24`) — якщо дві події для
-однієї задачі прийшли з інтервалом менше 55с, друга ігнорується
-(`eventIgnored:duplicateThreshold`) — захист від зайвого double-counting при дрібних збоях
-доставки, не основний механізм проти реальних затримок (див. нижче).
+Поточний формат події має identity `taskID + usageDay + monitorActivity(generation) +
+thresholdStep`. Повтор саме цієї четвірки в один день — дубль і ігнорується; **різні** step,
+що iOS доставила однією пачкою, обробляються як окремі підтверджені хвилини. Це правило повинно
+залишатися узгодженим у extension, App Group queue, `autoTrackEvents` і Cloud Function.
 
-**Критично:** цей захист зараз дедублікує за `taskID` + часом, а не за ідентичністю event name
-(`generation` + `step`). Якщо iOS віддає різні кроки однією пачкою, він може відкинути реальні
-накопичувальні пороги. Водночас iOS інколи справді викликає помилкові дублікати. Не змінювати
-це правило «всліпу» і не зараховувати всі пачки автоматично — аналіз, діагностика та план
-еволюції описані в `AUTO_TRACKING_RELIABILITY.md`.
+Для пакетної доставки точний історичний момент кожної хвилини невідомий. TimeGrow консервативно
+зберігає стільки 60-секундних кредитів, скільки distinct steps підтверджено. Їхній технічний
+інтервал розміщується перед доставкою пачки лише для сумісності моделі сесій, але позначається
+`hasEstimatedTiming = true`. Такий технічний стан видно в diagnostics, але не відображається в
+Timeline як точне твердження, що застосунок був відкритий у ці години. Reports враховують увесь
+підтверджений час. Повне обґрунтування й діагностика — у `AUTO_TRACKING_RELIABILITY.md`.
 
 ## Три шляхи, куди йде кожна подія
 
@@ -119,8 +120,9 @@ autoTrackingAppGroupID)`). До 2026-07-24 це було основне джер
 відображеної сервером події просто продовжує той самий документ до того самого значення, без
 дублю. Обробляється тільки коли головний застосунок відкривається/переходить у foreground:
 
-- `AutoTrackingStore.drainPendingEvents()` (`AutoTrackingStore.swift:172-213`) — вичитує й чистить
-  чергу, дедублікує події ближче ніж `minimumDistinctPendingEventInterval = 55с` одна до одної.
+- `AutoTrackingStore.drainPendingEvents()` — вичитує й чистить чергу. Для нових подій
+  дедублікує лише точну identity `taskID + usageDay + monitorActivity + thresholdStep`; старий
+  формат без цих полів має лише вузький 10-секундний fallback, щоб не зламати старі черги.
 - `TaskService.processQueuedAutoTrackEvents` → `processQueuedAutoTrackEvents()`
   (`TaskService.swift:664-709`) — склеює сусідні події в "вікна" (`windows`), якщо розрив між
   ними ≤ `autoTrackingInactivityGraceSeconds`, і для кожного вікна викликає
@@ -136,10 +138,11 @@ autoTrackingAppGroupID)`). До 2026-07-24 це було основне джер
 ### 3. Серверна колекція `autoTrackEvents` — відновлення, коли локальна черга не доїхала
 
 Додано 2026-07-23. `recordAutoTrackEvent` (`functions/src/index.ts`) в тій самій транзакції
-ідемпотентно пише сирий запис у `users/{uid}/autoTrackEvents/{taskID}_{deviceID}_{occurredAtSec}`
-(детермінований ID з таск/пристрій/секунда — повторний POST того самого callback перезаписує той
-самий документ, не створює дублікат). Це не заміна локальної черги (шлях 2 лишається головним і
-швидшим), а страховка на випадок, коли локальна `autoTracking.pendingEvents` ніколи не
+ідемпотентно пише сирий запис у `users/{uid}/autoTrackEvents/{taskID}_{deviceID}_{hash}`. Для
+поточного формату hash походить з `taskID + deviceID + usageDay + monitorActivity + thresholdStep`,
+тому повтор того самого callback не створює дублікат, а різні step з однієї пачки мають різні
+документи. Для старого клієнта без metadata збережено legacy identity за секундою доставки. Це не
+заміна локальної черги (шлях 2 лишається головним і швидшим), а страховка на випадок, коли локальна `autoTracking.pendingEvents` ніколи не
 доїжджає до `TaskService` — застосунок місяцями не відкривався, App Group контейнер втрачено,
 перевстановлення тощо. iOS, що не доставила сам `eventDidReachThreshold`, цим не лікується —
 лікується лише втрата вже прийнятої extension-ом події між нею й головним застосунком.
@@ -182,8 +185,7 @@ autoTrackingAppGroupID)`). До 2026-07-24 це було основне джер
 | `autoTrackingThresholdSeconds` | 60с | `AutoTrackingStore.swift:14`, `AutoTrackingExtension.swift` (`thresholdSeconds`) | Розмір одного порогу DeviceActivity; кожна прийнята подія = рівно +60с у вікні, незалежно від того, скільки реального часу пройшло до її отримання. |
 | `autoTrackingInactivityGraceSeconds` | **300с (5хв)**, піднято 2026-07-21 з 180с | `AutoTrackingStore.swift:15-22` (глобальна, `let`, доступна всьому app target), продубльована як `inactivityGraceSeconds` в `AutoTrackingExtension.swift:22-25` (окремий target — не може імпортувати з app target) | "Це ще та сама сесія?" — і для склеювання `TaskTimeSession`, і для того, чи резюмувати `sessionStartedAt` в розширенні. **Обидва місця треба міняти разом.** |
 | `AUTO_TRACK_LIVE_GRACE_MS` | **300 000мс (5хв)**, піднято 2026-07-23 з 180 000мс | `functions/src/index.ts` | Те саме поняття "ще жива", але на сервері, для `autoTrackLiveUntil`, який реально визначає, коли гасне Dynamic Island. Тепер синхронізована з клієнтським `autoTrackingInactivityGraceSeconds`. |
-| `minimumDistinctThresholdInterval` | 55с | `AutoTrackingExtension.swift:24` | Дедуп у розширенні: друга подія для тієї ж задачі раніше ніж за 55с — ігнорується. |
-| `minimumDistinctPendingEventInterval` | 55с | `AutoTrackingStore.swift:23` | Той самий дедуп, але при вичитуванні черги в головному застосунку (друга лінія захисту). |
+| `autoTrackingBatchedThresholdWindowSeconds` | 10с | `AutoTrackingStore.swift` | Максимальна відстань delivery timestamps, за якої distinct steps однієї generation розглядаються як пакет і отримують консервативне розміщення перед його доставкою. Не використовується для дедуплікації current-format подій. |
 | `thresholdDelayWarningSeconds` | 90с | `AutoTrackingExtension.swift:28` | Поріг для діагностичного логування "ця подія прийшла підозріло пізно" (див. нижче). |
 | `minimumTrackedSessionDuration` | 3с | `AutoTrackingStore.swift:18` | Сесії коротші за це видаляються повністю при зупинці — випадкові дотики, не реальний трекінг. |
 

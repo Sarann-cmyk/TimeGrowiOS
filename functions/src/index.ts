@@ -49,9 +49,14 @@ interface TaskDoc {
   timerOwnerPlatform?: string;
   timerOwnerLastAliveAt?: Timestamp;
   autoTrackSessionStartedAt?: Timestamp;
+  autoTrackLastUsageAt?: Timestamp;
   autoTrackLiveUntil?: Timestamp;
   autoTrackStoppedAt?: Timestamp;
   autoTrackActiveSessionID?: string;
+  /** Last DeviceActivity callback identity; transport metadata for packed-step credit only. */
+  autoTrackLastMonitorActivity?: string;
+  autoTrackLastThresholdStep?: number;
+  autoTrackLastUsageDay?: string;
   liveActivityPushToken?: string;
   /** Per-device ActivityKit update/end tokens. Legacy singular field remains for older clients. */
   liveActivityPushTokens?: Record<string, string>;
@@ -67,6 +72,7 @@ interface SessionDoc {
   colorHex?: string;
   startedAt?: Timestamp;
   startedAutomatically?: boolean;
+  hasEstimatedTiming?: boolean;
   endedAt?: Timestamp;
   startedByDeviceID?: string;
   startedByPlatform?: string;
@@ -212,8 +218,16 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
   const deviceID = typeof body?.deviceID === "string" ? body.deviceID : "";
   const deviceSecret = typeof body?.deviceSecret === "string" ? body.deviceSecret : "";
   const taskID = typeof body?.taskID === "string" ? body.taskID : "";
-  const thresholdStep = typeof body?.thresholdStep === "number" ? body.thresholdStep : null;
+  const thresholdStep = typeof body?.thresholdStep === "number"
+    && Number.isInteger(body.thresholdStep)
+    && body.thresholdStep >= 1
+    && body.thresholdStep <= 15
+    ? body.thresholdStep
+    : null;
   const monitorActivity = typeof body?.monitorActivity === "string" ? body.monitorActivity : null;
+  const usageDay = typeof body?.usageDay === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.usageDay)
+    ? body.usageDay
+    : null;
   if (!uid || !deviceID || !deviceSecret || !taskID) {
     response.status(400).json({ error: "invalid-request" });
     return;
@@ -224,12 +238,14 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
   const requestedSessionStart = requestDate(body?.sessionStartedAt, occurredAt);
   const deviceRef = db.collection("users").doc(uid).collection("devices").doc(deviceID);
   const taskRef = db.collection("users").doc(uid).collection("tasks").doc(taskID);
-  // Deterministic from the identity of the physical threshold callback (task, device, second it
-  // occurred), not a random ID, so a retried POST for the exact same callback — the extension's
-  // network path has no idea whether an earlier attempt actually landed — writes the same
-  // document instead of a duplicate. `processQueuedAutoTrackEvents` on the client already merges
-  // overlapping windows harmlessly, but there's no reason to make it rely on that here too.
-  const eventID = `${taskID}_${deviceID}_${Math.round(occurredAt.getTime() / 1_000)}`;
+  // A delivery timestamp is not an identity: iOS can legitimately deliver several distinct
+  // cumulative steps in the same second. Current clients send generation + step + local usage
+  // day, so only a replay of that exact callback overwrites the same raw event. Keep the legacy
+  // timestamp identity for queues sent by an older installed extension.
+  const eventIdentity = monitorActivity && thresholdStep && usageDay
+    ? `v2|${taskID}|${deviceID}|${usageDay}|${monitorActivity}|${thresholdStep}`
+    : `legacy|${taskID}|${deviceID}|${Math.round(occurredAt.getTime() / 1_000)}`;
+  const eventID = `${taskID}_${deviceID}_${createHash("sha256").update(eventIdentity).digest("hex").slice(0, 32)}`;
   const eventRef = db.collection("users").doc(uid).collection("autoTrackEvents").doc(eventID);
 
   try {
@@ -247,6 +263,16 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
       const eventSnapshot = await transaction.get(eventRef);
 
       const task = taskSnapshot.data() as TaskDoc;
+      if (eventSnapshot.exists) {
+        return {
+          started: false,
+          sessionStartedAt: task.autoTrackSessionStartedAt?.toDate() ?? requestedSessionStart,
+          sessionID: task.autoTrackActiveSessionID ?? "",
+          eventAlreadyRecorded: true,
+          packedDistinctStep: false,
+          creditedSessionStartedAt: task.autoTrackSessionStartedAt?.toDate() ?? requestedSessionStart,
+        };
+      }
       const wasRunning = activeTimerStart(task, now) !== null;
       const previousAutoStart = task.autoTrackSessionStartedAt?.toDate();
       const previousLiveUntil = task.autoTrackLiveUntil?.toDate();
@@ -257,6 +283,18 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
         && (!previousStoppedAt || previousStoppedAt < previousAutoStart);
       const sessionStartedAt = canContinuePreviousSession ? previousAutoStart : requestedSessionStart;
       const liveUntil = new Date(Math.max(now.getTime(), occurredAt.getTime()) + AUTO_TRACK_LIVE_GRACE_MS);
+      const previousUsageAt = task.autoTrackLastUsageAt?.toDate();
+      const packedDistinctStep = !!(
+        canContinuePreviousSession
+        && monitorActivity
+        && thresholdStep
+        && usageDay
+        && task.autoTrackLastMonitorActivity === monitorActivity
+        && task.autoTrackLastUsageDay === usageDay
+        && task.autoTrackLastThresholdStep !== thresholdStep
+        && previousUsageAt
+        && Math.abs(occurredAt.getTime() - previousUsageAt.getTime()) <= 10_000
+      );
 
       // Materialize the `TaskTimeSession` (Timeline/Reports block) here, in real time, instead of
       // waiting for some client to open the app and replay `autoTrackEvents` — that could be
@@ -270,11 +308,21 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
       const previousSessionSnapshot = previousSessionRef ? await transaction.get(previousSessionRef) : undefined;
 
       let sessionID: string;
+      var creditedSessionStartedAt = sessionStartedAt;
       if (previousSessionSnapshot?.exists && previousSessionRef) {
+        const previousStartedAt = (previousSessionSnapshot.data() as SessionDoc).startedAt?.toDate() ?? sessionStartedAt;
         const previousEndedAt = (previousSessionSnapshot.data() as SessionDoc).endedAt?.toDate();
         const mergedEndedAt = previousEndedAt && previousEndedAt > occurredAt ? previousEndedAt : occurredAt;
+        // A distinct step in a tightly delivered packet is another confirmed 60 seconds. Its
+        // exact historical second is unknowable, so add it immediately before the packet rather
+        // than extending a session into the future or moving Dynamic Island's live start time.
+        creditedSessionStartedAt = packedDistinctStep
+          ? new Date(previousStartedAt.getTime() - 60_000)
+          : previousStartedAt;
         transaction.update(previousSessionRef, {
+          startedAt: admin.firestore.Timestamp.fromDate(creditedSessionStartedAt),
           endedAt: admin.firestore.Timestamp.fromDate(mergedEndedAt),
+          hasEstimatedTiming: previousSessionSnapshot.data()?.hasEstimatedTiming === true || packedDistinctStep,
         });
         sessionID = previousSessionRef.id;
       } else {
@@ -288,6 +336,7 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
           startedByDeviceID: deviceID,
           startedByPlatform: "iOS",
           startedAutomatically: true,
+          hasEstimatedTiming: false,
         });
         sessionID = newSessionRef.id;
       }
@@ -298,6 +347,11 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
         autoTrackSessionStartedAt: admin.firestore.Timestamp.fromDate(sessionStartedAt),
         autoTrackActiveSessionID: sessionID,
         autoTrackStoppedAt: admin.firestore.FieldValue.delete(),
+        ...(monitorActivity && thresholdStep && usageDay ? {
+          autoTrackLastMonitorActivity: monitorActivity,
+          autoTrackLastThresholdStep: thresholdStep,
+          autoTrackLastUsageDay: usageDay,
+        } : {}),
         updatedAt: admin.firestore.Timestamp.fromDate(now),
       });
       // `createdAt` is when this server durably learned about the event, not `occurredAt` (when
@@ -305,20 +359,25 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
       // specifically so a callback that occurred earlier but arrives late over a bad connection
       // still gets picked up by a later reconciliation pass instead of falling behind a
       // watermark already advanced past its (earlier) `occurredAt`.
-      if (!eventSnapshot.exists) {
-        transaction.set(eventRef, {
-          taskID,
-          deviceID,
-          occurredAt: admin.firestore.Timestamp.fromDate(occurredAt),
-          sessionStartedAt: admin.firestore.Timestamp.fromDate(sessionStartedAt),
-          createdAt: admin.firestore.Timestamp.fromDate(now),
-        });
-      }
+      transaction.set(eventRef, {
+        taskID,
+        deviceID,
+        occurredAt: admin.firestore.Timestamp.fromDate(occurredAt),
+        sessionStartedAt: admin.firestore.Timestamp.fromDate(sessionStartedAt),
+        creditedSessionStartedAt: admin.firestore.Timestamp.fromDate(creditedSessionStartedAt),
+        hasEstimatedTiming: packedDistinctStep,
+        monitorActivity,
+        thresholdStep,
+        usageDay,
+        createdAt: admin.firestore.Timestamp.fromDate(now),
+      });
       return {
         started: !wasRunning,
         sessionStartedAt,
         sessionID,
-        eventAlreadyRecorded: eventSnapshot.exists,
+        eventAlreadyRecorded: false,
+        packedDistinctStep,
+        creditedSessionStartedAt,
       };
     });
 
@@ -328,12 +387,15 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
       deviceID,
       thresholdStep,
       monitorActivity,
+      usageDay,
       occurredAt: admin.firestore.Timestamp.fromDate(occurredAt),
       requestedSessionStart: admin.firestore.Timestamp.fromDate(requestedSessionStart),
       sessionStartedAt: admin.firestore.Timestamp.fromDate(result.sessionStartedAt),
       sessionID: result.sessionID,
       startedLiveWindow: result.started,
       eventAlreadyRecorded: result.eventAlreadyRecorded,
+      packedDistinctStep: result.packedDistinctStep,
+      creditedSessionStartedAt: admin.firestore.Timestamp.fromDate(result.creditedSessionStartedAt),
     });
     response.status(200).json({ ok: true, started: result.started });
   } catch (error) {
@@ -419,7 +481,25 @@ export const registerLiveActivityPushToken = onRequest(
         });
         response.status(200).json({ ok: true, running: true });
       } else {
-        await sendLiveActivityEnd(credentials(), activityPushToken, contentState(now));
+        await sendLiveActivityEnd(credentials(), activityPushToken, contentState(now))
+          .then(async (endResponse) => {
+            await writeLiveActivityDiagnostic(uid, "liveActivityEndAccepted", {
+              taskID,
+              source: "registeredAfterStop",
+              token: tokenHint(activityPushToken),
+              status: endResponse.status,
+              apnsID: endResponse.apnsID ?? null,
+            });
+          })
+          .catch(async (endError) => {
+            await writeLiveActivityDiagnostic(uid, "liveActivityEndFailed", {
+              taskID,
+              source: "registeredAfterStop",
+              token: tokenHint(activityPushToken),
+              reason: String(endError?.message ?? endError),
+            });
+            throw endError;
+          });
         await writeLiveActivityDiagnostic(uid, "activityTokenRegisteredAfterStop", {
           taskID,
           deviceID,
@@ -640,13 +720,37 @@ export const onTaskTimerChanged = onDocumentUpdated(
           .filter((deviceToken): deviceToken is string => !!deviceToken && deviceToken !== ownerWakeToken))];
         if (wakeTokens.length === 0) {
           console.warn(`Live Activity fallback wake skipped: no APNs device tokens (task ${taskID})`);
+          await writeLiveActivityDiagnostic(uid, "liveActivityEndSkippedNoToken", {
+            taskID,
+            source: "taskStopFallback",
+            reason: "no-activity-token-and-no-wake-token",
+          });
           return;
         }
         await Promise.all(
           wakeTokens.map((deviceToken) =>
             sendBackgroundWake(credentials(), deviceToken)
-              .then((response) => console.log(`Live Activity fallback wake accepted by APNs (task ${taskID}, token ${tokenHint(deviceToken)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
-              .catch((error) => console.error(`Live Activity fallback wake failed (task ${taskID}, token ${tokenHint(deviceToken)})`, error))
+              .then(async (response) => {
+                console.log(`Live Activity fallback wake accepted by APNs (task ${taskID}, token ${tokenHint(deviceToken)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`);
+                await writeLiveActivityDiagnostic(uid, "liveActivityEndFallbackWake", {
+                  taskID,
+                  source: "taskStopFallback",
+                  outcome: "accepted",
+                  token: tokenHint(deviceToken),
+                  status: response.status,
+                  apnsID: response.apnsID ?? null,
+                });
+              })
+              .catch(async (error) => {
+                console.error(`Live Activity fallback wake failed (task ${taskID}, token ${tokenHint(deviceToken)})`, error);
+                await writeLiveActivityDiagnostic(uid, "liveActivityEndFallbackWake", {
+                  taskID,
+                  source: "taskStopFallback",
+                  outcome: "failed",
+                  token: tokenHint(deviceToken),
+                  reason: String(error?.message ?? error),
+                });
+              })
           )
         );
         return;
@@ -655,8 +759,25 @@ export const onTaskTimerChanged = onDocumentUpdated(
       await Promise.all(
         activityTokens.map((token) =>
           sendLiveActivityEnd(credentials(), token, contentState(beforeStart))
-            .then((response) => console.log(`Live Activity end accepted by APNs (task ${taskID}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
-            .catch((error) => console.error(`Live Activity end push failed (task ${taskID}, token ${tokenHint(token)})`, error))
+            .then(async (response) => {
+              console.log(`Live Activity end accepted by APNs (task ${taskID}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`);
+              await writeLiveActivityDiagnostic(uid, "liveActivityEndAccepted", {
+                taskID,
+                source: "taskStop",
+                token: tokenHint(token),
+                status: response.status,
+                apnsID: response.apnsID ?? null,
+              });
+            })
+            .catch(async (error) => {
+              console.error(`Live Activity end push failed (task ${taskID}, token ${tokenHint(token)})`, error);
+              await writeLiveActivityDiagnostic(uid, "liveActivityEndFailed", {
+                taskID,
+                source: "taskStop",
+                token: tokenHint(token),
+                reason: String(error?.message ?? error),
+              });
+            })
         )
       );
     }
@@ -771,19 +892,42 @@ export const refreshLiveActivities = onSchedule(
     ].filter((token): token is string => !!token))];
     if (activityTokens.length === 0) return;
     const runningStart = activeTimerStart(task, now);
-    if (runningStart) {
+      if (runningStart) {
           await Promise.all(activityTokens.map((token) =>
             sendLiveActivityUpdate(creds, token, contentState(runningStart, now)).catch((error) =>
               console.error(`minute-window update failed (${doc.ref.path})`, error)
             )
           ));
           return;
-        }
+      }
 
+        const uid = doc.ref.parent.parent?.id;
+        const taskID = doc.id;
         await Promise.all(activityTokens.map((token) =>
           sendLiveActivityEnd(creds, token, contentState(now))
-            .then((response) => console.log(`scheduled Live Activity end accepted by APNs (task ${doc.ref.path}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`))
-            .catch((error) => console.error(`scheduled Live Activity end push failed (task ${doc.ref.path}, token ${tokenHint(token)})`, error))
+            .then(async (response) => {
+              console.log(`scheduled Live Activity end accepted by APNs (task ${doc.ref.path}, token ${tokenHint(token)}, status ${response.status}, apns-id ${response.apnsID ?? "none"})`);
+              if (uid) {
+                await writeLiveActivityDiagnostic(uid, "liveActivityEndAccepted", {
+                  taskID,
+                  source: "scheduledCleanup",
+                  token: tokenHint(token),
+                  status: response.status,
+                  apnsID: response.apnsID ?? null,
+                });
+              }
+            })
+            .catch(async (error) => {
+              console.error(`scheduled Live Activity end push failed (task ${doc.ref.path}, token ${tokenHint(token)})`, error);
+              if (uid) {
+                await writeLiveActivityDiagnostic(uid, "liveActivityEndFailed", {
+                  taskID,
+                  source: "scheduledCleanup",
+                  token: tokenHint(token),
+                  reason: String(error?.message ?? error),
+                });
+              }
+            })
         ));
         await doc.ref.update({
           liveActivityPushToken: admin.firestore.FieldValue.delete(),
@@ -848,6 +992,10 @@ export const closeInterruptedMacAutoTimers = onSchedule(
           }
 
           const endedAt = new Date(Math.max(startedAt.getTime(), currentHeartbeat.getTime()));
+          // `session.startedAutomatically === true` was just confirmed above, so this timer is
+          // always auto-tracked — set `autoTrackStoppedAt` so clients' Timeline/Task row
+          // grace-window check drops the "still live" state immediately instead of keeping it
+          // visually active for up to the full inactivity grace window after this closes it.
           transaction.update(taskSnapshot.ref, {
             timerStartedAt: admin.firestore.FieldValue.delete(),
             activeSessionID: admin.firestore.FieldValue.delete(),
@@ -856,6 +1004,8 @@ export const closeInterruptedMacAutoTimers = onSchedule(
             timerOwnerDeviceName: admin.firestore.FieldValue.delete(),
             timerOwnerLastAliveAt: admin.firestore.FieldValue.delete(),
             timerOwnerIsActive: admin.firestore.FieldValue.delete(),
+            autoTrackStoppedAt: admin.firestore.Timestamp.fromDate(endedAt),
+            autoTrackLiveUntil: admin.firestore.Timestamp.fromDate(endedAt),
             updatedAt: admin.firestore.Timestamp.fromDate(now),
           });
           transaction.update(currentSessionRef, {

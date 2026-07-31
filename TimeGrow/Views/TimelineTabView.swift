@@ -674,6 +674,10 @@ struct TimelineTabView: View {
     private func daySessions(for bounds: (start: Date, end: Date), at date: Date) -> [TaskTimeSession] {
         let filtered = sessionsSource(at: date)
             .filter { session in
+                // A delayed packet's duration is real, but its wall-clock placement is only a
+                // conservative reconstruction. Keep that technical state in diagnostics and
+                // Reports, but never draw it as a factual Timeline block.
+                guard !session.isTimingEstimated else { return false }
                 let end = session.endedAt ?? date
                 guard end > bounds.start && session.startedAt < bounds.end else { return false }
                 let overlapStart = max(session.startedAt, bounds.start)
