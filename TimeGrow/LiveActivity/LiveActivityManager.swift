@@ -14,9 +14,14 @@ import UIKit
 final class LiveActivityManager {
     static let shared = LiveActivityManager()
 
-    /// Ticks while at least one activity is running so an auto-tracked activity whose grace
-    /// period (`autoTrackLiveUntil`) elapses purely by wall-clock time — with no new Firestore
-    /// write to trigger `TaskService.tasks`' `didSet` — still gets re-checked and ended promptly.
+    private struct RunningActivityCycle {
+        let startedAt: Date
+        let key: String
+    }
+
+    /// Ticks while at least one activity is running so an auto-tracked activity whose short
+    /// ActivityKit lease (`autoTrackLiveActivityUntil`) elapses purely by wall-clock time — with
+    /// no new Firestore write to trigger `TaskService.tasks`' `didSet` — still gets ended.
     private var recheckTimer: Timer?
     /// Fires exactly at each local minute boundary while the app is alive. Keeping this separate
     /// from the 30-second lifecycle recheck prevents the expanded progress ring from waiting up
@@ -42,9 +47,10 @@ final class LiveActivityManager {
     private var activityEnablementUpdatesTask: Task<Void, Never>?
 
     /// Activities whose push token stream we've already subscribed to, keyed by `Activity.id`.
-    /// Needed because `reconcile(tasks:)` can discover an activity it didn't start itself (e.g.
-    /// `AutoTrackingExtension` starts activities directly, bypassing `start(for:startedAt:)`
-    /// below) — without this, that activity's `liveActivityPushToken` never reaches Firestore,
+    /// Needed because `reconcile(tasks:)` can discover an activity it didn't start itself (for
+    /// example, one created by a remote push-to-start, bypassing
+    /// `start(for:startedAt:cycleKey:)` below) — without this, that activity's
+    /// `liveActivityPushToken` never reaches Firestore,
     /// so a remote `end` push (sent when another device stops the task) has nothing to target
     /// and the Dynamic Island silently keeps counting until the app is opened locally.
     private var observedActivityIDs: Set<String> = []
@@ -57,6 +63,22 @@ final class LiveActivityManager {
     /// state. Do not end it based on that short-lived stale snapshot; give the server state one
     /// reconciliation interval to arrive first.
     private var remoteStartGraceUntilByActivityID: [String: Date] = [:]
+    /// One audit per auto-track ActivityKit cycle after its 90-second lease expires. This lets an
+    /// exported phone log answer whether iOS still listed the activity when TimeGrow next ran.
+    private var auditedExpiredLeaseKeys: Set<String> = []
+    /// ActivityKit can accept `Activity.request()` and then remove the new activity almost
+    /// immediately with `.dismissed`. Retrying the same timer window on every Firestore snapshot
+    /// creates a start storm and can make system throttling worse. Persist the stable timer-cycle
+    /// key so app relaunches on the same iPhone boot also respect that dismissal.
+    private var dismissedCycleKeys: Set<String> = []
+    private var loggedSuppressedCycleKeys: Set<String> = []
+    /// The Firestore cycle ID can be corrected after an optimistic local start. Keep the latest
+    /// cycle associated with each concrete Activity so a later `.dismissed` is never recorded
+    /// against the stale optimistic key.
+    private var cycleKeyByActivityID: [String: String] = [:]
+    /// A remotely push-started activity can be dismissed before its task snapshot arrives. Hold
+    /// the task ID briefly, then bind the dismissal to the cycle from the background fetch.
+    private var pendingDismissedTaskIDs: [String: Date] = [:]
 
     private let remoteStartReconciliationGrace: TimeInterval = 30
     private let appGroupID = "group.WINNER.ltd.TimeGrow"
@@ -64,6 +86,8 @@ final class LiveActivityManager {
     private let deviceCredentialProjectIDKey = "autoTracking.firebase.projectID"
     private let deviceCredentialIDKey = "autoTracking.deviceID"
     private let deviceCredentialSecretKey = "autoTracking.deviceSecret"
+    private let dismissedCycleKeysKey = "liveActivity.dismissedCycleKeys.v1"
+    private let dismissedCycleBootTimeKey = "liveActivity.dismissedCycleBootTime.v1"
 
     /// Called whenever a task's per-activity push token becomes known (activity just started) or
     /// should be cleared (activity ending). Set once from `TimeGrowApp` to persist it via
@@ -81,7 +105,21 @@ final class LiveActivityManager {
         }
     }
 
-    private init() {}
+    private init() {
+        guard let shared = UserDefaults(suiteName: appGroupID) else { return }
+
+        let currentBootTime = Date().timeIntervalSince1970 - ProcessInfo.processInfo.systemUptime
+        let hasStoredBootTime = shared.object(forKey: dismissedCycleBootTimeKey) != nil
+        let storedBootTime = shared.double(forKey: dismissedCycleBootTimeKey)
+        if hasStoredBootTime, abs(currentBootTime - storedBootTime) < 60 {
+            dismissedCycleKeys = Set(shared.stringArray(forKey: dismissedCycleKeysKey) ?? [])
+        } else {
+            // A device reboot is the most useful recovery for a wedged ActivityKit daemon. Let
+            // the current timer cycle make one fresh request after that reboot.
+            shared.removeObject(forKey: dismissedCycleKeysKey)
+            shared.set(currentBootTime, forKey: dismissedCycleBootTimeKey)
+        }
+    }
 
     /// Begin this at application launch alongside the other observers below. Logs the current
     /// enablement immediately, then every subsequent flip, so a report of "it just stopped
@@ -92,7 +130,7 @@ final class LiveActivityManager {
         let info = ActivityAuthorizationInfo()
         DiagnosticsLog.log(
             "liveActivity",
-            "Live Activities authorization enabled=\(info.areActivitiesEnabled) frequentPushesEnabled=\(info.frequentPushesEnabled)"
+            "Live Activities authorization enabled=\(info.areActivitiesEnabled) frequentPushesEnabled=\(info.frequentPushesEnabled) dismissedCycleGuardCount=\(dismissedCycleKeys.count)"
         )
         activityEnablementUpdatesTask = Task {
             for await enabled in info.activityEnablementUpdates {
@@ -135,7 +173,13 @@ final class LiveActivityManager {
                         self.remoteStartGraceUntilByActivityID[activity.id] = Date()
                             .addingTimeInterval(self.remoteStartReconciliationGrace)
                     }
-                    self.observePushToken(of: activity, taskID: taskID)
+                    let cycleKey = self.lastKnownTasks
+                        .first(where: { $0.id == taskID && Self.activeTimerStart(for: $0) != nil })
+                        .flatMap(Self.activityCycleKey(for:))
+                    if let cycleKey {
+                        self.cycleKeyByActivityID[activity.id] = cycleKey
+                    }
+                    self.observePushToken(of: activity, taskID: taskID, cycleKey: cycleKey)
                     DiagnosticsLog.log("liveActivity", "Observed ActivityKit-created activity task=\(taskID)")
                 }
             }
@@ -144,24 +188,28 @@ final class LiveActivityManager {
 
     func reconcile(tasks: [TGTask]) {
         lastKnownTasks = tasks
+        logExpiredAutoTrackLeaseAudits(tasks: tasks)
         guard ActivityAuthorizationInfo().areActivitiesEnabled else {
             DiagnosticsLog.log("liveActivity", "reconcile skipped: Live Activities not enabled")
             return
         }
 
-        var runningStartByTaskID: [String: Date] = [:]
+        var runningCyclesByTaskID: [String: RunningActivityCycle] = [:]
         for task in tasks {
-            guard let id = task.id, let startedAt = Self.activeTimerStart(for: task) else { continue }
-            runningStartByTaskID[id] = startedAt
+            guard let id = task.id,
+                  let startedAt = Self.activeTimerStart(for: task),
+                  let cycleKey = Self.activityCycleKey(for: task) else { continue }
+            runningCyclesByTaskID[id] = RunningActivityCycle(startedAt: startedAt, key: cycleKey)
         }
+        resolvePendingDismissals(using: runningCyclesByTaskID)
         let existingActivitySummary = Activity<TimeGrowLiveActivityAttributes>.activities.map {
             "\($0.attributes.taskID):\($0.activityState)"
         }
-        DiagnosticsLog.log("liveActivity", "reconcile tasks=\(tasks.count) running=\(runningStartByTaskID.keys) existingActivities=\(existingActivitySummary)")
+        DiagnosticsLog.log("liveActivity", "reconcile tasks=\(tasks.count) running=\(runningCyclesByTaskID.keys) existingActivities=\(existingActivitySummary)")
 
         for activity in Activity<TimeGrowLiveActivityAttributes>.activities {
             let taskID = activity.attributes.taskID
-            guard runningStartByTaskID[taskID] != nil else {
+            guard let runningCycle = runningCyclesByTaskID[taskID] else {
                 if UIApplication.shared.applicationState != .active,
                    let graceUntil = remoteStartGraceUntilByActivityID[activity.id],
                    graceUntil > Date() {
@@ -177,11 +225,12 @@ final class LiveActivityManager {
             }
             remoteStartGraceUntilByActivityID.removeValue(forKey: activity.id)
             cancelPendingEnd(forActivityID: activity.id)
+            cycleKeyByActivityID[activity.id] = runningCycle.key
             if !observedActivityIDs.contains(activity.id) {
                 observedActivityIDs.insert(activity.id)
-                observePushToken(of: activity, taskID: taskID)
+                observePushToken(of: activity, taskID: taskID, cycleKey: runningCycle.key)
             }
-            runningStartByTaskID.removeValue(forKey: taskID)
+            runningCyclesByTaskID.removeValue(forKey: taskID)
         }
 
         refreshMinuteProgress(for: tasks)
@@ -197,8 +246,17 @@ final class LiveActivityManager {
         // starting new ones is foreground-restricted.
         if UIApplication.shared.applicationState == .active {
             for task in tasks {
-                guard let id = task.id, let startedAt = runningStartByTaskID[id] else { continue }
-                start(for: task, startedAt: startedAt)
+                guard let id = task.id, let cycle = runningCyclesByTaskID[id] else { continue }
+                guard !dismissedCycleKeys.contains(cycle.key) else {
+                    if loggedSuppressedCycleKeys.insert(cycle.key).inserted {
+                        DiagnosticsLog.log(
+                            "liveActivity",
+                            "Suppressed repeated Live Activity start task=\(task.name) taskID=\(id) cycle=\(cycle.key) reason=systemDismissedSameCycle"
+                        )
+                    }
+                    continue
+                }
+                start(for: task, startedAt: cycle.startedAt, cycleKey: cycle.key)
             }
         }
 
@@ -249,13 +307,67 @@ final class LiveActivityManager {
             // (grace window expired vs. an explicit stop vs. never live) without re-deriving it
             // from separate task-snapshot log lines.
             let staleTask = self.lastKnownTasks.first { $0.id == taskID }
+            let endReason = Self.endReason(for: staleTask, at: Date())
             DiagnosticsLog.log(
                 "liveActivity",
-                "Ending Live Activity task=\(taskID) id=\(activityID) after reconciliation grace autoTrackLiveUntil=\(String(describing: staleTask?.autoTrackLiveUntil)) autoTrackStoppedAt=\(String(describing: staleTask?.autoTrackStoppedAt)) autoTrackSessionStartedAt=\(String(describing: staleTask?.autoTrackSessionStartedAt))"
+                "Ending Live Activity task=\(taskID) id=\(activityID) reason=\(endReason) after reconciliation grace autoTrackLiveActivityUntil=\(String(describing: staleTask?.autoTrackLiveActivityUntil)) autoTrackLiveUntil=\(String(describing: staleTask?.autoTrackLiveUntil)) autoTrackStoppedAt=\(String(describing: staleTask?.autoTrackStoppedAt)) autoTrackSessionStartedAt=\(String(describing: staleTask?.autoTrackSessionStartedAt))"
             )
             await currentActivity.end(nil, dismissalPolicy: .immediate)
-            DiagnosticsLog.log("liveActivity", "Ended Live Activity task=\(taskID) id=\(activityID)")
+            try? await Task.sleep(for: .milliseconds(250))
+            let stillListed = Activity<TimeGrowLiveActivityAttributes>.activities.contains {
+                $0.id == activityID
+            }
+            DiagnosticsLog.log(
+                "liveActivity",
+                "Live Activity end verification task=\(taskID) id=\(activityID) reason=\(endReason) systemRemoved=\(!stillListed) stillListed=\(stillListed) state=\(currentActivity.activityState)"
+            )
         }
+    }
+
+    /// Logs the exact 90-second deadline and ActivityKit's observable state. This also covers the
+    /// server-end path: if the app was suspended when APNs ended the activity, the next foreground
+    /// reconcile records `activityPresent=false` instead of relying only on APNs acceptance.
+    private func logExpiredAutoTrackLeaseAudits(tasks: [TGTask], at date: Date = Date()) {
+        let activities = Activity<TimeGrowLiveActivityAttributes>.activities
+
+        for task in tasks {
+            guard task.timerStartedAt == nil,
+                  let taskID = task.id,
+                  let autoStart = task.autoTrackSessionStartedAt,
+                  let leaseUntil = Self.autoTrackLiveActivityUntil(for: task),
+                  leaseUntil <= date,
+                  !(task.autoTrackStoppedAt.map { $0 >= autoStart } ?? false) else { continue }
+
+            let cycleID = task.autoTrackLiveActivityCycleID
+                ?? String(Int(leaseUntil.timeIntervalSince1970))
+            let auditKey = "\(taskID)|\(cycleID)|\(leaseUntil.timeIntervalSince1970)"
+            guard auditedExpiredLeaseKeys.insert(auditKey).inserted else { continue }
+            if auditedExpiredLeaseKeys.count > 200 {
+                auditedExpiredLeaseKeys = [auditKey]
+            }
+
+            let matchingActivities = activities.filter { $0.attributes.taskID == taskID }
+            let states = matchingActivities.map { "\($0.id):\($0.activityState)" }
+            let mergeUntil = task.autoTrackLiveUntil
+            let isWaitingForReturn = mergeUntil.map { $0 > date } ?? false
+            DiagnosticsLog.log(
+                "liveActivity",
+                "90-second lease audit task=\(task.name) taskID=\(taskID) cycle=\(cycleID) deadline=\(leaseUntil) observedAt=\(date) delayMs=\(Int(date.timeIntervalSince(leaseUntil) * 1_000)) activityPresent=\(!matchingActivities.isEmpty) activityStates=\(states) expectedUIPhase=\(isWaitingForReturn ? "pausedBlinking" : "inactive") autoTrackLiveUntil=\(String(describing: mergeUntil))"
+            )
+        }
+    }
+
+    private static func endReason(for task: TGTask?, at date: Date) -> String {
+        guard let task else { return "missingTaskState" }
+        if task.timerStartedAt != nil { return "manualTimerStateChanged" }
+        if let autoStart = task.autoTrackSessionStartedAt,
+           task.autoTrackStoppedAt.map({ $0 >= autoStart }) == true {
+            return "explicitAutoTrackStop"
+        }
+        if let leaseUntil = autoTrackLiveActivityUntil(for: task), leaseUntil <= date {
+            return "autoTrack90SecondLeaseExpired"
+        }
+        return "taskNoLongerRunning"
     }
 
     private func cancelPendingEnd(forActivityID activityID: String) {
@@ -264,7 +376,7 @@ final class LiveActivityManager {
         DiagnosticsLog.log("liveActivity", "Cancelled deferred end id=\(activityID); task is running")
     }
 
-    private func start(for task: TGTask, startedAt: Date) {
+    private func start(for task: TGTask, startedAt: Date, cycleKey: String) {
         guard let taskID = task.id else { return }
         let requestStartedAt = Date()
         let attributes = TimeGrowLiveActivityAttributes(taskID: taskID, taskName: task.name, colorHex: task.colorHex)
@@ -283,10 +395,11 @@ final class LiveActivityManager {
                 pushType: .token
             )
             observedActivityIDs.insert(activity.id)
-            observePushToken(of: activity, taskID: taskID)
+            cycleKeyByActivityID[activity.id] = cycleKey
+            observePushToken(of: activity, taskID: taskID, cycleKey: cycleKey)
             DiagnosticsLog.log(
                 "liveActivity",
-                "Started Live Activity for \(task.name) id=\(activity.id) state=\(activity.activityState) requestMs=\(Int(Date().timeIntervalSince(requestStartedAt) * 1_000))"
+                "Started Live Activity for \(task.name) id=\(activity.id) cycle=\(cycleKey) state=\(activity.activityState) requestMs=\(Int(Date().timeIntervalSince(requestStartedAt) * 1_000))"
             )
         } catch {
             DiagnosticsLog.log("liveActivity", "Failed to start Live Activity for \(task.name) requestMs=\(Int(Date().timeIntervalSince(requestStartedAt) * 1_000)): \(error.localizedDescription)")
@@ -296,7 +409,11 @@ final class LiveActivityManager {
 
     /// Streams this activity's per-activity push token to `pushTokenHandler` as ActivityKit
     /// (re)issues it, so a server can push `end` events via APNs.
-    private func observePushToken(of activity: Activity<TimeGrowLiveActivityAttributes>, taskID: String) {
+    private func observePushToken(
+        of activity: Activity<TimeGrowLiveActivityAttributes>,
+        taskID: String,
+        cycleKey: String?
+    ) {
         Task { [weak self] in
             // `activityUpdates` can hand us an activity after ActivityKit already issued its
             // token. Read the current value before waiting for a later rotation so we never
@@ -314,7 +431,7 @@ final class LiveActivityManager {
                 DiagnosticsLog.log("liveActivity", "Received per-activity push token task=\(taskID)")
             }
         }
-        observeActivityState(of: activity, taskID: taskID)
+        observeActivityState(of: activity, taskID: taskID, cycleKey: cycleKey)
     }
 
     /// Push-to-start gives iOS a short background runtime specifically to hand us this token.
@@ -365,19 +482,77 @@ final class LiveActivityManager {
     /// quiet or drops to its minimal presentation while the lock screen entry — driven by the
     /// same activity, just rendered differently — keeps counting: the state transition shows up
     /// here even though nothing on screen says why.
-    private func observeActivityState(of activity: Activity<TimeGrowLiveActivityAttributes>, taskID: String) {
-        Task {
+    private func observeActivityState(
+        of activity: Activity<TimeGrowLiveActivityAttributes>,
+        taskID: String,
+        cycleKey: String?
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let initialState = activity.activityState
             DiagnosticsLog.log(
                 "liveActivity",
-                "Activity state task=\(taskID) id=\(activity.id) state=\(activity.activityState)"
+                "Activity state task=\(taskID) id=\(activity.id) cycle=\(cycleKey ?? "pending") state=\(initialState)"
             )
+            if initialState == .dismissed {
+                recordDismissal(taskID: taskID, activityID: activity.id, cycleKey: cycleKey)
+            }
             for await state in activity.activityStateUpdates {
                 DiagnosticsLog.log(
                     "liveActivity",
-                    "Activity state changed task=\(taskID) id=\(activity.id) state=\(state)"
+                    "Activity state changed task=\(taskID) id=\(activity.id) cycle=\(cycleKey ?? "pending") state=\(state)"
+                )
+                if state == .dismissed {
+                    recordDismissal(taskID: taskID, activityID: activity.id, cycleKey: cycleKey)
+                }
+            }
+        }
+    }
+
+    private func recordDismissal(taskID: String, activityID: String, cycleKey: String?) {
+        guard let resolvedCycleKey = cycleKeyByActivityID[activityID] ?? cycleKey else {
+            pendingDismissedTaskIDs[taskID] = Date()
+            DiagnosticsLog.log(
+                "liveActivity",
+                "Deferred dismissed-cycle binding task=\(taskID) id=\(activityID) reason=taskStateNotLoaded"
+            )
+            return
+        }
+
+        cycleKeyByActivityID.removeValue(forKey: activityID)
+        guard dismissedCycleKeys.insert(resolvedCycleKey).inserted else { return }
+        if dismissedCycleKeys.count > 200 {
+            dismissedCycleKeys = [resolvedCycleKey]
+        }
+        persistDismissedCycleKeys()
+        DiagnosticsLog.log(
+            "liveActivity",
+            "Recorded system-dismissed Live Activity task=\(taskID) id=\(activityID) cycle=\(resolvedCycleKey); repeated starts suppressed until a new cycle or device reboot"
+        )
+    }
+
+    private func resolvePendingDismissals(using runningCyclesByTaskID: [String: RunningActivityCycle]) {
+        let now = Date()
+        for taskID in Array(pendingDismissedTaskIDs.keys) {
+            guard let observedAt = pendingDismissedTaskIDs[taskID] else { continue }
+            if let cycle = runningCyclesByTaskID[taskID] {
+                pendingDismissedTaskIDs.removeValue(forKey: taskID)
+                recordDismissal(taskID: taskID, activityID: "remote-pending", cycleKey: cycle.key)
+            } else if now.timeIntervalSince(observedAt) > remoteStartReconciliationGrace * 2 {
+                pendingDismissedTaskIDs.removeValue(forKey: taskID)
+                DiagnosticsLog.log(
+                    "liveActivity",
+                    "Discarded unresolved dismissed-cycle binding task=\(taskID) after waiting for task state"
                 )
             }
         }
+    }
+
+    private func persistDismissedCycleKeys() {
+        guard let shared = UserDefaults(suiteName: appGroupID) else { return }
+        shared.set(Array(dismissedCycleKeys).sorted(), forKey: dismissedCycleKeysKey)
+        let currentBootTime = Date().timeIntervalSince1970 - ProcessInfo.processInfo.systemUptime
+        shared.set(currentBootTime, forKey: dismissedCycleBootTimeKey)
     }
 
     /// Starts or stops the periodic re-check based on whether any activity is running.
@@ -445,16 +620,48 @@ final class LiveActivityManager {
         Date(timeIntervalSince1970: floor(date.timeIntervalSince1970 / 60) * 60)
     }
 
+    /// Stable identity for exactly one visible timer window. Firestore can publish the same task
+    /// many times while only transport fields or heartbeats change; those snapshots must not
+    /// become separate ActivityKit start attempts after the system has dismissed the activity.
+    private static func activityCycleKey(for task: TGTask) -> String? {
+        guard let taskID = task.id else { return nil }
+
+        if let manualStart = task.timerStartedAt {
+            let sessionKey = task.activeSessionID
+                ?? String(Int(manualStart.timeIntervalSince1970 * 1_000))
+            return "\(taskID)|manual|\(sessionKey)"
+        }
+
+        guard let autoStart = task.autoTrackSessionStartedAt else { return nil }
+        let sessionKey = task.autoTrackActiveSessionID
+            ?? String(Int(autoStart.timeIntervalSince1970 * 1_000))
+        let cycleKey = task.autoTrackLiveActivityCycleID
+            ?? autoTrackLiveActivityUntil(for: task).map {
+                String(Int($0.timeIntervalSince1970 * 1_000))
+            }
+            ?? sessionKey
+        return "\(taskID)|auto|\(sessionKey)|\(cycleKey)"
+    }
+
     private static func activeTimerStart(for task: TGTask) -> Date? {
         if let manualStart = task.timerStartedAt {
             return manualStart
         }
         if let autoStart = task.autoTrackSessionStartedAt,
-           let liveUntil = task.autoTrackLiveUntil,
-           liveUntil > Date(),
+           let activityUntil = autoTrackLiveActivityUntil(for: task),
+           activityUntil > Date(),
            !(task.autoTrackStoppedAt.map { $0 >= autoStart } ?? false) {
             return autoStart
         }
         return nil
+    }
+
+    /// Compatibility fallback for task documents written before the dedicated 90-second lease
+    /// existed. `autoTrackLastUsageAt` lets an upgraded client apply the new lifetime immediately
+    /// without waiting for the next Screen Time callback.
+    private static func autoTrackLiveActivityUntil(for task: TGTask) -> Date? {
+        task.autoTrackLiveActivityUntil
+            ?? task.autoTrackLastUsageAt?.addingTimeInterval(autoTrackingLiveActivityGraceSeconds)
+            ?? task.autoTrackLiveUntil
     }
 }

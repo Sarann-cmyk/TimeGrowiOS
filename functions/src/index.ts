@@ -51,6 +51,10 @@ interface TaskDoc {
   autoTrackSessionStartedAt?: Timestamp;
   autoTrackLastUsageAt?: Timestamp;
   autoTrackLiveUntil?: Timestamp;
+  /** ActivityKit-only lease; session merging continues until `autoTrackLiveUntil`. */
+  autoTrackLiveActivityUntil?: Timestamp;
+  /** Stable identity for one visible ActivityKit window inside a longer auto-track session. */
+  autoTrackLiveActivityCycleID?: string;
   autoTrackStoppedAt?: Timestamp;
   autoTrackActiveSessionID?: string;
   /** Last DeviceActivity callback identity; transport metadata for packed-step credit only. */
@@ -89,17 +93,28 @@ interface DeviceDoc {
   autoTrackingSecretHash?: string;
 }
 
+function autoTrackLiveActivityUntil(task: TaskDoc): Date | null {
+  if (task.autoTrackLiveActivityUntil) {
+    return task.autoTrackLiveActivityUntil.toDate();
+  }
+  // Compatibility for documents written before the dedicated ActivityKit lease existed.
+  if (task.autoTrackLastUsageAt) {
+    return new Date(task.autoTrackLastUsageAt.toDate().getTime() + AUTO_TRACK_LIVE_ACTIVITY_GRACE_MS);
+  }
+  return task.autoTrackLiveUntil?.toDate() ?? null;
+}
+
 /** Mirrors `LiveActivityManager.activeTimerStart(for:)` on the iOS side. */
 function activeTimerStart(task: TaskDoc, now: Date): Date | null {
   if (task.timerStartedAt) {
     return task.timerStartedAt.toDate();
   }
-  if (task.autoTrackSessionStartedAt && task.autoTrackLiveUntil) {
+  if (task.autoTrackSessionStartedAt) {
     const startedAt = task.autoTrackSessionStartedAt.toDate();
-    const liveUntil = task.autoTrackLiveUntil.toDate();
+    const activityUntil = autoTrackLiveActivityUntil(task);
     const stoppedAt = task.autoTrackStoppedAt?.toDate();
     const wasStoppedAfterStart = stoppedAt ? stoppedAt >= startedAt : false;
-    if (liveUntil > now && !wasStoppedAfterStart) {
+    if (activityUntil && activityUntil > now && !wasStoppedAfterStart) {
       return startedAt;
     }
   }
@@ -107,16 +122,19 @@ function activeTimerStart(task: TaskDoc, now: Date): Date | null {
 }
 
 /**
- * A timestamp alone is not a stable identity for an auto-track live window: after a delayed
- * stale write makes the server briefly regard it as stopped, the extension can legitimately
- * resume with its original session-start timestamp. The active session document ID changes for
- * that new server-side window, which lets us request a fresh Live Activity exactly once.
+ * A session timestamp/ID is not a stable identity for a visible ActivityKit window anymore:
+ * the 90-second presentation can end and restart while the five-minute session remains the same.
+ * `autoTrackLiveActivityCycleID` gives each such visible window one idempotent start claim.
  */
 function liveActivityStartKey(task: TaskDoc, startedAt: Date): string {
   if (task.timerStartedAt) {
     return `manual:${task.activeSessionID ?? startedAt.getTime()}`;
   }
-  return `auto:${task.autoTrackActiveSessionID ?? startedAt.getTime()}`;
+  const sessionKey = task.autoTrackActiveSessionID ?? startedAt.getTime();
+  const cycleKey = task.autoTrackLiveActivityCycleID
+    ?? task.autoTrackLiveActivityUntil?.toMillis()
+    ?? sessionKey;
+  return `auto:${sessionKey}:${cycleKey}`;
 }
 
 /**
@@ -135,13 +153,12 @@ function contentState(startedAt: Date, now: Date = new Date()): Record<string, n
 }
 
 // Must match `autoTrackingInactivityGraceSeconds` (TimeGrow/AutoTracking/AutoTrackingStore.swift)
-// and `inactivityGraceSeconds` (AutoTrackingExtension/AutoTrackingExtension.swift) — same "still
-// one session" window, but on the server, for `autoTrackLiveUntil` (drives Dynamic Island
-// lifetime). Left at 180s after the client was raised to 300s on 2026-07-21 caused the server to
-// treat a session as ended up to two minutes before the client did, from delivery delays already
-// observed up to 299s — splitting sessions and killing the Live Activity mid-use even though the
-// client-side merge window would have kept tracking it as continuous.
+// and `inactivityGraceSeconds` (AutoTrackingExtension/AutoTrackingExtension.swift). This controls
+// only whether a threshold resumes the same recorded session; ActivityKit has a shorter lease.
 const AUTO_TRACK_LIVE_GRACE_MS = 300_000;
+// Must match `autoTrackingLiveActivityGraceSeconds` in AutoTrackingStore.swift. A late Screen
+// Time callback can therefore restart Dynamic Island while the five-minute session remains one.
+const AUTO_TRACK_LIVE_ACTIVITY_GRACE_MS = 90_000;
 /**
  * How long a raw threshold event survives in `autoTrackEvents` before `pruneAutoTrackEvents`
  * deletes it. This collection exists purely so a client that missed its local App Group queue
@@ -283,6 +300,17 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
         && (!previousStoppedAt || previousStoppedAt < previousAutoStart);
       const sessionStartedAt = canContinuePreviousSession ? previousAutoStart : requestedSessionStart;
       const liveUntil = new Date(Math.max(now.getTime(), occurredAt.getTime()) + AUTO_TRACK_LIVE_GRACE_MS);
+      // Presentation lifetime is anchored to the actual Screen Time callback, exactly like the
+      // iPhone's optimistic state. A delayed network request must not keep Dynamic Island alive
+      // for another 90 seconds from server receipt. The separate five-minute session merge lease
+      // above intentionally retains its existing receipt-time protection.
+      const liveActivityUntil = new Date(
+        occurredAt.getTime() + AUTO_TRACK_LIVE_ACTIVITY_GRACE_MS
+      );
+      const existingActivityCycleID = task.autoTrackLiveActivityCycleID
+        ?? task.autoTrackActiveSessionID
+        ?? String(previousAutoStart?.getTime() ?? requestedSessionStart.getTime());
+      const liveActivityCycleID = wasRunning ? existingActivityCycleID : eventID;
       const previousUsageAt = task.autoTrackLastUsageAt?.toDate();
       const packedDistinctStep = !!(
         canContinuePreviousSession
@@ -344,6 +372,8 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
       transaction.update(taskRef, {
         autoTrackLastUsageAt: admin.firestore.Timestamp.fromDate(occurredAt),
         autoTrackLiveUntil: admin.firestore.Timestamp.fromDate(liveUntil),
+        autoTrackLiveActivityUntil: admin.firestore.Timestamp.fromDate(liveActivityUntil),
+        autoTrackLiveActivityCycleID: liveActivityCycleID,
         autoTrackSessionStartedAt: admin.firestore.Timestamp.fromDate(sessionStartedAt),
         autoTrackActiveSessionID: sessionID,
         autoTrackStoppedAt: admin.firestore.FieldValue.delete(),
@@ -396,6 +426,9 @@ export const recordAutoTrackEvent = onRequest(async (request, response) => {
       eventAlreadyRecorded: result.eventAlreadyRecorded,
       packedDistinctStep: result.packedDistinctStep,
       creditedSessionStartedAt: admin.firestore.Timestamp.fromDate(result.creditedSessionStartedAt),
+      liveActivityUntil: admin.firestore.Timestamp.fromDate(
+        new Date(occurredAt.getTime() + AUTO_TRACK_LIVE_ACTIVITY_GRACE_MS)
+      ),
     });
     response.status(200).json({ ok: true, started: result.started });
   } catch (error) {
@@ -862,13 +895,11 @@ export const onDevicePushToStartTokenChanged = onDocumentWritten(
 );
 
 /**
- * Closes the one gap `onTaskTimerChanged` can't cover: an auto-track grace period
- * (`autoTrackLiveUntil`) elapsing purely by wall-clock time, with no new Firestore write to
- * trigger the update handler above — e.g. the tracking device stopped sending updates and every
- * device running TimeGrow is backgrounded/closed. Sweeps every task with a live push token every
- * few minutes and ends any that are no longer actually running. While a task is active, it also
- * sends the next 60-second progress window so the expanded Dynamic Island ring keeps sweeping
- * even when every app scene is closed.
+ * Closes the one gap `onTaskTimerChanged` can't cover: the 90-second ActivityKit lease
+ * (`autoTrackLiveActivityUntil`) elapsing purely by wall-clock time, with no Firestore write to
+ * trigger the update handler above. The separate five-minute `autoTrackLiveUntil` remains intact
+ * for session merging. While an Activity is visible, this also sends the next 60-second progress
+ * window so the expanded Dynamic Island ring keeps sweeping with every app scene closed.
  *
  * Requires a Firestore collection-group single-field index exemption for `tasks`/
  * `liveActivityPushToken` (ascending) — set via Firestore Console → Indexes → Automatic index
@@ -914,6 +945,9 @@ export const refreshLiveActivities = onSchedule(
                   token: tokenHint(token),
                   status: response.status,
                   apnsID: response.apnsID ?? null,
+                  autoTrackLiveActivityUntil: task.autoTrackLiveActivityUntil ?? null,
+                  autoTrackLiveUntil: task.autoTrackLiveUntil ?? null,
+                  cleanupObservedAt: admin.firestore.Timestamp.fromDate(now),
                 });
               }
             })
@@ -925,13 +959,24 @@ export const refreshLiveActivities = onSchedule(
                   source: "scheduledCleanup",
                   token: tokenHint(token),
                   reason: String(error?.message ?? error),
+                  autoTrackLiveActivityUntil: task.autoTrackLiveActivityUntil ?? null,
+                  autoTrackLiveUntil: task.autoTrackLiveUntil ?? null,
+                  cleanupObservedAt: admin.firestore.Timestamp.fromDate(now),
                 });
               }
             })
         ));
-        await doc.ref.update({
-          liveActivityPushToken: admin.firestore.FieldValue.delete(),
-          liveActivityPushTokens: admin.firestore.FieldValue.delete(),
+        // A fresh threshold can race this sweep after it read the expired task but before the
+        // old Activity's end push completes. Never erase the newly registered token/cycle in
+        // that case; clear transport state only if the latest document is still inactive.
+        await db.runTransaction(async (transaction) => {
+          const currentSnapshot = await transaction.get(doc.ref);
+          const currentTask = currentSnapshot.data() as TaskDoc | undefined;
+          if (!currentTask || activeTimerStart(currentTask, new Date())) return;
+          transaction.update(doc.ref, {
+            liveActivityPushToken: admin.firestore.FieldValue.delete(),
+            liveActivityPushTokens: admin.firestore.FieldValue.delete(),
+          });
         });
       })
     );
@@ -1006,6 +1051,7 @@ export const closeInterruptedMacAutoTimers = onSchedule(
             timerOwnerIsActive: admin.firestore.FieldValue.delete(),
             autoTrackStoppedAt: admin.firestore.Timestamp.fromDate(endedAt),
             autoTrackLiveUntil: admin.firestore.Timestamp.fromDate(endedAt),
+            autoTrackLiveActivityUntil: admin.firestore.Timestamp.fromDate(endedAt),
             updatedAt: admin.firestore.Timestamp.fromDate(now),
           });
           transaction.update(currentSessionRef, {

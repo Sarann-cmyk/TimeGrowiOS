@@ -22,6 +22,12 @@ struct TGTask: Identifiable, Codable, Equatable {
     var timerOwnerIsActive: Bool?
     var autoTrackLastUsageAt: Date?
     var autoTrackLiveUntil: Date?
+    /// Short ActivityKit-only lease. Auto-tracked sessions may still merge for the full
+    /// `autoTrackLiveUntil` window after this expires and Dynamic Island disappears.
+    var autoTrackLiveActivityUntil: Date?
+    /// Stable identity for one visible auto-track ActivityKit window. A return after the
+    /// 90-second lease creates a new identity even when it resumes the same five-minute session.
+    var autoTrackLiveActivityCycleID: String?
     var autoTrackActiveSessionID: String?
     var autoTrackSessionStartedAt: Date?
     /// Set when the user manually stops an in-progress auto-tracked session. Any auto-tracked

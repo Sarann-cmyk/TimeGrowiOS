@@ -522,6 +522,12 @@ When processing:
   - persistent log in App Group container.
   - trims around `400_000` characters.
   - combines app log and extension debug events on export.
+- `CalendarSyncManager`
+  - one-way mirror of sessions into Apple Calendar;
+  - `observeSessions` coalesces Firestore snapshots for 300ms;
+  - skips unchanged `EKEvent` values and stages changed events with `commit: false`, followed by
+    one `EKEventStore.commit()` per batch. Do not restore per-session `commit: true` on the main
+    actor: it caused 3–5 second launch/tab stalls with Calendar sync enabled.
 - `SyncConfiguration`
   - contains `syncCode`.
   - No current references outside `SyncConfiguration.swift`; treat as legacy/placeholder unless new code proves otherwise.

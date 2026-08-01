@@ -11,6 +11,7 @@ struct TaskFormView: View {
     @State private var customColors: [Color]
     @State private var selectedColorIndex: Int
     @State private var isShowingCustomColorPicker = false
+    @FocusState private var isTaskNameFocused: Bool
 
     let navigationTitle: LocalizedStringKey
     let confirmTitle: LocalizedStringKey
@@ -67,6 +68,7 @@ struct TaskFormView: View {
                 TextField("Task name", text: $taskName)
                     .font(.system(size: 18, weight: .medium))
                     .textInputAutocapitalization(.sentences)
+                    .focused($isTaskNameFocused)
                     .padding(.horizontal, 14)
                     .frame(height: 52)
                     .background(Color.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -120,12 +122,16 @@ struct TaskFormView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
+                        isTaskNameFocused = false
                         dismiss()
                     }
                 }
 
                 ToolbarItem(placement: .confirmationAction) {
                     Button(confirmTitle) {
+                        // Resign the sheet's keyboard before publishing the task. Publishing first
+                        // rebuilds ContentView while its safe-area transition is still in flight.
+                        isTaskNameFocused = false
                         onSave(taskName, selectedColor)
                         dismiss()
                     }
@@ -140,6 +146,9 @@ struct TaskFormView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .onDisappear {
+            isTaskNameFocused = false
+        }
     }
 
     private func colorSwatch(

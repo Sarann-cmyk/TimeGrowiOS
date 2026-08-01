@@ -30,6 +30,10 @@ final class CalendarSyncManager: ObservableObject {
     private var latestUserID: String?
     private var runningSessionTimer: Timer?
     private var isMigratingEventTitles = false
+    /// Firestore can emit a cache snapshot and a server snapshot back-to-back. Calendar writes
+    /// are synchronous, so coalesce that burst and let SwiftUI render the published sessions
+    /// before touching EventKit.
+    private var pendingObservedSyncTask: Task<Void, Never>?
 
     private init() {
         isEnabled = defaults.bool(forKey: enabledKey)
@@ -74,8 +78,8 @@ final class CalendarSyncManager: ObservableObject {
         latestSessions = sessions
         latestUserID = userID
         guard isEnabled, let userID else { return }
-        synchronize(sessions, userID: userID, removeMissingEvents: false)
         updateRunningSessionTimer()
+        scheduleObservedSync(userID: userID)
 
         // Update titles of older Timeline events too, not only the 30-day listener cache.
         // Version 1 used the "TimeGrow ·" prefix; version 2 contains only the task name.
@@ -89,8 +93,24 @@ final class CalendarSyncManager: ObservableObject {
         }
     }
 
+    private func scheduleObservedSync(userID: String) {
+        pendingObservedSyncTask?.cancel()
+        pendingObservedSyncTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled,
+                  let self,
+                  self.isEnabled,
+                  self.latestUserID == userID else { return }
+            self.synchronize(self.latestSessions, userID: userID, removeMissingEvents: false)
+            self.pendingObservedSyncTask = nil
+        }
+    }
+
     func synchronizeAll(using taskService: TaskService) async {
         guard isEnabled, let userID = taskService.currentUser?.uid else { return }
+        pendingObservedSyncTask?.cancel()
+        pendingObservedSyncTask = nil
         do {
             let sessions = try await taskService.fetchAllSessionsForCalendarSync()
             latestSessions = sessions
@@ -127,6 +147,9 @@ final class CalendarSyncManager: ObservableObject {
         guard isEnabled else { return }
         let userID = latestUserID
 
+        pendingObservedSyncTask?.cancel()
+        pendingObservedSyncTask = nil
+
         if let userID {
             removeAllEvents(for: userID)
         }
@@ -151,26 +174,44 @@ final class CalendarSyncManager: ObservableObject {
     }
 
     private func synchronize(_ sessions: [TaskTimeSession], userID: String, removeMissingEvents: Bool) {
+        let syncStartedAt = Date()
         guard let calendar = calendarForTimeGrowEvents() else { return }
         var eventIDs = eventIDs(for: userID)
         let sessionIDs = Set(sessions.compactMap(\.id))
+        let syncDate = Date()
+        var hasStagedEventStoreChanges = false
+        var hasEventIDChanges = false
+        var savedEventsBySessionID: [String: EKEvent] = [:]
 
         for session in sessions {
             guard let sessionID = session.id else { continue }
-            let event = eventIDs[sessionID].flatMap(eventStore.event(withIdentifier:)) ?? EKEvent(eventStore: eventStore)
+            let existingEvent = eventIDs[sessionID].flatMap(eventStore.event(withIdentifier:))
+            let event = existingEvent ?? EKEvent(eventStore: eventStore)
+            let desiredEndDate = max(session.endedAt ?? syncDate, session.startedAt.addingTimeInterval(1))
+            let desiredNotes = eventNotes(for: session)
+            let desiredURL = URL(string: "timegrow://calendar-session?sessionID=\(sessionID)")
+            let needsSave = existingEvent == nil
+                || event.calendar?.calendarIdentifier != calendar.calendarIdentifier
+                || event.title != session.taskName
+                || Self.datesDiffer(event.startDate, session.startedAt)
+                || Self.datesDiffer(event.endDate, desiredEndDate)
+                || event.isAllDay
+                || event.notes != desiredNotes
+                || event.url != desiredURL
+
+            guard needsSave else { continue }
             event.calendar = calendar
             event.title = session.taskName
             event.startDate = session.startedAt
-            event.endDate = max(session.endedAt ?? Date(), session.startedAt.addingTimeInterval(1))
+            event.endDate = desiredEndDate
             event.isAllDay = false
-            event.notes = eventNotes(for: session)
-            event.url = URL(string: "timegrow://calendar-session?sessionID=\(sessionID)")
+            event.notes = desiredNotes
+            event.url = desiredURL
 
             do {
-                try eventStore.save(event, span: .thisEvent, commit: true)
-                if let eventID = event.eventIdentifier {
-                    eventIDs[sessionID] = eventID
-                }
+                try eventStore.save(event, span: .thisEvent, commit: false)
+                hasStagedEventStoreChanges = true
+                savedEventsBySessionID[sessionID] = event
             } catch {
                 DiagnosticsLog.log("calendar", "Failed to save event for session \(sessionID): \(error.localizedDescription)")
             }
@@ -180,13 +221,58 @@ final class CalendarSyncManager: ObservableObject {
             let staleEvents = eventIDs.filter { !sessionIDs.contains($0.key) }
             for (sessionID, eventID) in staleEvents {
                 if let event = eventStore.event(withIdentifier: eventID) {
-                    try? eventStore.remove(event, span: .thisEvent, commit: true)
+                    do {
+                        try eventStore.remove(event, span: .thisEvent, commit: false)
+                        hasStagedEventStoreChanges = true
+                    } catch {
+                        DiagnosticsLog.log("calendar", "Failed to stage removal for session \(sessionID): \(error.localizedDescription)")
+                        continue
+                    }
                 }
                 eventIDs.removeValue(forKey: sessionID)
+                hasEventIDChanges = true
             }
         }
 
-        save(eventIDs: eventIDs, for: userID)
+        if hasStagedEventStoreChanges {
+            do {
+                // One database commit for the whole changed subset. The previous implementation
+                // committed once per session, which blocked the main thread for seconds.
+                try eventStore.commit()
+                for (sessionID, event) in savedEventsBySessionID {
+                    if let eventID = event.eventIdentifier, eventIDs[sessionID] != eventID {
+                        eventIDs[sessionID] = eventID
+                        hasEventIDChanges = true
+                    }
+                }
+            } catch {
+                DiagnosticsLog.log("calendar", "Failed to commit Calendar sync batch: \(error.localizedDescription)")
+                return
+            }
+        }
+
+        if hasEventIDChanges {
+            save(eventIDs: eventIDs, for: userID)
+        }
+
+        let elapsed = Date().timeIntervalSince(syncStartedAt)
+        if elapsed >= 0.1 || hasStagedEventStoreChanges {
+            DiagnosticsLog.log(
+                "performance",
+                String(
+                    format: "Calendar sync completed in %.3fs sessions=%d changed=%d removeMissing=%@",
+                    elapsed,
+                    sessions.count,
+                    savedEventsBySessionID.count,
+                    removeMissingEvents ? "true" : "false"
+                )
+            )
+        }
+    }
+
+    private static func datesDiffer(_ lhs: Date?, _ rhs: Date, tolerance: TimeInterval = 0.5) -> Bool {
+        guard let lhs else { return true }
+        return abs(lhs.timeIntervalSince(rhs)) > tolerance
     }
 
     private func calendarForTimeGrowEvents() -> EKCalendar? {

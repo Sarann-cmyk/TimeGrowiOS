@@ -126,19 +126,25 @@ struct TaskTile: View {
     }
 
     private func tileContent(status: TimerOwnerStatus, date: Date) -> some View {
-        let autoLiveSession = autoTrackLiveSession(at: date)
-        let isAutoLive = autoLiveSession != nil
-        let isVisuallyActive = task.isTimerRunning || isAutoLive
+        let autoPresentation = autoTrackPresentation(at: date)
+        let isVisuallyActive = task.isTimerRunning || autoPresentation != nil
+        let isAutoPaused = autoPresentation?.isPaused == true
         let isInterrupted = task.isTimerRunning && status.isInterrupted
-        let secondsStart = task.timerStartedAt ?? autoLiveSession?.startedAt
+        let secondsStart = task.timerStartedAt ?? autoPresentation?.session.startedAt
+        let elapsedDate = autoPresentation?.displayDate ?? date
+        let presentationDiagnosticsKey = AutoTrackPresentationDiagnostics.key(
+            task: task,
+            presentation: autoPresentation
+        )
         let hasAutoTrackingSelection = task.id.map { autoTrackingStore.hasSelection(for: $0) } ?? false
 
         return VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 TaskAvatarCircle(
                     color: task.color,
-                    isPulsing: isVisuallyActive && !isInterrupted,
-                    elapsedSeconds: isVisuallyActive ? TaskRow.elapsedSeconds(startedAt: secondsStart, at: date) : nil,
+                    isPulsing: isVisuallyActive && !isAutoPaused && !isInterrupted,
+                    elapsedSeconds: isVisuallyActive ? TaskRow.elapsedSeconds(startedAt: secondsStart, at: elapsedDate) : nil,
+                    isPaused: isAutoPaused,
                     size: 40
                 )
                 .offset(y: 6)
@@ -175,22 +181,21 @@ struct TaskTile: View {
                     .stroke(isInterrupted ? Color.orange.opacity(0.45) : task.color.opacity(0.3), lineWidth: 0.7)
             }
         }
+        .task(id: presentationDiagnosticsKey) {
+            AutoTrackPresentationDiagnostics.report(
+                task: task,
+                presentation: autoPresentation,
+                surface: "taskTile",
+                at: date
+            )
+        }
     }
 
     private func isAutoTrackLive(at date: Date) -> Bool {
-        autoTrackLiveSession(at: date) != nil
+        autoTrackPresentation(at: date) != nil
     }
 
-    private func autoTrackLiveSession(at date: Date) -> TaskTimeSession? {
-        sessions
-            .filter { session in
-                guard session.startedAutomatically == true,
-                      let endedAt = session.endedAt else { return false }
-                if let stoppedAt = task.autoTrackStoppedAt, endedAt <= stoppedAt { return false }
-                return date.timeIntervalSince(endedAt) <= autoTrackingInactivityGraceSeconds
-            }
-            .max { first, second in
-                (first.endedAt ?? first.startedAt) < (second.endedAt ?? second.startedAt)
-            }
+    private func autoTrackPresentation(at date: Date) -> AutoTrackPresentationState? {
+        AutoTrackPresentationState.resolve(task: task, sessions: sessions, at: date)
     }
 }

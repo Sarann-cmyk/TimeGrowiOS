@@ -83,11 +83,18 @@ thresholdStep`. Повтор саме цієї четвірки в один де
 залишатися узгодженим у extension, App Group queue, `autoTrackEvents` і Cloud Function.
 
 Для пакетної доставки точний історичний момент кожної хвилини невідомий. TimeGrow консервативно
-зберігає стільки 60-секундних кредитів, скільки distinct steps підтверджено. Їхній технічний
-інтервал розміщується перед доставкою пачки лише для сумісності моделі сесій, але позначається
-`hasEstimatedTiming = true`. Такий технічний стан видно в diagnostics, але не відображається в
-Timeline як точне твердження, що застосунок був відкритий у ці години. Reports враховують увесь
-підтверджений час. Повне обґрунтування й діагностика — у `AUTO_TRACKING_RELIABILITY.md`.
+зберігає стільки 60-секундних кредитів, скільки distinct steps підтверджено, і розміщує їхній
+технічний інтервал перед доставкою пачки, позначаючи сесію `hasEstimatedTiming = true`.
+
+**2026-07-31, скасовано:** короткий час це поле також ховало сесію з Timeline (`TimelineTabView.daySessions`,
+`guard !session.isTimingEstimated else { return false }`) — залишаючи її лише в Reports-підсумках.
+Це давало розбіжність "у Stats є, на Timeline немає" (реальний кейс: TikTok, 9 хв, 20:23–20:32,
+розбір у `MANUAL_TRACKING.md`) і суперечило Mac-версії, де такий самий кредит завжди малюється як
+блок. За рішенням користувача цей фільтр прибрано — **якщо час зарахований у Stats, він завжди
+малюється й на Timeline**, незалежно від `hasEstimatedTiming`. Поле саме лишається на моделі й
+далі пишеться (діагностичний слід і майбутній перемикач "ховати короткі сесії" в налаштуваннях
+можуть на нього спиратись), просто більше нічого не фільтрує за ним. Повне обґрунтування й
+діагностика самого механізму пакетного кредитування — у `AUTO_TRACKING_RELIABILITY.md`.
 
 ## Три шляхи, куди йде кожна подія
 
@@ -163,20 +170,26 @@ autoTrackingAppGroupID)`). До 2026-07-24 це було основне джер
   `AUTO_TRACK_EVENT_RETENTION_MS = 14 днів` — колекція існує тільки для відновлення нещодавно
   пропущеного, не як вічний дублікат історії сесій.
 
-## "Сесія" (`TaskTimeSession`) і "live"-стан (`autoTrackLiveUntil`) — це РІЗНІ речі
+## Сесія, п'ятихвилинний стан і 90-секундна Live Activity — це РІЗНІ речі
 
 Легко переплутати, бо обидва звучать як "чи це ще той самий безперервний трекінг":
 
 - **Сесія** — Firestore-документ, який малюється як блок у Reports/Timeline. Рішення про
   склеювання/розрив рахується **тільки на клієнті**, в `TaskService.swift` (шлях 2 вище).
-- **Live-стан** (чи горить Dynamic Island, чи `LiveActivityManager.activeTimerStart` вважає
-  задачу запущеною) — читається з `autoTrackLiveUntil` на задачі. Це поле **пишеться і сервером
-  (Cloud Function), і клієнтом**, і сервер зазвичай встигає першим (він пише синхронно в
-  момент кожної події, клієнт — лише коли застосунок відкриють).
+- **П'ятихвилинний стан сесії** читається з `autoTrackLiveUntil`: повернення до застосунку в цей
+  проміжок продовжує той самий `TaskTimeSession`.
+- **Видимість Dynamic Island** читається окремо з `autoTrackLiveActivityUntil`. Кожен свіжий
+  threshold продовжує її на 90 секунд; `autoTrackLiveActivityCycleID` дозволяє після згасання
+  запустити нову Activity, не розриваючи п'ятихвилинну сесію. І клієнт, і сервер рахують цей
+  дедлайн від `occurredAt`; серверний щохвилинний cleanup може фактично надіслати `end` через
+  90–150 секунд.
+- **Стан UI основного застосунку** визначає `AutoTrackPresentationState`: поки 90-секундний
+  дедлайн не минув, кільце й elapsed продовжуються; після нього elapsed завмирає і кільце блимає
+  до кінця п'ятихвилинного вікна. Це лише presentation state — він не записує Firestore і не
+  змінює правила склеювання сесій.
 
-Це означає: клієнтський grace-період впливає на те, чи склеяться сесії в Reports. Але на те, чи
-живе Dynamic Island прямо зараз, найбільше впливає **серверна** константа
-`AUTO_TRACK_LIVE_GRACE_MS` — з 2026-07-23 синхронізована з клієнтською (обидві 300с).
+Обидва дедлайни пишуться сервером і клієнтом. Сервер зазвичай встигає першим, бо обробляє
+threshold одразу, навіть коли основний застосунок закритий.
 
 ## Ключові константи (і де кожна продубльована)
 
@@ -184,7 +197,8 @@ autoTrackingAppGroupID)`). До 2026-07-24 це було основне джер
 |---|---|---|---|
 | `autoTrackingThresholdSeconds` | 60с | `AutoTrackingStore.swift:14`, `AutoTrackingExtension.swift` (`thresholdSeconds`) | Розмір одного порогу DeviceActivity; кожна прийнята подія = рівно +60с у вікні, незалежно від того, скільки реального часу пройшло до її отримання. |
 | `autoTrackingInactivityGraceSeconds` | **300с (5хв)**, піднято 2026-07-21 з 180с | `AutoTrackingStore.swift:15-22` (глобальна, `let`, доступна всьому app target), продубльована як `inactivityGraceSeconds` в `AutoTrackingExtension.swift:22-25` (окремий target — не може імпортувати з app target) | "Це ще та сама сесія?" — і для склеювання `TaskTimeSession`, і для того, чи резюмувати `sessionStartedAt` в розширенні. **Обидва місця треба міняти разом.** |
-| `AUTO_TRACK_LIVE_GRACE_MS` | **300 000мс (5хв)**, піднято 2026-07-23 з 180 000мс | `functions/src/index.ts` | Те саме поняття "ще жива", але на сервері, для `autoTrackLiveUntil`, який реально визначає, коли гасне Dynamic Island. Тепер синхронізована з клієнтським `autoTrackingInactivityGraceSeconds`. |
+| `AUTO_TRACK_LIVE_GRACE_MS` | **300 000мс (5хв)** | `functions/src/index.ts` | Серверний еквівалент вікна склеювання сесії; пише `autoTrackLiveUntil`, але більше не визначає тривалість Dynamic Island. |
+| `autoTrackingLiveActivityGraceSeconds` / `AUTO_TRACK_LIVE_ACTIVITY_GRACE_MS` | **90с / 90 000мс** | `AutoTrackingStore.swift`, `functions/src/index.ts` | Окремий строк видимості Dynamic Island після останнього доставленого threshold. Не змінює п'ятихвилинне склеювання сесії. |
 | `autoTrackingBatchedThresholdWindowSeconds` | 10с | `AutoTrackingStore.swift` | Максимальна відстань delivery timestamps, за якої distinct steps однієї generation розглядаються як пакет і отримують консервативне розміщення перед його доставкою. Не використовується для дедуплікації current-format подій. |
 | `thresholdDelayWarningSeconds` | 90с | `AutoTrackingExtension.swift:28` | Поріг для діагностичного логування "ця подія прийшла підозріло пізно" (див. нижче). |
 | `minimumTrackedSessionDuration` | 3с | `AutoTrackingStore.swift:18` | Сесії коротші за це видаляються повністю при зупинці — випадкові дотики, не реальний трекінг. |
@@ -213,8 +227,8 @@ best-effort, без SLA і без опублікованої верхньої м
 але ті — законні нічні/денні паузи, не збої доставки.
 
 Висновок: цю затримку не можна усунути в нашому коді — Apple навмисно не дає важіль форсувати
-часті пробудження розширення. Єдине, що можна зробити — розширити grace-вікно (див. константи
-вище), щоб типові затримки в кілька хвилин не розривали видиму поведінку (сесію, Dynamic Island).
+часті пробудження розширення. П'ятихвилинне вікно й надалі захищає сесію від розриву. Натомість
+90-секундна Live Activity тепер свідомо може згаснути й повторно з'явитися під час такої затримки.
 
 ## Діагностика — де саме дивитись у diagnostics-лозі
 
@@ -230,9 +244,14 @@ best-effort, без SLA і без опублікованої верхньої м
 - `[autoTrack] starting new session for X instead of extending previous (ended ...): gap=Ns
   exceeds merge window=Ms` — момент і причина розриву сесії. (`TaskService.swift`,
   `recordAutoTrackedSession`)
-- `[liveActivity] Ending Live Activity task=... after reconciliation grace autoTrackLiveUntil=...
+- `[liveActivity] Ending Live Activity task=... after reconciliation grace autoTrackLiveActivityUntil=...
   autoTrackStoppedAt=... autoTrackSessionStartedAt=...` — повний стан задачі в момент, коли
   Dynamic Island гаситься. (`LiveActivityManager.swift`, `scheduleEndAfterReconciliationGrace`)
+- `[liveActivity] 90-second lease audit ... activityPresent=... expectedUIPhase=pausedBlinking` /
+  `Live Activity end verification ... systemRemoved=...` — відповідно audit системного стану
+  ActivityKit і перевірка після локального immediate end.
+- `[autoTrackUI] paused blinking started ...` / `paused blinking ended ...` — одноразові переходи
+  кільця Tasks/Timeline в паузу та назад; кадри самої анімації навмисно не логуються.
 - `[autoTrack] adopted live DeviceActivity monitor for task X activity=...` /
   `stopped N orphaned DeviceActivity monitor(s) at launch: ...` — що сталось із моніторингом при
   відкритті застосунку (див. наступний розділ). (`AutoTrackingStore.swift`,
@@ -254,6 +273,11 @@ best-effort, без SLA і без опублікованої верхньої м
 чи `DeviceActivityCenter().activities` все ще містить монітор, записаний розширенням у спільні
 `UserDefaults` (`monitoredActivityKeyPrefix`) для цієї задачі з відповідним selection'ом — якщо
 так, просто "усиновлює" його замість перезапуску. Зупиняються лише дійсно осиротілі активності.
+
+Додатково з 2026-08-01 `refreshMonitoring(for:)` порівнює лише поля, що реально впливають на
+DeviceActivity (`taskID`, `isTimerRunning`). Повторні `onAppear`/`scenePhase`/Firestore snapshots
+з тим самим станом більше не запускають синхронний Screen Time IPC на main actor. Прохід довший
+за 100мс записується як `[performance] Screen Time monitoring refresh blocked main actor...`.
 
 ## Файли, що стосуються автотрекінгу
 

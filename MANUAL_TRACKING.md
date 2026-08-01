@@ -152,8 +152,8 @@ Mac за секунди) виграє лише один запис у Firestore 
 Причина: `applyOptimisticTimerStop` до фіксу мутувало `sessions[sessionIndex].endedAt = endedAt`
 **синхронно**, на тому самому виклику, що й флаг `task.isTimerRunning`. Ця мутація `@Published
 sessions` синхронно перебудовує `sessionsByTaskID` (`TaskService.swift:61-65`) і викликає
-`CalendarSyncManager.shared.observeSessions(...)` — а той, якщо в користувача увімкнена
-синхронізація з Apple Calendar, проходить по **всьому** 30-денному кешу сесій і робить окремий
+`CalendarSyncManager.shared.observeSessions(...)` — а той на той момент, якщо в користувача була
+увімкнена синхронізація з Apple Calendar, проходив по **всьому** 30-денному кешу і робив окремий
 `eventStore.save(event, ..., commit: true)` (синхронний EventKit-запис) для кожної
 (`CalendarSyncManager.swift:153-190`). `task.isTimerRunning` логічно вже `false` в цей момент, але
 SwiftUI фізично не може перемалювати екран, поки головний потік зайнятий цією роботою — тому
@@ -170,6 +170,19 @@ milliseconds", тож він має відбутись **після** того, 
 патерн, що й у старту. Firestore-записи для сесії лишились синхронними/fire-and-forget у самому
 `stopTimer` (`TaskService.swift:1442-`) — вони й раніше не блокували, блокувала саме локальна
 мутація масиву.
+
+### Виправлений баг (2026-08-01): Calendar sync блокував запуск і переходи між вкладками
+
+Навіть після defer мутації `sessions` Firestore snapshot на запуску все одно передавав весь
+30-денний кеш у `CalendarSyncManager`, а старий `synchronize` безумовно робив окремий
+`eventStore.save(..., commit: true)` для кожної сесії на main actor. З увімкненою синхронізацією
+це давало видимі зависання приблизно на 3–5с при відкритті застосунку або коли snapshot приходив
+під час переходу між вкладками.
+
+Тепер `observeSessions` coalesce-ить cache/server snapshots на 300мс і дає SwiftUI відмалювати
+кадр. `synchronize` порівнює існуючу подію з бажаним станом, пропускає незмінені записи, stage-ить
+лише реальні зміни з `commit: false`, а потім виконує один `eventStore.commit()` на весь batch.
+Diagnostics пише `[performance] Calendar sync completed in ...` для повільних/непорожніх batch-ів.
 
 ### Виправлений баг (2026-07-31): Stop міг зупиняти сесію, якої ще не існувало на сервері — вона лишалась "вічно запущеною"
 
@@ -324,9 +337,9 @@ Time-стеження й моніторинг усе ще накопичує в�
   returned task=X` для того самого `taskID` — обидва логуються в одному синхронному tap-виклику,
   тож будь-яка різниця більша за одноцифрові мс означає, що щось на цьому виклику блокує головний
   потік (до фіксу 2026-07-31 це послідовно було 1-2.2с). Якщо ця пауза колись повернеться —
-  перевір, чи `CalendarSyncManager.isEnabled` (Settings → синхронізація з Apple Calendar): якщо
-  так, `[calendar] Failed to save event for session ...` (помилки логуються; успішні
-  `eventStore.save` — ні) і сам факт увімкненості вже пояснює вартість.
+  перевір `CalendarSyncManager.isEnabled` і рядок `[performance] Calendar sync completed in ...`.
+  Після фіксу 2026-08-01 сам факт увімкненості вже не має означати багатосекундну паузу: важливий
+  виміряний час batch-а та кількість `changed`.
 - `[hang] Main thread unresponsive for X.XXs` (`HangDetector.swift`) — мав би зловити подібне
   зависання головного потоку, **але вимикається, якщо підключений дебагер**
   (`isDebuggerAttached()`), тож відсутність `[hang]`-рядків у логу, знятому під час розробки з
@@ -340,10 +353,9 @@ Time-стеження й моніторинг усе ще накопичує в�
   старту, `timerOwnerStatus`, `reconcileOrphanedManualSessions` (safety-сітка проти "вічно
   запущених" сесій).
 - `TimeGrow/Store/CalendarSyncManager.swift` — не про ручний таймер напряму, але
-  `observeSessions`/`synchronize` викликаються синхронно з `sessions`'s `didSet` і, з увімкненою
-  синхронізацією, є найдорожчою операцією на цьому шляху (per-сесія `EKEventStore.save(...,
-  commit: true)` по всьому 30-денному кешу) — саме це стояло за багом з розділу "Виправлений баг"
-  вище.
+  отримує оновлення з `sessions`'s `didSet`. З 2026-08-01 робота coalesced на 300мс,
+  інкрементальна й комітиться одним EventKit batch; не повертай per-сесію `commit: true` або
+  безумовний перезапис усього 30-денного кешу.
 - `TimeGrow/Views/ContentView.swift` — `toggleTimer(_:)`, пряме з'єднання тапу з
   `TaskService`.
 - `TimeGrow/Views/TaskRowView.swift` / `TaskTileView.swift` — рендер рядка/тайла, `isTimerRunning
@@ -363,6 +375,10 @@ Time-стеження й моніторинг усе ще накопичує в�
   Якщо після цього фіксу пауза на Stop повернеться — підозра № 1 та сама:
   `CalendarSyncManager`, якщо хтось додасть ще один синхронний виклик на шляху `sessions`'s
   `didSet`, або якщо `scheduleOptimisticSessionEnd`-деферал випадково приберуть.
+- **Виправлено (2026-08-01):** `CalendarSyncManager` безумовно перезаписував увесь 30-денний кеш
+  окремими `commit: true` і блокував main thread на запуску/під час snapshot. Тепер це coalesced
+  incremental batch. Якщо пауза повернеться, дивись `[performance] Calendar sync...`,
+  `[performance] Screen Time monitoring refresh...` і `[hang] Main thread unresponsive...`.
 - **Виправлено (2026-07-31):** `stopTimer` міг слати `updateData(["endedAt": ...])` на сесію,
   чию транзакцію старту сервер ще не закомітив — запис мовчки провалювався, і сесія лишалась
   "запущеною" назавжди (розділ "Stop міг зупиняти сесію, якої ще не існувало" вище). Якщо

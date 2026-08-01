@@ -33,9 +33,9 @@ enum AppTab: String, CaseIterable, Identifiable {
         case .timeline:
             "list.bullet"
         case .reports:
-            "chart.bar.fill"
+            "chart.bar.xaxis"
         case .settings:
-            "gearshape.fill"
+            "gear"
         }
     }
 }

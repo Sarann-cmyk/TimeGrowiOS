@@ -195,7 +195,12 @@ struct ReportsView: View {
     }
 
     private func content(at date: Date) -> some View {
-        let reportSessions = displaySessions.filter { sessionListDuration($0, at: date) >= TimeInterval(sessionListMinimumDuration) }
+        // Scope the 30-day listener cache once before feeding the report aggregations. Previously
+        // every chart/group helper repeatedly scanned and sorted sessions outside this report.
+        let reportSessions = displaySessions.filter {
+            overlapSeconds($0, start: range.start, end: range.end, now: date) > 0
+                && sessionListDuration($0, at: date) >= TimeInterval(sessionListMinimumDuration)
+        }
         let entries = taskEntries(reportSessions, at: date)
         let columns = chartColumns(reportSessions, at: date)
         let scale = ReportChartScale.automatic(for: columns)
@@ -769,6 +774,12 @@ struct ReportsView: View {
 
     private func load() async {
         let requestedRangeKey = rangeKey
+        // Current ranges are already kept live by TaskService's 30-day listener.
+        if canUseObservedSessionCache {
+            sessions = []
+            loadedRangeKey = requestedRangeKey
+            return
+        }
         do {
             let fetched = try await taskService.fetchSessions(from: range.start, to: range.end)
             guard requestedRangeKey == rangeKey else { return }

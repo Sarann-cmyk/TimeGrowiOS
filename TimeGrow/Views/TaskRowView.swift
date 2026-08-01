@@ -129,11 +129,16 @@ struct TaskRow: View {
     }
 
     private func rowContent(status: TimerOwnerStatus, date: Date) -> some View {
-        let autoLiveSession = autoTrackLiveSession(at: date)
-        let isAutoLive = autoLiveSession != nil
-        let isVisuallyActive = task.isTimerRunning || isAutoLive
+        let autoPresentation = autoTrackPresentation(at: date)
+        let isVisuallyActive = task.isTimerRunning || autoPresentation != nil
+        let isAutoPaused = autoPresentation?.isPaused == true
         let isInterrupted = task.isTimerRunning && status.isInterrupted
-        let secondsStart = task.timerStartedAt ?? autoLiveSession?.startedAt
+        let secondsStart = task.timerStartedAt ?? autoPresentation?.session.startedAt
+        let elapsedDate = autoPresentation?.displayDate ?? date
+        let presentationDiagnosticsKey = AutoTrackPresentationDiagnostics.key(
+            task: task,
+            presentation: autoPresentation
+        )
         let hasAutoTrackingSelection = task.id.map { autoTrackingStore.hasSelection(for: $0) } ?? false
 
         return HStack(spacing: 13) {
@@ -141,8 +146,9 @@ struct TaskRow: View {
 
             TaskAvatarCircle(
                 color: task.color,
-                isPulsing: isVisuallyActive && !isInterrupted,
-                elapsedSeconds: isVisuallyActive ? Self.elapsedSeconds(startedAt: secondsStart, at: date) : nil
+                isPulsing: isVisuallyActive && !isAutoPaused && !isInterrupted,
+                elapsedSeconds: isVisuallyActive ? Self.elapsedSeconds(startedAt: secondsStart, at: elapsedDate) : nil,
+                isPaused: isAutoPaused
             )
 
             Text(task.name)
@@ -172,23 +178,22 @@ struct TaskRow: View {
                     .stroke(isInterrupted ? Color.orange.opacity(0.45) : task.color.opacity(0.3), lineWidth: 0.7)
             }
         }
+        .task(id: presentationDiagnosticsKey) {
+            AutoTrackPresentationDiagnostics.report(
+                task: task,
+                presentation: autoPresentation,
+                surface: "taskRow",
+                at: date
+            )
+        }
     }
 
     private func isAutoTrackLive(at date: Date) -> Bool {
-        autoTrackLiveSession(at: date) != nil
+        autoTrackPresentation(at: date) != nil
     }
 
-    private func autoTrackLiveSession(at date: Date) -> TaskTimeSession? {
-        sessions
-            .filter { session in
-                guard session.startedAutomatically == true,
-                      let endedAt = session.endedAt else { return false }
-                if let stoppedAt = task.autoTrackStoppedAt, endedAt <= stoppedAt { return false }
-                return date.timeIntervalSince(endedAt) <= autoTrackingInactivityGraceSeconds
-            }
-            .max { first, second in
-                (first.endedAt ?? first.startedAt) < (second.endedAt ?? second.startedAt)
-            }
+    private func autoTrackPresentation(at date: Date) -> AutoTrackPresentationState? {
+        AutoTrackPresentationState.resolve(task: task, sessions: sessions, at: date)
     }
 
     static func elapsedSeconds(startedAt: Date?, at date: Date) -> Int {
@@ -238,6 +243,9 @@ struct TaskAvatarCircle: View {
     /// clockwise over each minute (resetting as seconds roll over) with a pause icon in the
     /// middle; otherwise it shows a plain outlined circle with a play icon.
     var elapsedSeconds: Int? = nil
+    /// Paused auto-tracking keeps its frozen progress visible and gently blinks until the
+    /// five-minute resume window closes or a new Screen Time threshold arrives.
+    var isPaused: Bool = false
     var size: CGFloat = 31
 
     private var iconFontSize: CGFloat { 12 * size / 31 }
@@ -245,7 +253,11 @@ struct TaskAvatarCircle: View {
     private var activeRingStrokeWidth: CGFloat { 3 * size / 31 }
 
     var body: some View {
-        if isPulsing {
+        if isPaused {
+            TimelineView(.animation(minimumInterval: 1.0 / 12.0, paused: false)) { context in
+                content.opacity(Self.pausedOpacity(at: context.date))
+            }
+        } else if isPulsing {
             TimelineView(.animation(minimumInterval: 1.0 / 12.0, paused: false)) { context in
                 let phase = context.date.timeIntervalSinceReferenceDate
                 let scale = 1.0 + 0.05 * (0.5 + 0.5 * sin(phase * (2 * .pi / 1.6)))
@@ -254,6 +266,11 @@ struct TaskAvatarCircle: View {
         } else {
             content
         }
+    }
+
+    static func pausedOpacity(at date: Date) -> Double {
+        let phase = date.timeIntervalSinceReferenceDate * (2 * Double.pi / 1.2)
+        return 0.38 + 0.62 * (0.5 + 0.5 * sin(phase))
     }
 
     @ViewBuilder
@@ -303,12 +320,13 @@ struct TaskDurationLabel: View {
         let dayStart = calendar.startOfDay(for: date)
         let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? date
         let runningEndDate = ownerStatus.interruptedAt ?? date
-        let liveAutoSessionID = autoTrackLiveSession(at: date)?.id
+        let autoPresentation = autoTrackPresentation(at: date)
+        let liveAutoSessionID = autoPresentation?.session.id
 
         let sessionSeconds = sessions.reduce(0) { total, session in
             let sessionEnd: Date
             if session.id == liveAutoSessionID {
-                sessionEnd = date
+                sessionEnd = autoPresentation?.displayDate ?? date
             } else {
                 sessionEnd = session.endedAt ?? runningEndDate
             }
@@ -334,23 +352,16 @@ struct TaskDurationLabel: View {
     }
 
     var body: some View {
+        let autoPresentation = autoTrackPresentation(at: date)
         durationView(
             seconds: totalSeconds(at: date),
-            isRunning: (task.isTimerRunning && !ownerStatus.isInterrupted) || autoTrackLiveSession(at: date) != nil
+            isRunning: (task.isTimerRunning && !ownerStatus.isInterrupted)
+                || autoPresentation?.isActive == true
         )
     }
 
-    private func autoTrackLiveSession(at date: Date) -> TaskTimeSession? {
-        sessions
-            .filter { session in
-                guard session.startedAutomatically == true,
-                      let endedAt = session.endedAt else { return false }
-                if let stoppedAt = task.autoTrackStoppedAt, endedAt <= stoppedAt { return false }
-                return date.timeIntervalSince(endedAt) <= autoTrackingInactivityGraceSeconds
-            }
-            .max { first, second in
-                (first.endedAt ?? first.startedAt) < (second.endedAt ?? second.startedAt)
-            }
+    private func autoTrackPresentation(at date: Date) -> AutoTrackPresentationState? {
+        AutoTrackPresentationState.resolve(task: task, sessions: sessions, at: date)
     }
 
     private func durationView(seconds: TimeInterval, isRunning: Bool) -> some View {

@@ -808,6 +808,11 @@ struct TaskReportDetailView: View {
     // MARK: - Data
 
     private func load() async {
+        if canUseObservedSessionCache {
+            sessions = []
+            isLoading = false
+            return
+        }
         isLoading = true
         defer { isLoading = false }
         do {

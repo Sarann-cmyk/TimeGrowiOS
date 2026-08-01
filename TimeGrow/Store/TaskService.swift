@@ -178,6 +178,8 @@ final class TaskService: NSObject, ObservableObject {
         let timerOwnerIsActive: Bool?
         let autoTrackLastUsageAt: Date?
         let autoTrackLiveUntil: Date?
+        let autoTrackLiveActivityUntil: Date?
+        let autoTrackLiveActivityCycleID: String?
         let autoTrackActiveSessionID: String?
         let autoTrackSessionStartedAt: Date?
         let autoTrackStoppedAt: Date?
@@ -213,8 +215,8 @@ final class TaskService: NSObject, ObservableObject {
             if let manualStartedAt = task.timerStartedAt {
                 startedAt = manualStartedAt
             } else if let autoStartedAt = task.autoTrackSessionStartedAt,
-                      let liveUntil = task.autoTrackLiveUntil,
-                      liveUntil > Date(),
+                      let activityUntil = autoTrackLiveActivityUntil(for: task),
+                      activityUntil > Date(),
                       !(task.autoTrackStoppedAt.map { $0 >= autoStartedAt } ?? false) {
                 startedAt = autoStartedAt
             } else {
@@ -247,12 +249,23 @@ final class TaskService: NSObject, ObservableObject {
                 timerOwnerIsActive: task.timerOwnerIsActive,
                 autoTrackLastUsageAt: task.autoTrackLastUsageAt,
                 autoTrackLiveUntil: task.autoTrackLiveUntil,
+                autoTrackLiveActivityUntil: task.autoTrackLiveActivityUntil,
+                autoTrackLiveActivityCycleID: task.autoTrackLiveActivityCycleID,
                 autoTrackActiveSessionID: task.autoTrackActiveSessionID,
                 autoTrackSessionStartedAt: task.autoTrackSessionStartedAt,
                 autoTrackStoppedAt: task.autoTrackStoppedAt,
                 sortOrder: task.sortOrder
             )
         }
+    }
+
+    /// Older task documents predate the dedicated ActivityKit lease. Derive its equivalent from
+    /// the last accepted threshold so upgrading does not leave an existing Island alive for the
+    /// former five-minute session grace.
+    private func autoTrackLiveActivityUntil(for task: TGTask) -> Date? {
+        task.autoTrackLiveActivityUntil
+            ?? task.autoTrackLastUsageAt?.addingTimeInterval(autoTrackingLiveActivityGraceSeconds)
+            ?? task.autoTrackLiveUntil
     }
 
     private func tasksCollection(for uid: String) -> CollectionReference {
@@ -341,7 +354,7 @@ final class TaskService: NSObject, ObservableObject {
         user.getIDTokenResult(forcingRefresh: false) { [weak self] result, error in
             guard let self else { return }
             if let error {
-                print("Failed to refresh auto-tracking Firebase token: \(error.localizedDescription)")
+                DiagnosticsLog.log("autoTrack", "Failed to refresh auto-tracking Firebase token: \(error.localizedDescription)")
                 return
             }
             guard let result,
@@ -350,7 +363,7 @@ final class TaskService: NSObject, ObservableObject {
             shared.set(result.token, forKey: self.autoTrackingAuthIDTokenKey)
             shared.set(result.expirationDate.timeIntervalSince1970, forKey: self.autoTrackingAuthTokenExpirationKey)
             shared.set(self.autoTrackingFirebaseProjectID, forKey: "autoTracking.firebase.projectID")
-            print("Updated auto-tracking Firebase auth snapshot. expiresAt=\(result.expirationDate)")
+            DiagnosticsLog.log("autoTrack", "Updated auto-tracking Firebase auth snapshot. expiresAt=\(result.expirationDate)")
         }
     }
 
@@ -1036,7 +1049,9 @@ final class TaskService: NSObject, ObservableObject {
                 let taskID = document.get("taskID") as? String ?? "?"
                 let values = [
                     "thresholdStep", "sessionID", "startKey", "status", "apnsID", "reason",
-                    "running", "startedLiveWindow", "eventAlreadyRecorded", "token", "source", "outcome",
+                    "running", "startedLiveWindow", "liveActivityUntil", "eventAlreadyRecorded",
+                    "autoTrackLiveActivityUntil", "autoTrackLiveUntil", "cleanupObservedAt",
+                    "token", "source", "outcome",
                 ].compactMap { key -> String? in
                     guard let value = document.get(key) else { return nil }
                     return "\(key)=\(value)"
@@ -1281,8 +1296,18 @@ final class TaskService: NSObject, ObservableObject {
     private func applyOptimisticAutoTrackLiveState(taskID: String, sessionID: String, sessionStartedAt: Date, lastUsageAt: Date) {
         guard let taskIndex = tasks.firstIndex(where: { $0.id == taskID }) else { return }
         var updatedTask = tasks[taskIndex]
+        let now = Date()
+        let existingActivityUntil = autoTrackLiveActivityUntil(for: updatedTask)
+        let activityCycleID: String
+        if existingActivityUntil.map({ $0 > now }) == true {
+            activityCycleID = updatedTask.autoTrackLiveActivityCycleID ?? sessionID
+        } else {
+            activityCycleID = UUID().uuidString
+        }
         updatedTask.autoTrackLastUsageAt = lastUsageAt
         updatedTask.autoTrackLiveUntil = lastUsageAt.addingTimeInterval(autoTrackingInactivityGraceSeconds)
+        updatedTask.autoTrackLiveActivityUntil = lastUsageAt.addingTimeInterval(autoTrackingLiveActivityGraceSeconds)
+        updatedTask.autoTrackLiveActivityCycleID = activityCycleID
         updatedTask.autoTrackActiveSessionID = sessionID
         updatedTask.autoTrackSessionStartedAt = sessionStartedAt
         // A new threshold event starts a fresh live window. Clear an earlier explicit stop
@@ -1344,9 +1369,23 @@ final class TaskService: NSObject, ObservableObject {
                     return false
                 }
 
+                let now = Date()
+                let activityUntil = lastUsageAt.addingTimeInterval(autoTrackingLiveActivityGraceSeconds)
+                let existingActivityUntil = self.autoTrackLiveActivityUntil(for: currentTask)
+                let activityCycleID: String
+                if existingActivityUntil.map({ $0 > now }) == true {
+                    activityCycleID = currentTask.autoTrackLiveActivityCycleID ?? sessionID
+                } else if activityUntil > now {
+                    activityCycleID = UUID().uuidString
+                } else {
+                    activityCycleID = currentTask.autoTrackLiveActivityCycleID ?? sessionID
+                }
+
                 transaction.updateData([
                     "autoTrackLastUsageAt": Timestamp(date: lastUsageAt),
                     "autoTrackLiveUntil": Timestamp(date: lastUsageAt.addingTimeInterval(autoTrackingInactivityGraceSeconds)),
+                    "autoTrackLiveActivityUntil": Timestamp(date: activityUntil),
+                    "autoTrackLiveActivityCycleID": activityCycleID,
                     "autoTrackActiveSessionID": sessionID,
                     "autoTrackSessionStartedAt": Timestamp(date: sessionStartedAt),
                     "autoTrackStoppedAt": FieldValue.delete(),
@@ -1454,11 +1493,13 @@ final class TaskService: NSObject, ObservableObject {
             // to the stop time makes older clients that have not yet adopted
             // `autoTrackStoppedAt` stop immediately too.
             updatedTask.autoTrackLiveUntil = stoppedAt
+            updatedTask.autoTrackLiveActivityUntil = stoppedAt
             tasks[taskIndex] = updatedTask
         }
         tasksCollection(for: uid).document(id).updateData([
             "autoTrackStoppedAt": Timestamp(date: stoppedAt),
             "autoTrackLiveUntil": Timestamp(date: stoppedAt),
+            "autoTrackLiveActivityUntil": Timestamp(date: stoppedAt),
             "updatedAt": Timestamp(date: stoppedAt),
         ])
     }
@@ -1488,6 +1529,7 @@ final class TaskService: NSObject, ObservableObject {
         if wasAutoTracked {
             updateData["autoTrackStoppedAt"] = Timestamp(date: endedAt)
             updateData["autoTrackLiveUntil"] = Timestamp(date: endedAt)
+            updateData["autoTrackLiveActivityUntil"] = Timestamp(date: endedAt)
         }
         tasksCollection(for: uid).document(id).updateData(updateData)
 
@@ -1548,6 +1590,7 @@ final class TaskService: NSObject, ObservableObject {
             if wasAutoTracked {
                 updatedTask.autoTrackStoppedAt = endedAt
                 updatedTask.autoTrackLiveUntil = endedAt
+                updatedTask.autoTrackLiveActivityUntil = endedAt
             }
             updatedTask.updatedAt = Date()
             tasks[taskIndex] = updatedTask
@@ -2083,6 +2126,7 @@ final class TaskService: NSObject, ObservableObject {
                     "timerOwnerIsActive": FieldValue.delete(),
                     "autoTrackStoppedAt": Timestamp(date: endedAt),
                     "autoTrackLiveUntil": Timestamp(date: endedAt),
+                    "autoTrackLiveActivityUntil": Timestamp(date: endedAt),
                     "updatedAt": Timestamp(date: Date()),
                 ], forDocument: taskRef)
 

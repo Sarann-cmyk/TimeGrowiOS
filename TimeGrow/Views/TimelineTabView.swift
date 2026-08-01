@@ -53,7 +53,7 @@ struct TimelineTabView: View {
     private var hasLiveSession: Bool {
         sessions.contains { $0.endedAt == nil }
             || taskService.sessions.contains { $0.endedAt == nil }
-            || activeEntry != nil
+            || activeEntry(at: Date()) != nil
     }
 
     var body: some View {
@@ -197,56 +197,105 @@ struct TimelineTabView: View {
         let color: Color
         let symbol: String
         let startedAt: Date
+        let frozenAt: Date?
+        let isPaused: Bool
+        let diagnosticsTask: TGTask
+        let diagnosticsPresentation: AutoTrackPresentationState?
     }
 
     /// A manually-started timer, or an auto-tracked session that's still within its
     /// grace-period window after ending — the same two cases the Tasks list treats as "live".
     /// Auto-track never sets `timerStartedAt` on the task itself, only on the session, so
     /// this can't be answered from `task.isTimerRunning` alone.
-    private var activeEntry: ActiveEntry? {
+    private func activeEntry(at date: Date) -> ActiveEntry? {
         if let task = taskService.tasks.first(where: { $0.isTimerRunning }), let startedAt = task.timerStartedAt {
-            return ActiveEntry(color: task.color, symbol: task.symbol, startedAt: startedAt)
+            return ActiveEntry(
+                color: task.color,
+                symbol: task.symbol,
+                startedAt: startedAt,
+                frozenAt: nil,
+                isPaused: false,
+                diagnosticsTask: task,
+                diagnosticsPresentation: nil
+            )
         }
-        let graceCandidates = taskService.sessions.filter { session -> Bool in
-            guard session.startedAutomatically == true, let endedAt = session.endedAt else { return false }
-            if let stoppedAt = taskService.tasks.first(where: { $0.id == session.taskID })?.autoTrackStoppedAt,
-               endedAt <= stoppedAt {
-                return false
-            }
-            return Date().timeIntervalSince(endedAt) <= autoTrackingInactivityGraceSeconds
+
+        let candidates = taskService.tasks.compactMap { task -> (TGTask, AutoTrackPresentationState)? in
+            let taskSessions = taskService.sessions(forTaskID: task.id)
+            guard let presentation = AutoTrackPresentationState.resolve(
+                task: task,
+                sessions: taskSessions,
+                at: date
+            ) else { return nil }
+            return (task, presentation)
         }
-        guard let liveSession = graceCandidates.max(by: { ($0.endedAt ?? $0.startedAt) < ($1.endedAt ?? $1.startedAt) }) else {
+        guard let (task, presentation) = candidates.max(by: {
+            ($0.1.session.endedAt ?? $0.1.session.startedAt)
+                < ($1.1.session.endedAt ?? $1.1.session.startedAt)
+        }) else {
             return nil
         }
-        let symbol = String(liveSession.taskName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1)).uppercased()
-        return ActiveEntry(color: liveSession.color, symbol: symbol.isEmpty ? "T" : symbol, startedAt: liveSession.startedAt)
+        return ActiveEntry(
+            color: task.color,
+            symbol: task.symbol,
+            startedAt: presentation.session.startedAt,
+            frozenAt: presentation.isPaused ? presentation.displayDate : nil,
+            isPaused: presentation.isPaused,
+            diagnosticsTask: task,
+            diagnosticsPresentation: presentation
+        )
     }
 
     @ViewBuilder
     private var activeTrackerCorner: some View {
-        if let entry = activeEntry {
-            SwiftUI.TimelineView(.periodic(from: .now, by: 1)) { context in
-                let elapsed = max(0, Int(context.date.timeIntervalSince(entry.startedAt)))
-                let minutes = elapsed / 60
-                let secondsFraction = Double(elapsed % 60) / 60
+        if activeEntry(at: Date()) != nil {
+            SwiftUI.TimelineView(.animation(minimumInterval: 1.0 / 12.0, paused: false)) { context in
+                if let entry = activeEntry(at: context.date) {
+                    let elapsedDate = entry.frozenAt ?? context.date
+                    let elapsed = max(0, Int(elapsedDate.timeIntervalSince(entry.startedAt)))
+                    let minutes = elapsed / 60
+                    let secondsFraction = Double(elapsed % 60) / 60
+                    let presentationDiagnosticsKey = AutoTrackPresentationDiagnostics.key(
+                        task: entry.diagnosticsTask,
+                        presentation: entry.diagnosticsPresentation
+                    )
 
-                ZStack {
-                    Circle()
-                        .stroke(entry.color.opacity(0.25), lineWidth: 2.5)
-                    // The ring fills clockwise over each minute, resetting as the seconds roll over.
-                    Circle()
-                        .trim(from: 0, to: secondsFraction)
-                        .stroke(entry.color, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
-                    Text("\(minutes)")
-                        .font(.system(size: 12, weight: .bold, design: .rounded))
-                        .foregroundStyle(entry.color)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.6)
+                    ZStack {
+                        Circle()
+                            .stroke(entry.color.opacity(0.25), lineWidth: 2.5)
+                        // The ring fills clockwise over each minute, resetting as seconds roll over.
+                        Circle()
+                            .trim(from: 0, to: secondsFraction)
+                            .stroke(entry.color, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                        Text("\(minutes)")
+                            .font(.system(size: 12, weight: .bold, design: .rounded))
+                            .foregroundStyle(entry.color)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.6)
+                    }
+                    .frame(width: 35, height: 35)
+                    .opacity(entry.isPaused ? TaskAvatarCircle.pausedOpacity(at: context.date) : 1)
+                    .task(id: presentationDiagnosticsKey) {
+                        AutoTrackPresentationDiagnostics.report(
+                            task: entry.diagnosticsTask,
+                            presentation: entry.diagnosticsPresentation,
+                            surface: "timelineCorner",
+                            at: context.date
+                        )
+                    }
+                } else {
+                    idleTrackerCorner
                 }
-                .frame(width: 35, height: 35)
             }
-        } else if let lastTask = mostRecentTask {
+        } else {
+            idleTrackerCorner
+        }
+    }
+
+    @ViewBuilder
+    private var idleTrackerCorner: some View {
+        if let lastTask = mostRecentTask {
             Text(lastTask.symbol)
                 .font(.system(size: 14, weight: .bold))
                 .foregroundStyle(lastTask.color)
@@ -351,7 +400,13 @@ struct TimelineTabView: View {
     }
 
     private func weekSessionColumns(at date: Date) -> some View {
-        GeometryReader { geo in
+        // Narrow the rolling 30-day cache once for the visible week. Each of the seven columns
+        // still applies its own day/minimum-duration rules, but no longer rescans all 30 days.
+        let visibleWeekSessions = sessionsSource(at: date).filter { session in
+            let end = session.endedAt ?? date
+            return end > weekBounds.start && session.startedAt < weekBounds.end
+        }
+        return GeometryReader { geo in
             let columnsAreaWidth = max(0, geo.size.width - leadingLabelWidth - 8)
             let columnWidth = columnsAreaWidth / 7
             ZStack(alignment: .topLeading) {
@@ -370,7 +425,8 @@ struct TimelineTabView: View {
                         at: date,
                         xOffset: leadingLabelWidth + 8 + CGFloat(index) * columnWidth,
                         columnWidth: columnWidth,
-                        totalHeight: geo.size.height
+                        totalHeight: geo.size.height,
+                        sourceSessions: visibleWeekSessions
                     )
                 }
             }
@@ -378,10 +434,22 @@ struct TimelineTabView: View {
         .frame(height: hourHeight * 24)
     }
 
-    private func weekDayColumn(day: Date, at date: Date, xOffset: CGFloat, columnWidth: CGFloat, totalHeight: CGFloat) -> some View {
+    private func weekDayColumn(
+        day: Date,
+        at date: Date,
+        xOffset: CGFloat,
+        columnWidth: CGFloat,
+        totalHeight: CGFloat,
+        sourceSessions: [TaskTimeSession]
+    ) -> some View {
         let bounds = dayBounds(for: day)
         return ZStack(alignment: .topLeading) {
-            ForEach(positionedSessions(bounds: bounds, at: date, totalHeight: totalHeight)) { positioned in
+            ForEach(positionedSessions(
+                bounds: bounds,
+                at: date,
+                totalHeight: totalHeight,
+                sourceSessions: sourceSessions
+            )) { positioned in
                 let laneWidth = max(1, columnWidth - 4) / CGFloat(positioned.laneCount)
                 let laneGap: CGFloat = positioned.laneCount > 1 ? 2 : 0
 
@@ -473,14 +541,19 @@ struct TimelineTabView: View {
     /// Groups sessions that overlap in time into clusters, then greedily assigns each a lane
     /// (like Apple/Google Calendar's side-by-side columns) so overlapping sessions never stack
     /// on top of each other unreadably. Sessions with no overlap keep the full row width.
-    private func positionedSessions(bounds: (start: Date, end: Date), at date: Date, totalHeight: CGFloat) -> [PositionedSession] {
+    private func positionedSessions(
+        bounds: (start: Date, end: Date),
+        at date: Date,
+        totalHeight: CGFloat,
+        sourceSessions: [TaskTimeSession]? = nil
+    ) -> [PositionedSession] {
         // When looking at today, no block may cross the red current-time line — a session
         // that just started or just ended must stop exactly at "now", not reach into the future.
         let nowMinutes: CGFloat? = calendar.isDate(bounds.start, inSameDayAs: date)
             ? CGFloat(min(max(date.timeIntervalSince(bounds.start), 0), bounds.end.timeIntervalSince(bounds.start)) / 60)
             : nil
 
-        let intervals = daySessions(for: bounds, at: date).map { session -> (session: TaskTimeSession, start: CGFloat, end: CGFloat) in
+        let intervals = daySessions(for: bounds, at: date, sourceSessions: sourceSessions).map { session -> (session: TaskTimeSession, start: CGFloat, end: CGFloat) in
             let start = max(session.startedAt, bounds.start)
             let end = min(session.endedAt ?? date, bounds.end)
             let startMinutes = CGFloat(start.timeIntervalSince(bounds.start) / 60)
@@ -671,13 +744,13 @@ struct TimelineTabView: View {
 
     // MARK: - Data
 
-    private func daySessions(for bounds: (start: Date, end: Date), at date: Date) -> [TaskTimeSession] {
-        let filtered = sessionsSource(at: date)
+    private func daySessions(
+        for bounds: (start: Date, end: Date),
+        at date: Date,
+        sourceSessions: [TaskTimeSession]? = nil
+    ) -> [TaskTimeSession] {
+        let filtered = (sourceSessions ?? sessionsSource(at: date))
             .filter { session in
-                // A delayed packet's duration is real, but its wall-clock placement is only a
-                // conservative reconstruction. Keep that technical state in diagnostics and
-                // Reports, but never draw it as a factual Timeline block.
-                guard !session.isTimingEstimated else { return false }
                 let end = session.endedAt ?? date
                 guard end > bounds.start && session.startedAt < bounds.end else { return false }
                 let overlapStart = max(session.startedAt, bounds.start)
@@ -779,6 +852,13 @@ struct TimelineTabView: View {
 
     private func load() async {
         let requestedKey = rangeKey
+        // The live listener already contains the complete rolling 30-day window. A second
+        // Firestore query every time the user opens Timeline only adds decoding/main-actor work.
+        if canUseObservedSessionCache {
+            sessions = []
+            loadedRangeKey = requestedKey
+            return
+        }
         do {
             let bounds = rangeBounds
             let fetched = try await taskService.fetchSessions(from: bounds.start, to: bounds.end)

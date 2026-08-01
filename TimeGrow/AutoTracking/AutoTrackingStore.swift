@@ -13,12 +13,18 @@ import Foundation
 // AutoTrackingExtension targets, and the suite name the extension writes to.
 let autoTrackingAppGroupID = "group.WINNER.ltd.TimeGrow"
 let autoTrackingThresholdSeconds: TimeInterval = 60
+/// How long Dynamic Island remains visible after the latest Screen Time threshold callback.
+/// This is intentionally shorter than `autoTrackingInactivityGraceSeconds`: the latter keeps
+/// a returning user in the same recorded session for five minutes, while this lease controls
+/// only the ActivityKit presentation.
+let autoTrackingLiveActivityGraceSeconds: TimeInterval = 90
 /// Must match `accumulatedThresholdStepCount` in AutoTrackingExtension.swift — the number of
 /// 1-minute-apart thresholds armed per `startMonitoring` call, so the extension only has to pay
 /// for a full stop/start restart once every N minutes of continuous usage instead of every one.
 let autoTrackingAccumulatedThresholdStepCount = 15
 /// How long a gap since the last confirmed minute of usage is still treated as the same
-/// session (same Firestore session record, same live Live Activity). DeviceActivityMonitor's
+/// session (the same Firestore session record). Dynamic Island uses the shorter lease above.
+/// DeviceActivityMonitor's
 /// `eventDidReachThreshold` delivery has no documented upper bound on latency — it's best-effort,
 /// and 180s proved too short: a genuinely continuous TikTok session on 2026-07-21 saw iOS defer
 /// delivery for 299s, splitting one session into two and dropping the Dynamic Island mid-use.
@@ -59,9 +65,20 @@ final class AutoTrackingStore: ObservableObject {
     private let defaults = UserDefaults.standard
     private var monitoredActivitiesByTaskID: [String: DeviceActivityName] = [:]
     private var didResetMonitoringThisRun = false
+    private struct MonitoringTaskState: Equatable {
+        let id: String
+        let isTimerRunning: Bool
+    }
+    /// Task documents also change for elapsed/live metadata that has no effect on Screen Time.
+    /// Re-running DeviceActivity IPC for those snapshots can stall the main thread on resume.
+    private var lastMonitoringTaskState: [MonitoringTaskState]?
 
     func refreshAuthorizationStatus() {
-        authorizationStatus = center.authorizationStatus
+        let newStatus = center.authorizationStatus
+        if newStatus != authorizationStatus {
+            lastMonitoringTaskState = nil
+            authorizationStatus = newStatus
+        }
     }
 
     @discardableResult
@@ -99,6 +116,15 @@ final class AutoTrackingStore: ObservableObject {
         guard authorizationStatus == .approved else { return }
         guard !tasks.isEmpty else { return }
 
+        let monitoringTaskState = tasks
+            .compactMap { task in
+                task.id.map { MonitoringTaskState(id: $0, isTimerRunning: task.isTimerRunning) }
+            }
+            .sorted { $0.id < $1.id }
+        guard monitoringTaskState != lastMonitoringTaskState else { return }
+        let refreshStartedAt = Date()
+        var refreshSucceeded = true
+
         if !didResetMonitoringThisRun {
             adoptExistingMonitoring(for: tasks)
             didResetMonitoringThisRun = true
@@ -125,12 +151,23 @@ final class AutoTrackingStore: ObservableObject {
                     for: taskID,
                     reason: "isTimerRunning timerStartedAt=\(String(describing: task.timerStartedAt)) "
                         + "autoTrackLiveUntil=\(String(describing: task.autoTrackLiveUntil)) "
+                        + "autoTrackLiveActivityUntil=\(String(describing: task.autoTrackLiveActivityUntil)) "
                         + "autoTrackSessionStartedAt=\(String(describing: task.autoTrackSessionStartedAt)) "
                         + "autoTrackStoppedAt=\(String(describing: task.autoTrackStoppedAt))"
                 )
             } else if monitoredActivitiesByTaskID[taskID] == nil {
-                scheduleMonitoring(selection: currentSelection, taskID: taskID)
+                refreshSucceeded = scheduleMonitoring(selection: currentSelection, taskID: taskID)
+                    && refreshSucceeded
             }
+        }
+        lastMonitoringTaskState = refreshSucceeded ? monitoringTaskState : nil
+
+        let elapsed = Date().timeIntervalSince(refreshStartedAt)
+        if elapsed >= 0.1 {
+            DiagnosticsLog.log(
+                "performance",
+                String(format: "Screen Time monitoring refresh blocked main actor for %.3fs tasks=%d", elapsed, tasks.count)
+            )
         }
     }
 
@@ -183,12 +220,13 @@ final class AutoTrackingStore: ObservableObject {
 
     /// Watches the picked apps/categories all day, every day, and reports
     /// back once the task has been used for at least a minute in a day.
-    private func scheduleMonitoring(selection: FamilyActivitySelection, taskID: String) {
+    @discardableResult
+    private func scheduleMonitoring(selection: FamilyActivitySelection, taskID: String) -> Bool {
         let generation = UUID().uuidString
         let activityName = DeviceActivityName("\(taskID)|\(generation)")
         guard !selection.applicationTokens.isEmpty || !selection.categoryTokens.isEmpty || !selection.webDomainTokens.isEmpty else {
             stopMonitoring(for: taskID, reason: "noSelection")
-            return
+            return true
         }
 
         var selectionDataFingerprint = "?"
@@ -215,8 +253,10 @@ final class AutoTrackingStore: ObservableObject {
                 "autoTrack",
                 "started DeviceActivity monitoring for task \(taskID) activity=\(activityName.rawValue) steps=\(events.count) apps=\(selection.applicationTokens.count) categories=\(selection.categoryTokens.count) webDomains=\(selection.webDomainTokens.count) selectionFingerprint=\(selectionDataFingerprint)"
             )
+            return true
         } catch {
             DiagnosticsLog.log("autoTrack", "failed to start DeviceActivity monitoring: \(error.localizedDescription)")
+            return false
         }
     }
 

@@ -1,6 +1,6 @@
 # Dynamic Island / Live Activity — AI agent map
 
-Останнє фактичне оновлення: 2026-07-14.
+Останнє фактичне оновлення: 2026-08-01.
 
 Цей файл — вузькоспеціалізована карта саме для Dynamic Island / Live Activity частини
 TimeGrow, для AI агента, який продовжує роботу над цією фічею. Загальна карта репозиторію —
@@ -34,6 +34,12 @@ TimeGrow, для AI агента, який продовжує роботу на�
   автоматично компілюється в основний app target (synchronized group); в
   `TimeGrowLiveActivityExtension` і `AutoTrackingExtension` доданий вручну через окремий
   `PBXBuildFile` в `project.pbxproj` (ці два таргети НЕ synchronized groups).
+- `TimeGrow/Helpers/AutoTrackPresentationState.swift` — UI-only поділ п'ятихвилинного вікна
+  автотрекінгу на `.active` і `.paused`. Після завершення 90-секундного
+  `autoTrackLiveActivityUntil` фіксує `displayDate`, але не закриває і не змінює сесію.
+- `TaskRowView.swift`, `TaskTileView.swift`, `TimelineTabView.swift` — у `.paused` elapsed/progress
+  завмирає на `displayDate`, а коло плавно блимає. Картка задачі лишається підсвіченою до кінця
+  п'ятихвилинного вікна; новий threshold повертає звичайну активну анімацію.
 
 ### Логіка старту/завершення в основному застосунку
 
@@ -58,6 +64,12 @@ TimeGrow, для AI агента, який продовжує роботу на�
     `Activity.pushToStartTokenUpdates` ще під час `TimeGrowApp.init`, кешує пристрій-рівневий
     токен і передає його в `pushToStartTokenHandler`, щойно Firebase/UI готові. Це не дає
     загубити одноразову ранню видачу токена до появи SwiftUI сцени.
+  - Якщо ActivityKit повернув `.dismissed`, менеджер зберігає стабільний ключ поточного циклу
+    (`activeSessionID` для manual або `autoTrackLiveActivityCycleID` для auto) в App Group і не
+    повторює `Activity.request()` на кожному Firestore snapshot. Захист переживає relaunch
+    застосунку, але очищається після reboot iPhone, щоб системний ActivityKit recovery міг зробити
+    одну нову спробу. Якщо push-start dismissal випередив завантаження task state, task ID
+    утримується до background fetch і тоді прив'язується до правильного циклу.
 - `TimeGrow/TimeGrowApp.swift` — `AppDelegate` реєструє APNs (`registerForRemoteNotifications`),
   обробляє `didRegisterForRemoteNotificationsWithDeviceToken` /
   `didFailToRegisterForRemoteNotificationsWithError` / `didReceiveRemoteNotification`. В
@@ -71,6 +83,8 @@ TimeGrow, для AI агента, який продовжує роботу на�
 - `TimeGrow/Store/TaskService.swift` — `updateActivityPushToStartToken`, `updateAPNsDeviceToken`,
   `updateLiveActivityPushToken`, `fetchTasksOnce(completion:)` (one-shot фетч тасків для
   background-wake обробника, без очікування live listener'а).
+  - Для автотрекінгу `autoTrackLiveActivityUntil` керує лише ActivityKit і продовжується на 90с
+    кожним threshold. `autoTrackLiveUntil` окремо лишається 300с для склеювання сесії.
 
 ### Автотрекінг (локальний тригер на iPhone)
 
@@ -80,8 +94,8 @@ TimeGrow, для AI агента, який продовжує роботу на�
   конфігурації; помилка `"Target does not include NSSupportsLiveActivities plist key"` є
   оманливою — реальний ключ на місці, перевірено напряму в зібраному бінарнику. Джерела:
   Apple Developer Forums threads 746416, 760520, 805859). Замість цього екстеншн лише пише
-  `autoTrackSessionStartedAt`/`autoTrackLiveUntil`/`autoTrackLastUsageAt` в Firestore напряму
-  через REST API (`patchTaskFields`) — цей запис і є єдиним сигналом, який запускає весь ланцюжок
+  `autoTrackSessionStartedAt`/`autoTrackLiveUntil`/`autoTrackLiveActivityUntil`/
+  `autoTrackLastUsageAt` у Firestore через `recordAutoTrackEvent` — цей запис і є сигналом, який запускає весь ланцюжок
   старту (див. нижче).
   - **НЕ додавай назад** `DeviceActivityMonitor.intervalDidEnd`-based "expiry watcher" для
     локального завершення активності з коротким (менше ~10-15 хв) вікном —
@@ -104,9 +118,13 @@ TimeGrow, для AI агента, який продовжує роботу на�
     `reconcile()` для всього, що НЕ потребує foreground (синхронізація push-token, завершення
     активностей). На переході "запущено → не запущено": шле `end`-push на
     `liveActivityPushToken` конкретної задачі.
-- `refreshLiveActivities` — `onSchedule('every 1 minutes')`. Підчищає активності, чий таск
-  більше не запущений (grace period вийшов мовчки, без нового Firestore-запису), а для активних
+- `refreshLiveActivities` — `onSchedule('every 1 minutes')`. Підчищає активності, чий
+  90-секундний `autoTrackLiveActivityUntil` вийшов мовчки без нового Firestore-запису, а для активних
   пушить новий `minuteWindowStart`, щоб expanded ring починав наступний 60-секундний sweep.
+  Сервер рахує ці 90 секунд від `occurredAt` (фактичного DeviceActivity callback), а не від
+  моменту отримання HTTP-запиту, тому затримана мережа не подовжує показ. Через хвилинний крок
+  scheduler фактичний server-side `end` очікується приблизно через 90–150 секунд; окреме
+  п'ятихвилинне `autoTrackLiveUntil` це не змінює.
   Потребує
     Firestore collection-group single-field index exemption на `tasks`/`liveActivityPushToken`
     (Firestore Console → Indexes → Automatic index settings → Exemptions — НЕ через
@@ -140,6 +158,31 @@ TimeGrow, для AI агента, який продовжує роботу на�
   одразу після використання** (`rm` файл + `firebase functions:delete <name> --region <region>
   --force`) — вона публічно доступна без авторизації. Uid поточного користувача можна знайти через
   `firebase auth:export /tmp/users.json && cat /tmp/users.json` (і видалити файл після).
+
+## Діагностика 90-секундного завершення й UI-паузи
+
+Експорт із Settings тепер містить один ланцюжок без animation-frame спаму:
+
+- `[serverDiag] kind=liveActivityEndAccepted ... source=scheduledCleanup
+  autoTrackLiveActivityUntil=... cleanupObservedAt=...` — сервер побачив завершений lease й APNs
+  прийняв immediate end-push;
+- `[liveActivity] 90-second lease audit ... activityPresent=false expectedUIPhase=pausedBlinking`
+  — що ActivityKit фактично показував у списку активностей на телефоні, коли застосунок мав CPU;
+- `[liveActivity] Live Activity end verification ... systemRemoved=true stillListed=false state=...`
+  — результат локального `activity.end(..., .immediate)` через 250мс. `systemRemoved` означає
+  відсутність у `Activity.activities` (найсильніший доступний програмний сигнал), а не pixel-level
+  перевірку Dynamic Island;
+- `[liveActivity] Recorded system-dismissed Live Activity ... cycle=...` — iOS прибрала Activity,
+  і цей цикл записаний у локальний guard;
+- `[liveActivity] Suppressed repeated Live Activity start ... reason=systemDismissedSameCycle` —
+  наступний snapshot не створив retry storm; нова сесія/auto-cycle запускається звичайно;
+- `[autoTrackUI] paused blinking started ... surface=taskRow|taskTile|timelineCorner ...` — SwiftUI
+  реально перейшов у заморожений blinking state;
+- `[autoTrackUI] paused blinking ended ... reason=usageResumed|returnWindowEndedOrStopped` — вихід
+  із паузи через нове використання або завершення п'ятихвилинного вікна.
+
+`DiagnosticsLog.exportText()` синхронно дренить свою serial queue перед читанням файла, тому
+експорт одразу після події не втрачає останній рядок.
 
 ## Дві головні проблеми в роботі (станом на 2026-07-14)
 
@@ -194,3 +237,31 @@ iPhone має погасити Dynamic Island без відкриття заст
 - **APNs топік з суфіксом `.push-to-start`** — не існує, push-to-start і звичайні update/end йдуть
   на той самий `.push-type.liveactivity` топік, різниця лише в тому, на який токен (пристрій vs
   активність) і з яким `event` в payload.
+- **Часткове `firebase deploy --only functions:X` після зміни спільної helper-функції** — 2026-08-01,
+  90-секундний auto-track ліміт (`autoTrackLiveActivityUntil`) не гасив Dynamic Island без відкриття
+  застосунку, хоча `recordAutoTrackEvent` вже коректно писав нове поле. Причина: `activeTimerStart`/
+  `autoTrackLiveActivityUntil()` — спільний helper для `recordAutoTrackEvent`, `refreshLiveActivities`,
+  `onTaskTimerChanged`, `registerLiveActivityPushToken`, `onDevicePushToStartTokenChanged`,
+  `closeInterruptedMacAutoTimers` — але задеплоєно було вибірково лише `recordAutoTrackEvent`.
+  `refreshLiveActivities` продовжував виконувати СТАРУ скомпільовану версію helper'а (5-хвилинний
+  `autoTrackLiveUntil`), тому щохвилинний sweep вважав активність "ще живою" ще ~3.5 хвилини понад
+  очікуване і мовчки слав update замість end-push (обидва шляхи нічого не логують при успіху — це і
+  ховало розбіжність). Кожен Cloud Functions Gen2 таргет — окремий Cloud Run сервіс зі своєю
+  скомпільованою копією `lib/index.js`; зміна спільної функції в `src/index.ts` вимагає передеплою
+  **усіх** таргетів, що її використовують, не тільки того, який первинно тестуєш.
+
+  Діагностика такого розсинхрону: `firebase functions:log --only refreshLiveActivities` після
+  очікуваного дедлайну не показує НІ `scheduled Live Activity end accepted`, НІ error/APNs-лог —
+  просто порожній рядок (це нормальний вигляд і для "silent success" гілки, і для "нічого не
+  знайшли", тому відсутність логу сама по собі не доказ). Найшвидший спосіб підтвердити: тимчасова
+  `onRequest` діагностична функція (див. розділ вище), яка дампить сирий таск-документ і звіряє
+  `autoTrackLiveActivityUntil` з очікуваним 90-секундним дедлайном.
+- **`liveActivityPushToken` (singular) vs `liveActivityPushTokens` (map) розсинхрон** —
+  `TaskService.updateLiveActivityPushToken` (клієнт, `TimeGrow/Store/TaskService.swift`) пише/чистить
+  **лише** singular-поле; сервер (`registerLiveActivityPushToken`) пише обидва разом. Коли клієнт сам
+  локально завершує активність і шле `nil` (`LiveActivityManager` після 2-секундного
+  reconciliation grace), singular-поле видаляється, а `liveActivityPushTokens` лишається з застарілим
+  токеном назавжди — і, що важливіше, `refreshLiveActivities`'s `collectionGroup` query фільтрує
+  **тільки** по singular-полю, тому такий таск-документ повністю зникає з-під щохвилинного sweep, поки
+  наступний auto-track цикл не зареєструє новий токен через сервер. Не критично для одного пристрою
+  (наступний цикл усе одно перезапише), але вартий уваги при мультипристрійних сценаріях.

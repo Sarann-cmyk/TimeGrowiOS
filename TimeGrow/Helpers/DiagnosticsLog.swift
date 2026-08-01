@@ -40,15 +40,26 @@ enum DiagnosticsLog {
             .appendingPathComponent(logFileName)
     }
 
+    /// Writes only to the persisted, exportable log — not to `print`/the Xcode console. This tag
+    /// family fires on every Firestore snapshot (`[sync]`), heartbeat, and reconcile pass, often
+    /// several times a second; printing it drowned out everything else in the console during
+    /// on-device debugging. The export button (`exportText()`) remains the way to inspect it.
     static func log(_ tag: String, _ message: String) {
         let line = "\(Self.timestampFormatter.string(from: Date())) [\(tag)] \(message)"
-        print(line)
         queue.async {
             append(line + "\n")
         }
     }
 
     static func exportText() -> String {
+        // Wait for every previously queued event before reading the file. Without this barrier,
+        // exporting immediately after a 90-second expiry could omit the most important last line.
+        queue.sync {
+            exportTextAfterFlushingPendingWrites()
+        }
+    }
+
+    private static func exportTextAfterFlushingPendingWrites() -> String {
         var result = "TimeGrow diagnostics export — \(Self.timestampFormatter.string(from: Date()))\n\n"
         if let url = fileURL, let content = try? String(contentsOf: url, encoding: .utf8) {
             result += content

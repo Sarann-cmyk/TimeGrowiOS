@@ -53,6 +53,10 @@ struct ContentView: View {
         .safeAreaInset(edge: .bottom) {
             tabBar
         }
+        // The task form is presented in its own sheet. Its keyboard must not move the persistent
+        // app navigation underneath it — interrupted sheet/keyboard dismissal during backgrounding
+        // could otherwise leave this inset pinned to the keyboard's former top edge.
+        .ignoresSafeArea(.keyboard, edges: .bottom)
         .sheet(isPresented: $isShowingAddTask) {
             TaskFormView(navigationTitle: "New Task", confirmTitle: "Create") { name, color in
                 taskService.createTask(name: name, color: color)
@@ -278,7 +282,7 @@ struct ContentView: View {
                             TimelineTabIcon(color: iconColor)
                         } else {
                             Image(systemName: tab.systemImage)
-                                .font(.system(size: 27, weight: .semibold))
+                                .font(.system(size: tab == .reports ? 29.7 : 27, weight: .semibold))
                                 .symbolRenderingMode(.hierarchical)
                                 .foregroundStyle(iconColor)
                         }
